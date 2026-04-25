@@ -2,24 +2,32 @@
 
 ## Registering roots
 
-A "source" is a directory or file you've registered with a project. Files can
-live anywhere on your filesystem; loci just walks the roots you tell it about.
+A "source" is a directory or file you've registered with a **workspace**.
+Files can live anywhere on your filesystem; loci just walks the roots you
+tell it about. Workspaces decouple file registration from projects: scan
+once, link to many.
 
 ```bash
-loci source add <project> <path>            # register
-loci source list <project>                  # show all
-loci source remove <project> <path-or-id>   # un-register
-loci scan <project>                         # walk every registered root
-loci scan <project> /one/off/path           # walk one ad-hoc root (also fine)
+loci workspace add-source <ws-slug> <path> --label <label>   # register a root
+loci workspace list-sources <ws-slug>                         # show all roots
+loci workspace remove-source <ws-slug> <path-or-id>          # un-register
+loci workspace scan <ws-slug>                                 # walk every root
+loci workspace scan <ws-slug> /one/off/path                   # ad-hoc root (also fine)
 ```
 
-Same operations over REST: `/projects/:id/sources/roots` (POST/GET, DELETE
-the per-id form, POST `/scan-all` to walk everything).
+Same operations over REST:
+- `POST /workspaces` / `GET /workspaces` — create and list workspaces
+- `POST /workspaces/:id/sources` / `GET /workspaces/:id/sources` / `DELETE /workspaces/:id/sources/:sid` — manage roots
+- `POST /workspaces/:id/scan` — trigger a scan
+- `POST /projects/:pid/workspaces/:wid` / `DELETE /projects/:pid/workspaces/:wid` — link or unlink a workspace to a project
 
-Multi-project sharing is automatic: if the same PDF lives under
-`~/papers/foo.pdf` and you scan it from two projects, you get **one
-RawNode** (deduped by content hash) and **two memberships**. The same paper
-in two projects participates in both retrieval contexts but stays one row.
+Multi-project sharing is automatic: link the same workspace to multiple
+projects and all of them see the same raw nodes via the
+`project_effective_members` view — no re-scanning, no duplication. If the
+same PDF is also registered under a second workspace that another project
+uses, loci still stores **one RawNode** (deduped by content hash) and
+two workspace memberships. The same paper in two projects participates in
+both retrieval contexts but stays one row.
 
 ## Supported file types (built-in)
 
@@ -70,9 +78,9 @@ own venv, then expose its CLI:
 pip install marker-pdf
 marker_single ~/papers/foo.pdf  # produces foo.md alongside
 ```
-Then `loci source add` the directory containing the converted .md files.
-This is the cleanest model and avoids any dep conflict; you treat marker as
-a one-shot conversion tool, not part of loci's runtime.
+Then `loci workspace add-source` the directory containing the converted .md
+files. This is the cleanest model and avoids any dep conflict; you treat
+marker as a one-shot conversion tool, not part of loci's runtime.
 
 **B. Override marker's anthropic pin in loci's env** (advanced, fragile):
 ```bash
@@ -137,4 +145,18 @@ flips `source_of_truth` to `false` for any raw whose `canonical_path` is
 missing, and surfaces `broken-support` proposals for interpretations that
 cited it (PLAN §Edge cases (1)).
 
-To force the audit immediately, `loci absorb <project>`.
+To force the audit immediately:
+
+```bash
+loci absorb <project>
+```
+
+To remove a source root from a workspace before the next scan (so new files
+under it are no longer picked up):
+
+```bash
+loci workspace remove-source <ws-slug> <path-or-id>
+```
+
+Removing a source root does not immediately delete any already-scanned
+RawNodes — those persist until the absorb audit marks them as missing.

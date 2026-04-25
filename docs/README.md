@@ -19,11 +19,14 @@ If you're reading docs for the first time, read in this order:
    confusing because there is no proposal queue.
 4. [architecture.md](./architecture.md) — how files flow through the system;
    what the interpretation graph is; how the reflect cycle evolves it.
-5. [sources.md](./sources.md) — file storage, supported formats, multi-root
-   scanning, marker (high-quality PDF) setup.
-6. [model-config.md](./model-config.md) — choosing which LLM provider/model
+5. [graph.md](./graph.md) — the graph reference: every node type, edge type,
+   lifecycle state machine, confidence signal table, construction pipeline
+   step-by-step, and how to read + query the graph.
+6. [sources.md](./sources.md) — workspaces, source registration, supported
+   formats, multi-root scanning, marker (high-quality PDF) setup.
+7. [model-config.md](./model-config.md) — choosing which LLM provider/model
    is used for which task (interpretation, RAG, classifier, HyDE).
-7. [session-lifecycle.md](./session-lifecycle.md) — the bigger picture: how
+8. [session-lifecycle.md](./session-lifecycle.md) — the bigger picture: how
    a project evolves from "five questions" to a working knowledge graph.
 
 The two repos:

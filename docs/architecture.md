@@ -25,6 +25,41 @@ Every file you ingest becomes one `RawNode`:
 The original file bytes are also stored under `~/.loci/blobs/<hash[:2]>/<hash[2:]>` — content-addressed, deduped. This lets us re-extract later if we
 swap to a better PDF parser without re-reading the source file.
 
+### 1b. Information Workspaces
+
+An information workspace is a **named bag of source roots** that can be
+linked to one or more projects. Workspaces decouple *where you store files*
+from *which projects care about them*: a PDF library scanned once is
+available to every project that links its workspace, without re-embedding.
+
+| table | key columns | meaning |
+|---|---|---|
+| `information_workspaces` | `id`, `slug`, `name`, `description_md`, `kind` | Named source collection with an optional human-readable description |
+| `workspace_sources` | `id`, `workspace_id`, `root_path`, `label` | Source roots owned by a workspace; scan walks these paths |
+| `workspace_membership` | `workspace_id`, `node_id` | Which raw nodes belong to which workspace (populated by scan) |
+| `project_workspaces` | `project_id`, `workspace_id`, `role`, `weight` | M:N link; `role` ∈ `primary` / `reference` / `excluded` |
+
+The `project_effective_members` view is derived automatically:
+
+```sql
+-- pseudocode
+(project_workspaces ⋈ workspace_membership WHERE role != 'excluded')
+  ∪ project_membership(role = 'included')
+  ∖ project_membership(role = 'excluded')
+```
+
+This means:
+- All raws reachable through a non-excluded workspace link are visible to
+  the project.
+- Explicit `project_membership` rows (pins, manual includes) layer on top
+  as overrides.
+- Explicit `excluded` membership rows act as a veto regardless of workspace
+  linkage.
+
+Projects no longer own source roots directly; source roots belong to
+workspaces. One workspace can serve N projects; a raw node scanned into a
+workspace becomes available to all linked projects without re-embedding.
+
 ### 2. Interpretation graph — `InterpretationNode`s + `Edge`s
 
 Your distillations. Subkinds (PLAN §Inspiration carried forward):
@@ -37,6 +72,7 @@ Your distillations. Subkinds (PLAN §Inspiration carried forward):
 - `touchstone` — a pinned anchor for a project
 - `experiment` — time-boxed test with a hypothesis
 - `metaphor` — figurative framework for understanding something
+- `relevance` — a typed bridge between one or more workspaces and the project's intent, at a named angle; always multi-source (cites ≥2 raws)
 
 Edges are typed. Symmetric (`reinforces`, `contradicts`, `aliases`,
 `co_occurs`) auto-create their reciprocal; `specializes` auto-creates an
@@ -62,6 +98,10 @@ paper share *that paper's node* — no duplication.
 - `excluded` — explicitly hidden from this project.
 - `pinned`   — touchstone; boosted in retrieval, used as a default PPR anchor.
 
+The effective member set for a project is computed by
+`project_effective_members` (see "Information Workspaces" above). Explicit
+`project_membership` rows take precedence over workspace-derived membership.
+
 ## Storage layout on disk
 
 ```
@@ -78,8 +118,8 @@ paper share *that paper's node* — no duplication.
 Override the data dir with `LOCI_DATA_DIR=/path`.
 
 The SQLite database holds *everything graph-related* — nodes, edges,
-projects, memberships, FTS5 inverted index, vector index, jobs, traces,
-responses, proposals, communities. Backing up loci is `cp loci.sqlite*
+projects, memberships, workspaces, FTS5 inverted index, vector index, jobs,
+traces, responses, proposals, communities. Backing up loci is `cp loci.sqlite*
 backup/`. Moving to a new machine is `rsync ~/.loci/`.
 
 ## Request flow
@@ -149,19 +189,36 @@ loci.agent.interpreter.reflect():
       - fetch retrieved-but-not-cited nodes (from traces)
       - roll up citation feedback (cited_kept / cited_dropped / cited_replaced)
         if the user has submitted any
+      - fetch linked workspaces (name, kind, description, 6 sample raw titles)
+        and render WORKSPACE CONTEXT block for the synthesis prompt
    2. SYNTHESISE (interpretation_model):
-      → propose Action[] = create | reinforce | soften | link
+      → propose Action[] = create | reinforce | soften | link | update_angle
+      (subkind chosen from candidates actually observed, not defaulted to relevance)
    3. SELF-CRITIQUE (interpretation_model):
       → keep[] / drop[] indices + reason
    4. APPLY surviving actions:
       - creates: write InterpretationNode at conf 0.40, origin=agent_synthesis
       - reinforces / softens: confidence += 0.05 (signed)
       - links: edges via EdgeRepository.create (with symmetry/inverse)
+      - update_angle: update angle + rationale_md on existing relevance node in place
    5. log to agent_reflections (deliberation_md + actions_json)
 ```
 
 Trigger sources for the reflect job: `draft` (auto), `feedback`
-(citation-level diff), `kickoff`, `manual`.
+(citation-level diff), `kickoff`, `manual`, `relevance` (workspace linkage
+events — focused single-pass, no self-critique stage).
+
+### Linkage events
+
+Workspace linkage and scan events generate both synchronous and asynchronous
+effects:
+
+| Event | Sync | Async |
+|---|---|---|
+| Link W→P | insert `project_workspaces` join row | enqueue `relevance(scope=link)` |
+| Unlink W from P | remove `project_workspaces` join row | enqueue `sweep_orphans` — finds live interpretation nodes whose all cited raws are no longer in `project_effective_members`, flips them to `dirty`, files `forget` proposals |
+| Workspace gains raw (during scan) | insert `workspace_membership` | for each linked project where role != `excluded`: enqueue `relevance(scope=incremental)`, deduped via fingerprint |
+| Profile change | update project profile | optional `relevance(scope=profile_refresh)`, gated by config |
 
 ### A scan call
 
@@ -200,6 +257,9 @@ worker thread picks it up and runs jobs.absorb.run():
    6. detect_forgetting    : low conf + no access N days → dismiss proposals
    7. contradiction_pass   : (LLM) for each new raw, classify against top-3 interps; tensions / reinforces
    8. communities          : (igraph) Leiden over the interp graph
+   9. co_citation_edges    : find pairs of interpretation nodes that both cite the same raw
+                             (via existing `cites` edges); create `co_occurs` edges between them.
+                             Safe to re-run — idempotent. Also runs in kickoff as a post-write step.
 ```
 
 The proposals from absorb are the *only* surface where the user is asked

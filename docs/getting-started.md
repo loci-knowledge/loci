@@ -127,43 +127,81 @@ uv run loci project create codoc \
 Save that ULID — the frontend uses it. (You can always look it up later
 with `uv run loci project list`.)
 
-## 3. Register your sources
+## 3. Create a workspace and add sources
 
-Files can live anywhere on your filesystem. Register one *root* per
-modality so each scan picks up everything underneath.
+A **workspace** is a named collection of source roots. It sits between your
+filesystem and a project, so the same scanned files can serve multiple
+projects without re-scanning.
 
 ```bash
-uv run loci source add codoc ~/Documents/codoc/papers --label papers
-uv run loci source add codoc ~/Documents/codoc/code   --label code
-uv run loci source add codoc ~/Documents/codoc/notes  --label notes
-uv run loci source list codoc
+uv run loci workspace create codoc-ws \
+  --name "Codoc sources" \
+  --kind mixed
+```
+
+`kind` is one of `papers | codebase | notes | transcripts | web | mixed`. Use
+`mixed` when a workspace spans more than one modality (as in our case).
+
+Now register the three roots:
+
+```bash
+uv run loci workspace add-source codoc-ws ~/Documents/codoc/papers --label papers
+uv run loci workspace add-source codoc-ws ~/Documents/codoc/code   --label code
+uv run loci workspace add-source codoc-ws ~/Documents/codoc/notes  --label notes
 ```
 
 Supported file types: PDF, Markdown, plain text, RST/org, HTML, transcripts
 (VTT/SRT), and ~30 source-code extensions. See [sources.md](./sources.md)
 for the full list and high-quality PDF parsing via marker.
 
-## 4. Scan
+## 4. Link the workspace to your project
 
 ```bash
-uv run loci scan codoc
+uv run loci workspace link codoc-ws codoc --role primary
 ```
 
-This walks every registered root, content-hashes each file, deduplicates
-against the global raw store, extracts text, batches embeddings through the
-local model, and writes one `RawNode` per file. Sample output:
+Roles: `primary` (the workspace's content drives this project's context),
+`reference` (supplementary; included but weighted lower), or `excluded`
+(explicitly suppressed). A project can link multiple workspaces — one might
+be `primary`, others `reference`.
+
+Linking with `--role primary` automatically enqueues a `relevance` job that
+does a focused single-pass synthesis for the workspace↔project pair. This
+runs in the background; you can proceed without waiting for it.
+
+> **Tip — sharing a workspace across projects.** If you have a second project
+> that should see the same raws (say, a `codoc-review` project a colleague is
+> using), just link the same workspace there:
+> ```bash
+> uv run loci workspace link codoc-ws codoc-review --role reference
+> ```
+> The workspace is scanned once and both projects see the same raw nodes via
+> the `project_effective_members` view — no re-scanning, no duplication.
+
+## 5. Scan
+
+```bash
+uv run loci workspace scan codoc-ws
+```
+
+This walks every source registered to the workspace, content-hashes each
+file, deduplicates against the global raw store, extracts text, batches
+embeddings through the local model, and writes one `RawNode` per file.
+Sample output:
 
 ```
 {
   'scanned': 131, 'new_raw': 131, 'deduped': 0,
-  'skipped': 0, 'members_added': 131, 'errors': []
+  'members_added': 131, 'errors': []
 }
 ```
 
-Re-run `loci scan codoc` whenever you add files — it's idempotent. Files
-already present (by content hash) are skipped without re-extraction.
+Re-run `loci workspace scan codoc-ws` whenever you add files — it's
+idempotent. Files already present (by content hash) are skipped without
+re-extraction. Because the workspace is linked to the project, newly scanned
+nodes immediately become part of `codoc`'s effective members.
 
-## 5. Kickoff: get the first questions
+## 6. Kickoff: get the first questions
 
 Kickoff reads your profile + a sample of the raws and proposes 5–10 *open
 questions* worth pursuing. **It does not invent interpretations on day one**
@@ -185,7 +223,11 @@ uv run loci q codoc "what counts as a cite-worthy span?" --k 5
 The questions show up in the ranked results alongside raw sources because
 they're real graph nodes from minute one.
 
-## 6. Draft something
+Note: if the `relevance` job from the workspace link (step 4) has not yet
+finished, kickoff will still work — it draws from whatever raws are already
+scanned. The relevance synthesis runs on top of that.
+
+## 7. Draft something
 
 Now the high-leverage operation. Ask loci to write something using your
 sources:
@@ -212,7 +254,7 @@ By the time you come back tomorrow, the graph has a few new live
 interpretation nodes you didn't write. See [agent.md](./agent.md) for what
 the agent is allowed to do.
 
-## 7. Close the alignment loop with feedback
+## 8. Close the alignment loop with feedback
 
 If you edit the draft (kept these citations, dropped those, rewrote the
 sentence around C2…) and submit your edit:
@@ -229,7 +271,7 @@ kept reinforce the underlying nodes; ones you dropped soften them.
 This is the core alignment loop. Three or four cycles in, the agent's voice
 starts to sound like yours.
 
-## 8. Start the server
+## 9. Start the server
 
 For the VSCode extension, MCP clients, or the REST API, run the server:
 
@@ -247,7 +289,7 @@ For Claude Code MCP integration:
 uv run loci mcp        # stdio transport — Claude subprocesses this
 ```
 
-## 9. Connect the VSCode extension (loki-frontend)
+## 10. Connect the VSCode extension (loki-frontend)
 
 The extension lives in a separate repo. Once the loci server is running on
 127.0.0.1:7077, the extension picks it up automatically.
@@ -282,7 +324,7 @@ Configure the server URL or pre-pin a project in VSCode settings:
 
 Full extension guide: [frontend.md](./frontend.md).
 
-## 10. Maintain: absorb (occasionally)
+## 11. Maintain: absorb (occasionally)
 
 Every ~30 sessions or once a week, run absorb to consolidate:
 

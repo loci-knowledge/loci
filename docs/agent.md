@@ -10,28 +10,31 @@ usage, without any explicit gesture from you.
 
 ## When the agent fires
 
-| trigger    | what fired it                                           |
-|------------|---------------------------------------------------------|
-| `draft`    | A `loci draft` (or the REST equivalent) just completed. |
-| `feedback` | You submitted citation-level feedback for a previous draft. |
-| `kickoff`  | Project kickoff (questions land directly as live nodes). |
-| `manual`   | You called `loci reflect <project>`.                    |
+| trigger       | what fired it                                           |
+|---------------|---------------------------------------------------------|
+| `draft`       | A `loci draft` (or the REST equivalent) just completed. |
+| `feedback`    | You submitted citation-level feedback for a previous draft. |
+| `kickoff`     | Project kickoff (questions land directly as live nodes). |
+| `manual`      | You called `loci reflect <project>`.                    |
+| `relevance`   | A workspace was linked to the project, the project profile changed, or incremental workspace members were added (see "Workspace context" below). Runs a focused single-pass synthesis without a self-critique stage. |
+| `update_angle` | Triggered by citation feedback on a `relevance` node when the angle appears wrong, or by a direct user edit to such a node. Retargets the node's `angle` and `rationale_md` without recreating it. |
 
-The first three are auto-enqueued. The agent runs in the worker thread, so
+The first four are auto-enqueued. The agent runs in the worker thread, so
 your draft response is non-blocking — you read the draft while the agent
 thinks about what to add to your graph.
 
 ## What the agent decides
 
 For every reflection cycle, the agent emits a list of **Actions**. Each
-action is one of four kinds:
+action is one of five kinds:
 
-| kind        | effect                                                            |
-|-------------|-------------------------------------------------------------------|
-| `create`    | Write a new interpretation node (philosophy, pattern, tension, decision, question, touchstone, experiment, metaphor) at confidence 0.40, `origin=agent_synthesis`. Optionally link it into the existing graph. |
-| `reinforce` | Bump an existing node's confidence by +0.05.                      |
-| `soften`    | Drop an existing node's confidence by −0.05.                      |
-| `link`      | Add a typed edge between two existing nodes (or between a newly-created node and an existing one). |
+| kind           | effect                                                            |
+|----------------|-------------------------------------------------------------------|
+| `create`       | Write a new interpretation node (philosophy, pattern, tension, decision, question, touchstone, experiment, metaphor, or `relevance` — see "Workspace context") at confidence 0.40, `origin=agent_synthesis`. Optionally link it into the existing graph. |
+| `reinforce`    | Bump an existing node's confidence by +0.05.                      |
+| `soften`       | Drop an existing node's confidence by −0.05.                      |
+| `link`         | Add a typed edge between two existing nodes (or between a newly-created node and an existing one). |
+| `update_angle` | Retarget an existing `relevance` node's `angle` field and `rationale_md` without recreating the node. This is the RLHF refinement path for workspace-level relevance claims. |
 
 ## Two-stage LLM pipeline
 
@@ -48,6 +51,69 @@ action is one of four kinds:
 
 Only surviving Actions are applied. Everything is logged to
 `agent_reflections` so you can audit the agent's reasoning.
+
+The `relevance` job skips the self-critique stage — it is a focused
+single-pass synthesis scoped to one workspace↔project pair, where the
+angle vocabulary already constrains output quality.
+
+The synthesis prompt chooses subkind based on what is actually observed in
+the candidate set. The agent does not default to `relevance`; it selects
+`relevance` only when the evidence spans multiple workspaces or when the
+relationship between a source cluster and the project's intent is the
+primary thing worth naming.
+
+## Workspace context
+
+When a project is linked to one or more information workspaces, `_build_context()`
+injects a **WORKSPACE CONTEXT** block into the synthesis prompt. This block
+lists each linked workspace's name, kind, description, and up to six sample
+raw titles. It gives the agent the vocabulary it needs to name bridges across
+workspace boundaries.
+
+### The `relevance` subkind
+
+A `relevance` node expresses a typed relationship between one or more
+information workspaces and the project's intent. It is always multi-source
+(cites ≥2 raw nodes, ideally from different workspaces). Unlike a `pattern`
+(which names a recurring behaviour in *your* work) or a `decision` (which
+records an inflection point), a `relevance` node names *why a cluster of
+external sources matters to this project* — what angle the connection takes.
+
+Two required fields distinguish relevance nodes from generic interps:
+
+- **`angle`** — one of eight named values:
+  - `applicable_pattern` — a method or pattern from the workspace that applies directly
+  - `experimental_setup` — a setup, apparatus, or protocol transferable to this project
+  - `borrowed_concept` — a theoretical construct imported from another domain
+  - `counterexample` — a case that challenges or stress-tests the project's assumptions
+  - `prior_attempt` — an earlier effort at the same problem, succeeded or failed
+  - `vocabulary_source` — a workspace that provides the naming conventions the project uses
+  - `methodological_neighbor` — adjacent methodology that informs without being adopted wholesale
+  - `contrast_baseline` — a reference point the project explicitly positions against
+
+- **`rationale_md`** — 1–3 sentences: the "because" clause that distinguishes
+  this relevance from a generic mention. The agent must supply this; nodes
+  lacking it are rejected at self-critique.
+
+### When to prefer `relevance` vs. other subkinds
+
+Use `relevance` when the thing worth naming is the relationship between a
+source cluster and the project, not something internal to the project itself.
+Use `pattern` for recurring behaviours in your own work, `tension` for
+internal contradictions, `decision` for inflection points. If the agent is
+unsure, it should prefer the more specific internal subkind and let workspace
+context appear in the `rationale_md` of ordinary nodes rather than forcing a
+`relevance` frame.
+
+### The `update_angle` action
+
+When citation feedback on a `relevance` node signals the angle was wrong
+(e.g., the user drops a citation that was the whole basis of
+`applicable_pattern`), the next reflect cycle may emit `update_angle` instead
+of softening or recreating. `update_angle` carries a new `angle` value and a
+new `rationale_md`, and updates the node in place. This preserves the node's
+identity, edge connections, and confidence history while correcting the
+interpretation.
 
 ## Citation feedback — the alignment signal
 
@@ -70,7 +136,9 @@ Each cited node lands one of three trace kinds:
 
 These traces feed directly into the next reflection cycle's input, so
 "explicitly dropped" becomes "the agent should soften that node and
-consider why it was retrieved in the first place."
+consider why it was retrieved in the first place." For `relevance` nodes,
+`cited_dropped` on the primary source citation additionally triggers
+consideration of an `update_angle` action in the next cycle.
 
 ## Inspecting the agent
 
@@ -107,6 +175,12 @@ synthesising things that match how you think, or drifting toward generic.
   forgetting pass at absorb time only flags candidates, never auto-prunes.
 - **Audit trail** — every cycle is in `agent_reflections`. Every signal is
   in `traces`. Nothing happens that you can't reconstruct.
+- **Relevance discipline** — `relevance` nodes require both `angle` and
+  `rationale_md` to be accepted. The named angle forces the agent to commit
+  to a specific claim about *why* a source cluster matters, not just *that*
+  it is related. This acts as the alignment signal for workspace-level
+  relevance, operating at the cluster level rather than the individual node
+  level. Nodes missing either field are rejected at self-critique.
 
 ## Tuning
 
