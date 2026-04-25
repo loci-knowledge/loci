@@ -5,17 +5,21 @@ factory=True)` and by the CLI's `loci server` command. Tests construct a fresh
 app per test by calling `create_app()` directly.
 
 App lifespan: at startup we run migrations (idempotent) so a fresh data dir
-just works. Shutdown is a no-op — connections are closed by Python's atexit.
+just works, and we hand the running asyncio loop to the pubsub bus so sync
+route handlers can schedule WS publishes onto it. Shutdown is a no-op —
+connections are closed by Python's atexit.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from loci import __version__
+from loci.api.pubsub import bus
 from loci.config import get_settings
 from loci.db import migrate
 
@@ -30,6 +34,9 @@ async def _lifespan(app: FastAPI):
     applied = migrate()
     if applied:
         log.info("Applied migrations: %s", applied)
+    # Hand the running loop to pubsub so sync route handlers can schedule
+    # `bus.publish(...)` from the threadpool via `run_coroutine_threadsafe`.
+    bus.attach_loop(asyncio.get_running_loop())
     yield
 
 
@@ -47,6 +54,7 @@ def create_app() -> FastAPI:
     # Routers are imported here (not at module top) so app construction is
     # cheap and tests can swap implementations.
     from loci.api.routes import (
+        anchors,
         draft,
         edges,
         feedback,
@@ -61,6 +69,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(projects.router)
+    app.include_router(anchors.router)
     app.include_router(sources.router)
     app.include_router(retrieve.router)
     app.include_router(draft.router)

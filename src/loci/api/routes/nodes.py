@@ -10,6 +10,12 @@ PLAN.md §API §Graph manipulation:
     POST /nodes/:id/pin              role: pinned in current project
     GET  /nodes/:id/trace            session history of this node
     GET  /nodes/:id/responses        responses that cited this node
+
+After-DB-commit, every mutation (create / edit / accept / dismiss / pin)
+publishes a graph-delta event to `project:{id}` so the VSCode extension's
+GraphSocket can update the visualisation in real time. The payload mirrors
+the shape `loki-frontend/extension/src/state/deltaReducer.ts` already accepts:
+`{op: "upsert", entity: "node", payload: <node-dict>, seq, ts}`.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from loci.api.dependencies import db
+from loci.api.publishers import publish_node_upsert
 from loci.citations import CitationTracker
 from loci.embed.local import get_embedder
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
@@ -62,6 +69,8 @@ class PatchNode(BaseModel):
 def create_node(
     body: CreateNode, conn: sqlite3.Connection = Depends(db),
 ) -> dict:
+    from loci.api.publishers import publish_edge_upsert
+
     nodes_repo = NodeRepository(conn)
     edges_repo = EdgeRepository(conn)
     projects_repo = ProjectRepository(conn)
@@ -85,13 +94,23 @@ def create_node(
     projects_repo.add_member(body.project_id, n.id, role="included")
 
     edges_created: list[str] = []
+    new_edges = []
     for raw_id in body.cites:
         for e in edges_repo.create(n.id, raw_id, type="cites"):
             edges_created.append(e.id)
+            new_edges.append(e)
     for typ, dst_ids in body.related.items():
         for dst in dst_ids:
             for e in edges_repo.create(n.id, dst, type=typ):  # type: ignore[arg-type]
                 edges_created.append(e.id)
+                new_edges.append(e)
+
+    # Publish after-commit (the repos run their own transactions). One node
+    # upsert + one edge upsert per created edge. The project_id is fixed
+    # because we just added the membership above.
+    publish_node_upsert(conn, n, project_ids=[body.project_id])
+    for e in new_edges:
+        publish_edge_upsert(conn, e, project_ids=[body.project_id])
     return {"node_id": n.id, "edges_created": edges_created}
 
 
@@ -137,6 +156,10 @@ def patch_node(
     )
     if body.status is not None:
         nodes_repo.set_status(node_id, body.status)
+    # Re-fetch and publish so subscribers get the updated shape.
+    updated = nodes_repo.get(node_id)
+    if updated is not None:
+        publish_node_upsert(conn, updated)
     return {"updated": True}
 
 
@@ -150,6 +173,9 @@ def accept_node(
         raise HTTPException(404, detail="node not found")
     nodes_repo.set_status(node_id, "live")
     nodes_repo.bump_confidence(node_id, +0.15)  # PLAN.md §Interaction vocabulary
+    updated = nodes_repo.get(node_id)
+    if updated is not None:
+        publish_node_upsert(conn, updated)
     return {"status": "live"}
 
 
@@ -161,6 +187,9 @@ def dismiss_node(
     if nodes_repo.get(node_id) is None:
         raise HTTPException(404, detail="node not found")
     nodes_repo.set_status(node_id, "dismissed")
+    updated = nodes_repo.get(node_id)
+    if updated is not None:
+        publish_node_upsert(conn, updated)
     return {"status": "dismissed"}
 
 
@@ -177,6 +206,11 @@ def pin_node(
         raise HTTPException(404, detail="node not found")
     projects_repo.add_member(project_id, node_id, role="pinned")
     CitationTracker(conn).append_trace(project_id, node_id, "pinned")
+    updated = NodeRepository(conn).get(node_id)
+    if updated is not None:
+        # Pin only mutates membership in this project; the node itself is
+        # unchanged, but we re-publish so clients see the new role.
+        publish_node_upsert(conn, updated, project_ids=[project_id])
     return {"role": "pinned"}
 
 

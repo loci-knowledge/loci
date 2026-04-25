@@ -64,6 +64,11 @@ class CitationTracker:
         retrieval surfaced — those get `kind='retrieved'` traces. Cited rows
         get `kind='cited'`. A node can appear in both lists; we emit one row
         per (kind, node) pair.
+
+        After the SQL commit, every (node_id, action) trace is published to
+        the project's WS channel so subscribers can update their TraceLayer
+        in real time. Publish failures are swallowed — losing a real-time
+        update is preferable to corrupting the SQL write path.
         """
         from loci.db.connection import transaction
 
@@ -114,6 +119,12 @@ class CitationTracker:
                         for nid in retrieved_only
                     ],
                 )
+        # After commit, fan out trace events to subscribers.
+        self._publish_traces(
+            record.project_id, record.session_id, record.id,
+            ts=record.ts,
+            cited=record.cited_node_ids, retrieved=retrieved_only,
+        )
         return record.id
 
     def append_trace(
@@ -123,6 +134,7 @@ class CitationTracker:
     ) -> str:
         """Single-trace write — used for explicit gestures (accept/dismiss/pin)."""
         trace_id = new_id()
+        ts = now_iso()
         self.conn.execute(
             """
             INSERT INTO traces(id, project_id, session_id, response_id,
@@ -130,9 +142,52 @@ class CitationTracker:
             VALUES (?,?,?,?,?,?,?,?)
             """,
             (trace_id, project_id, session_id, response_id, node_id, kind,
-             now_iso(), client),
+             ts, client),
+        )
+        self._publish_one_trace(
+            project_id=project_id, node_id=node_id, action=kind,
+            ts=ts, session_id=session_id or None, response_id=response_id,
         )
         return trace_id
+
+    # -----------------------------------------------------------------------
+    # Pub/sub fan-out (best-effort)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _publish_one_trace(
+        *, project_id: str, node_id: str, action: str, ts: str,
+        session_id: str | None, response_id: str | None,
+    ) -> None:
+        # Imported lazily so the citations module doesn't pull pubsub at import
+        # time (tests construct CitationTracker without an event loop).
+        import contextlib
+
+        try:
+            from loci.api.publishers import publish_trace
+        except Exception:  # noqa: BLE001
+            return
+        # Never let a WS publish break the SQL write path.
+        with contextlib.suppress(Exception):
+            publish_trace(
+                project_id, node_id=node_id, action=action, ts=ts,
+                session_id=session_id, response_id=response_id,
+            )
+
+    def _publish_traces(
+        self, project_id: str, session_id: str, response_id: str,
+        *, ts: str, cited: list[str], retrieved: list[str],
+    ) -> None:
+        for nid in cited:
+            self._publish_one_trace(
+                project_id=project_id, node_id=nid, action="cited",
+                ts=ts, session_id=session_id, response_id=response_id,
+            )
+        for nid in retrieved:
+            self._publish_one_trace(
+                project_id=project_id, node_id=nid, action="retrieved",
+                ts=ts, session_id=session_id, response_id=response_id,
+            )
 
     # -----------------------------------------------------------------------
     # Reads — power the citation expansion endpoints

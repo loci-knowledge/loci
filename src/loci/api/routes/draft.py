@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 
 from fastapi import APIRouter, Depends, Header
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from loci.api.dependencies import db, project_by_id
 from loci.graph.models import Project
@@ -21,7 +21,10 @@ router = APIRouter(prefix="/projects", tags=["draft"])
 class DraftBody(BaseModel):
     instruction: str
     context_md: str | None = None
-    anchors: list[str] = Field(default_factory=list)
+    # `anchors` is Optional so we can distinguish "not provided" (None →
+    # fall back to active anchors) from "explicitly empty" ([] → caller
+    # wants no anchors). See `post_draft` for the resolution.
+    anchors: list[str] | None = None
     style: str = "prose"  # prose | outline | code-comments | bibtex
     cite_density: str = "normal"  # low | normal | high
     session_id: str = "default"
@@ -53,14 +56,19 @@ def post_draft(
 ) -> DraftResponseBody:
     # Imported lazily so a request hitting the route exercises the LLM stack
     # only when needed; tests of other routes don't pay for it.
+    from loci.api.routes.anchors import get_active_anchors
     from loci.draft import DraftRequest, draft
+
+    # Anchor fallback: distinguish "not provided" (None → use active anchors)
+    # from "explicitly empty" ([] → caller wants none).
+    anchors = list(body.anchors) if body.anchors is not None else get_active_anchors(project.id)
 
     req = DraftRequest(
         project_id=project.id,
         session_id=body.session_id,
         instruction=body.instruction,
         context_md=body.context_md,
-        anchors=body.anchors,
+        anchors=anchors,
         style=body.style,  # type: ignore[arg-type]
         cite_density=body.cite_density,  # type: ignore[arg-type]
         hyde=body.hyde,

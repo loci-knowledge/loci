@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 
 from fastapi import APIRouter, Depends, Header
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from loci.api.dependencies import db, project_by_id
 from loci.citations import CitationTracker, ResponseRecord
@@ -25,7 +25,11 @@ router = APIRouter(prefix="/projects", tags=["retrieve"])
 class RetrieveBody(BaseModel):
     query: str
     k: int = 10
-    anchors: list[str] = Field(default_factory=list)
+    # `anchors` is intentionally Optional so we can distinguish "not provided"
+    # (None → fall back to the project's active-anchor set, if any) from
+    # "explicitly empty" ([] → caller wants no anchors at all). This matches
+    # PLAN.md §Retrieval semantics.
+    anchors: list[str] | None = None
     include: list[str] | None = None
     hyde: bool = False
     session_id: str = "default"
@@ -60,11 +64,21 @@ def post_retrieve(
     conn: sqlite3.Connection = Depends(db),
     user_agent: str = Header("unknown"),
 ) -> RetrieveResponseBody:
+    # Anchor fallback: if the client didn't pass `anchors` at all, consult
+    # the project's active-anchor set (frontend's "Pin for Claude Code"). An
+    # explicit empty list is preserved verbatim — the caller wants none.
+    from loci.api.routes.anchors import get_active_anchors
+
+    anchors = (
+        get_active_anchors(project.id) if body.anchors is None
+        else list(body.anchors)
+    )
+
     req = RetrievalRequest(
         project_id=project.id,
         query=body.query,
         k=body.k,
-        anchors=body.anchors,
+        anchors=anchors,
         include=body.include,
         hyde=body.hyde,
     )

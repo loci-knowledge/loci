@@ -27,8 +27,16 @@ def register_ws(app: FastAPI) -> None:
         channel = f"project:{project_id}"
         q = await bus.subscribe(channel)
         try:
-            # Send a hello so the client knows the connection is live.
-            await ws.send_json({"type": "subscribed", "channel": channel})
+            # Send a hello so the client knows the connection is live. We
+            # include the current `seq` so a reconnecting client knows which
+            # range it has already seen — the next published event will carry
+            # `seq + 1`. (Backfill from `seq+1` is a future endpoint; for now
+            # the value is informational so the client can detect skips.)
+            await ws.send_json({
+                "type": "subscribed",
+                "channel": channel,
+                "seq": bus.current_seq(project_id),
+            })
             while True:
                 event = await q.get()
                 await ws.send_json(event)
