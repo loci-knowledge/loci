@@ -201,16 +201,17 @@ idempotent. Files already present (by content hash) are skipped without
 re-extraction. Because the workspace is linked to the project, newly scanned
 nodes immediately become part of `codoc`'s effective members.
 
-## 6. Kickoff: get the first questions
+## 6. Kickoff: get the first tensions
 
 Kickoff reads your profile + a sample of the raws and proposes 5–10 *open
-questions* worth pursuing. **It does not invent interpretations on day one**
-— questions only, at confidence 0.5, written directly into the live graph
-(not into a proposal queue).
+tensions* worth pursuing. **It does not invent interpretations on day one**
+— `tension` nodes only, at confidence 0.5, written directly into the live
+graph (not into a proposal queue). Tensions are open questions and conflicts
+that invite your reasoning rather than assert conclusions.
 
 ```bash
 uv run loci kickoff codoc --n 8
-# → result: { 'skipped': false, 'questions_written': 8,
+# → result: { 'skipped': false, 'tensions_written': 8,
 #            'model': 'openai:gpt-5.4-mini' }
 ```
 
@@ -220,7 +221,7 @@ You can list them:
 uv run loci q codoc "what counts as a cite-worthy span?" --k 5
 ```
 
-The questions show up in the ranked results alongside raw sources because
+The tensions show up in the ranked results alongside raw sources because
 they're real graph nodes from minute one.
 
 Note: if the `relevance` job from the workspace link (step 4) has not yet
@@ -289,6 +290,16 @@ For Claude Code MCP integration:
 uv run loci mcp        # stdio transport — Claude subprocesses this
 ```
 
+To let MCP tools auto-resolve the current project without passing a `project`
+argument every call, bind a project to your working directory:
+
+```bash
+loci project bind codoc   # writes .loci/project in the cwd
+```
+
+MCP tools walk up from cwd to find this file. You can also set
+`LOCI_PROJECT=codoc` in your environment, or pass `project=` explicitly.
+
 ## 10. Connect the VSCode extension (loki-frontend)
 
 The extension lives in a separate repo. Once the loci server is running on
@@ -341,6 +352,8 @@ surface (the silent reflect cycle handles per-draft work):
 - forgetting candidates (no access in N days + low confidence)
 - contradiction pass (LLM-mediated; needs an API key)
 - community detection (Leiden; needs `loci[graph]` extra)
+- semantic edge refresh for co-cited interpretation pairs (step 9)
+- code dependency extraction: Python/JS/TS import analysis → `actual` edges (step 10)
 
 ## What's next
 

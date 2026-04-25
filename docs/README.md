@@ -32,7 +32,8 @@ If you're reading docs for the first time, read in this order:
 The two repos:
 
 - **`loci/`** (this repo) — the server: SQLite, embeddings, agent, REST,
-  WS, MCP, CLI. Talks on `127.0.0.1:7077`.
+  WS, MCP, CLI. Talks on `127.0.0.1:7077`. MCP tools support auto-resolution
+  of the active project via `loci project bind <slug>` or `LOCI_PROJECT` env.
 - **`loki-frontend/`** — the VSCode extension. Optional. Connects to the
   loci server.
 

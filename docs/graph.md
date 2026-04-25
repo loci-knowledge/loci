@@ -12,7 +12,7 @@ Every loci project owns a three-level structure:
 raw nodes  (files)
     ↓  cites
 interpretation nodes  (distillations)
-    ↓  reinforces / extends / co_occurs / …
+    ↓  semantic
 interpretation nodes  (meta-level)
 ```
 
@@ -67,7 +67,7 @@ Every interpretation node has:
 | field          | meaning                                                   |
 |----------------|-----------------------------------------------------------|
 | `kind`         | always `"interpretation"`                                 |
-| `subkind`      | one of the 7 types below                                  |
+| `subkind`      | one of the 4 types below                                  |
 | `title`        | ≤80 chars — the claim or question in brief                |
 | `body`         | 1–4 sentences — the full statement                        |
 | `confidence`   | 0.0–1.0 — how established the interpretation is           |
@@ -78,25 +78,18 @@ Every interpretation node has:
 
 #### Subkinds
 
-**`question`** — An open question the project must answer, not yet resolved.
-Kickoff produces these. They seed retrieval immediately and invite, rather than
-assert. Low confidence by default (0.5). As you draft answers, a
-`question`→`pattern` arc can emerge: the question gets softened, a new pattern
-node reinforces next to it.
+**`tension`** — An open question or conflict the project must grapple with,
+not yet resolved. Kickoff produces these. They seed retrieval immediately and
+invite reasoning rather than assert conclusions. Low confidence by default
+(0.5). A tension is honest about the competing pressures; it doesn't pretend
+there's a clean answer.
 
-*Created by:* kickoff job + reflect cycle.
+*Example:* "transparency should be there, but not in the way — provenance
+on-demand, not by default."
 
----
-
-**`pattern`** — A recurring structure or approach that appears across sources.
-Not a summary of one source — it must manifest in multiple places. The body
-names the trigger/cycle/outcome, not the paper it appears in.
-
-*Example:* "analysis before presentation — infer structure first, build the
-output surface after."
-
-*Created by:* reflect cycle (when candidates across multiple sources share a
-structural similarity).
+*Created by:* kickoff job + reflect cycle (when cited candidates embody
+competing commitments). Also from absorb's `detect_broken_supports` (a
+citation chain breaks, signalling instability in an assumed resolution).
 
 ---
 
@@ -111,19 +104,6 @@ forced the choice.
 
 ---
 
-**`tension`** — Two values or requirements that genuinely pull against each
-other in a way that doesn't resolve. Not a problem to fix — a creative
-constraint to navigate. A tension is honest about the cost of either side.
-
-*Example:* "transparency should be there, but not in the way — provenance
-on-demand, not by default."
-
-*Created by:* reflect cycle (when cited candidates embody competing
-commitments). Also from absorb's `detect_broken_supports` (a citation chain
-breaks, signalling instability in an assumed resolution).
-
----
-
 **`philosophy`** — A first-principle belief that grounds the project's
 direction. The most durable and least actionable node type. A philosophy
 should be something you'd invoke to settle a dispute about priorities, not a
@@ -133,13 +113,6 @@ description of an approach.
 
 *Created by:* reflect cycle (rarely — only when the agent observes a
 consistent axiom, not a pattern or decision).
-
----
-
-**`question` (kickoff variant)** — Same type, but kickoff questions are
-written at confidence 0.50 (slightly above agent-synthesised patterns/decisions
-at 0.40) because they're meant to surface immediately in retrieval. Questions
-written by the reflect cycle are also at 0.40.
 
 ---
 
@@ -183,30 +156,24 @@ rationale without recreating the node).
 ## Edge types
 
 Edges are stored in the `edges` table with `src`, `dst`, `type`, `weight`.
-Some types are symmetric (auto-create their reciprocal); `specializes`
-auto-creates an inverse `generalizes`.
+`semantic` edges are symmetric (auto-create their reciprocal).
 
-| type             | direction     | symmetric | meaning                                                   |
-|------------------|---------------|-----------|-----------------------------------------------------------|
-| `cites`          | interp → raw  | no        | The interpretation draws on this raw as evidence. The primary structural link between layers. |
-| `reinforces`     | interp → interp | yes      | Two interpretations support each other — seeing one makes the other more credible. |
-| `co_occurs`      | interp → interp | yes      | Two interpretations cite the same raw node (shared evidence). Created automatically by absorb and kickoff. |
-| `extends`        | interp → interp | no       | One interpretation elaborates or specialises another without contradiction. |
-| `specializes`    | interp → interp | no       | A focused version of a more general interpretation. Auto-creates inverse `generalizes`. |
-| `generalizes`    | interp → interp | no       | Inverse of `specializes` (auto-created).                 |
-| `contradicts`    | interp → interp | yes      | Two interpretations claim incompatible things. Created by the contradiction pass in absorb. |
-| `aliases`        | interp → interp | yes      | Two interpretations are effectively the same claim at different abstraction levels. Created by absorb's alias detection (cosine > 0.92). |
+| type       | direction        | symmetric | meaning                                                   |
+|------------|------------------|-----------|-----------------------------------------------------------|
+| `cites`    | interp → raw     | no        | The interpretation draws on this raw as evidence. The primary structural link between layers. |
+| `semantic` | interp ↔ interp  | yes       | Two interpretations are semantically related — one supports, extends, contradicts, or co-occurs with the other. Created by reflect cycle `link` actions and by absorb's co-citation and contradiction passes. |
+| `actual`   | raw ↔ raw        | no        | An explicit dependency between raw nodes: code import, paper citation, or markdown link. Created by absorb's code dependency extraction (step 10). |
 
 ### How edges are created
 
-| source            | edge types produced                                      |
-|-------------------|----------------------------------------------------------|
-| Reflect cycle     | `cites` (from new interp to cited raws), `reinforces`, `extends`, `specializes`, `generalizes` (from `link` actions) |
-| Kickoff post-write | `cites` (anchor wiring — nearest raws by cosine), `co_occurs` (co-citation pairs) |
-| Absorb step 9     | `co_occurs` (idempotent co-citation update)              |
-| Absorb contradiction pass | `contradicts`, `reinforces` (from LLM classifier) |
-| Absorb alias detection | `aliases` (from cosine > 0.92 threshold)          |
-| User action       | any type via `POST /edges` or `loci link`                |
+| source                       | edge types produced                                             |
+|------------------------------|-----------------------------------------------------------------|
+| Reflect cycle                | `cites` (new interp → cited raws), `semantic` (from `link` actions) |
+| Kickoff post-write           | `cites` (anchor wiring — nearest raws by cosine), `semantic` (co-citation pairs) |
+| Absorb step 9                | `semantic` (idempotent co-citation update for interp pairs)     |
+| Absorb step 10               | `actual` (code import / paper citation / markdown link analysis) |
+| Absorb contradiction pass    | `semantic` (from LLM classifier)                                |
+| User action                  | any type via `POST /edges` or `loci link`                       |
 
 **Anchor wiring** (automatic): when a new interpretation node has no `cites`
 edge yet (isolated), kickoff computes its cosine similarity against all raw
@@ -214,9 +181,14 @@ nodes and wires the 3 nearest with `weight = cosine_sim`. This ensures every
 interpretation is grounded from minute one.
 
 **Co-citation** (automatic): two interpretation nodes that both cite raw R get
-a `co_occurs` edge. This edge means "shared evidence" — they're bound by the
-same source material, even if their claims differ. It is the lightest and most
-defensible structural edge: no inference required, just shared citation.
+a `semantic` edge. This edge means "shared evidence" — they're bound by the
+same source material, even if their claims differ. No inference required, just
+shared citation.
+
+**Code dependency** (automatic): absorb step 10 parses Python imports and
+JS/TS `import`/`require` statements in raw code nodes and writes `actual`
+edges between raw nodes that import each other. Paper citations and markdown
+links produce the same edge type.
 
 ---
 
@@ -252,7 +224,7 @@ defensible structural edge: no inference required, just shared citation.
 
 ## Confidence signal
 
-Confidence starts at 0.40 for agent-created nodes (0.50 for kickoff questions)
+Confidence starts at 0.40 for agent-created nodes (0.50 for kickoff tensions)
 and evolves through usage:
 
 | event                    | Δ confidence |
@@ -283,10 +255,10 @@ A well-developed loci graph has a natural gradient from *outer* (raw) to
 *inner* (abstract):
 
 ```
-raw sources  ──cites──▶  grounded interps  ──extends──▶  meta-interps
-(files)                   (cite 1-2 raws)                (cite other interps)
-                                ↕ co_occurs
-                          (shared evidence)
+raw sources  ──cites──▶  grounded interps  ──semantic──▶  meta-interps
+(files)                   (cite 1-2 raws)                 (cite other interps)
+    ↕ actual
+(imports/citations)
 ```
 
 Nodes closest to the raw layer (`cites` pointing outward) are the most
@@ -295,29 +267,29 @@ abstract — they've been distilled enough that the original source material
 isn't their primary claim.
 
 The **radial layout** in the `/tmp/loci_graph.html` visualization encodes this:
-- Center: philosophy + high-degree decision/pattern nodes
-- Mid-ring: questions and relevance nodes
+- Center: philosophy + high-degree decision/tension nodes
+- Mid-ring: tensions and relevance nodes
 - Outer ring: raw source nodes
 
 ### The edge density gradient
 
-A dense `co_occurs` cluster means several interpretations are drawing from the
-same raw sources — this is your most fertile ground for synthesis. If 4
-question nodes all co_occur via the same raw, ask: is there a pattern or
-tension hiding here that should be written explicitly?
+A dense `semantic` cluster around several interpretations citing the same raw
+source is your most fertile ground for synthesis. If several tension nodes
+share evidence via semantic edges, ask: is there a decision or philosophy
+that should be written explicitly to resolve them?
 
-A `reinforces` chain means multiple interpretations support each other
-independently — a sign of a stable belief. A `contradicts` edge is the inverse:
-two beliefs in tension that the project hasn't resolved.
+A `semantic` chain connecting interpretations that support each other signals a
+stable belief. Semantic edges from the contradiction pass mark beliefs in
+conflict that the project hasn't resolved.
 
-### Questions vs. claims
+### Tensions vs. decisions
 
-Questions (confidence 0.5) are placeholders. When the reflect cycle or a draft
-produces a pattern or decision that answers a question, you can:
-- Dismiss the question (it's been answered).
-- Reinforce the question to keep it visible as a known-open thread.
-- Create a `specializes` edge from the answer to the question (the answer is a
-  specific instance of the broader question).
+Tensions (confidence 0.5) are open questions and conflicts. When the reflect
+cycle or a draft produces a decision that resolves one, you can:
+- Dismiss the tension (it's been answered).
+- Reinforce the tension to keep it visible as a known-open thread.
+- Create a `semantic` edge from the decision to the tension (the decision
+  is a specific resolution of the broader conflict).
 
 ---
 
@@ -342,6 +314,14 @@ JOIN raw_nodes r ON r.node_id = e1.dst
 WHERE e1.type = 'cites' AND e2.type = 'cites'
 GROUP BY r.node_id
 ORDER BY pairs DESC;
+
+-- Raw nodes linked by actual dependencies (imports, citations, links)
+SELECT n1.title AS src_title, n2.title AS dst_title
+FROM edges e
+JOIN nodes n1 ON n1.id = e.src
+JOIN nodes n2 ON n2.id = e.dst
+WHERE e.type = 'actual'
+ORDER BY n1.title;
 
 -- Interpretation nodes with no raw support
 SELECT n.id, n.subkind, n.title
@@ -374,6 +354,8 @@ This is the full lifecycle from file to graph structure.
 ```
 loci workspace scan codoc-ws
   └─ walker: walk source roots, skip dotdirs / binaries / >50MB
+             skip dirs: coverage/, htmlcov/, .idea/, .vscode/, storybook-static/, .nuxt, .parcel-cache, …
+             skip files: *.min.js, *.map, *.lock, package-lock.json, yarn.lock, …
   └─ for each path:
        sha256[:16]  →  look up raw_nodes.content_hash
        if exists:   write workspace_membership only  (dedup)
@@ -384,17 +366,17 @@ loci workspace scan codoc-ws
          write workspace_membership
 ```
 
-### 2. Kickoff → first questions
+### 2. Kickoff → first tensions
 
 ```
 loci kickoff codoc
   └─ sample 12 raws (most recent) + project profile
-  └─ LLM: propose 8–10 open questions
-  └─ write InterpretationNode (subkind=question, conf=0.5, origin=agent_synthesis)
-  └─ anchor wiring: for each new question with no cites edge:
-       cosine(question_emb, all_raw_embs) → top-3 nearest
+  └─ LLM: propose 8–10 open TENSIONS worth pursuing
+  └─ write InterpretationNode (subkind=tension, conf=0.5, origin=agent_synthesis)
+  └─ anchor wiring: for each new tension with no cites edge:
+       cosine(tension_emb, all_raw_embs) → top-3 nearest
        write cites edges (weight = cosine_sim)
-  └─ co-citation: pairs of questions that cite same raw → co_occurs edges
+  └─ co-citation: pairs of tensions that cite same raw → semantic edges
 ```
 
 ### 3. Draft + reflect → interpretation graph
@@ -416,9 +398,8 @@ worker: reflect job
   └─ SYNTHESISE (interpretation_model):
        → Action[] — create / reinforce / soften / link / update_angle
        subkind chosen from observed candidates:
-         pattern: recurring structure across sources
+         tension: open question or conflict worth pursuing
          decision: a concrete choice with trade-offs
-         tension: two competing values
          philosophy: a grounding axiom
          relevance: named bridge between workspace(s) and project intent
   └─ SELF-CRITIQUE (interpretation_model):
@@ -431,19 +412,20 @@ worker: reflect job
   └─ anchor wiring + co-citation (for newly created nodes)
 ```
 
-### 4. Absorb → housekeeping
+### 4. Absorb → housekeeping (10 steps)
 
 ```
 loci absorb codoc  (or POST /projects/:id/absorb)
-  └─ fs_audit         : flip source_of_truth for missing files
-  └─ replay_traces    : roll up traces → access_count, confidence
-  └─ detect_orphans   : 0 edges → status=dirty
-  └─ detect_broken_supports: dead raw → broken proposals, status=stale
-  └─ detect_aliases   : cosine > 0.92 → alias proposals
-  └─ detect_forgetting: low conf + no access → dismiss proposals
-  └─ contradiction_pass: LLM 3-way classify each new raw vs top-3 interps
-  └─ communities      : Leiden algorithm over interp graph
-  └─ co_citation      : refresh co_occurs edges for all interp pairs
+  step 1  fs_audit            : flip source_of_truth for missing files
+  step 2  replay_traces       : roll up traces → access_count, confidence
+  step 3  detect_orphans      : 0 edges → status=dirty
+  step 4  detect_broken_supports: dead raw → broken proposals, status=stale
+  step 5  detect_aliases      : cosine > 0.92 → alias proposals
+  step 6  detect_forgetting   : low conf + no access → dismiss proposals
+  step 7  contradiction_pass  : LLM 3-way classify each new raw vs top-3 interps
+  step 8  communities         : Leiden algorithm over interp graph
+  step 9  co_citation         : refresh semantic edges for co-cited interp pairs
+  step 10 code_dependencies   : parse Python/JS/TS imports → actual edges between raw nodes
 ```
 
 ### 5. Workspace link → relevance pass
@@ -472,19 +454,15 @@ The D3.js force graph at `/tmp/loci_graph.html` uses:
 - **Node size** — proportional to degree + base size by subkind. High-degree
   nodes (heavily connected interpretations) appear larger.
 - **Node color** by subkind:
-  - question: blue
+  - tension: blue
   - relevance: green
-  - tension: red
   - philosophy: purple
-  - pattern: yellow
   - decision: cyan
   - raw: grey
 - **Edge style**:
   - `cites`: solid indigo
-  - `reinforces`: solid green
-  - `extends`: dashed amber
-  - `co_occurs`: faint dashed (background structure — shared evidence, not semantic claim)
-  - `specializes`/`generalizes`: dashed purple/blue
+  - `semantic`: faint dashed (background structure — shared evidence or semantic relationship)
+  - `actual`: solid amber (explicit raw→raw dependency)
 - **Click** any node for the side panel: full body, angle (if relevance),
   rationale, and the connection list.
 - **Filter bar** (top center): toggle subkinds on/off to reduce visual noise.
@@ -500,6 +478,6 @@ That command reads the local loci database and writes a standalone HTML
 snapshot. If your friend clones the repo, they will only see a graph after
 they create or open a project with data and run the export command.
 
-The co_occurs edges are shown at very low opacity so they don't obscure the
-structural (`cites`, `reinforces`) edges. If you want to hide them entirely,
-add `type != 'co_occurs'` to the edge export query.
+The `semantic` edges are shown at very low opacity so they don't obscure the
+structural `cites` edges. If you want to hide them entirely,
+add `type != 'semantic'` to the edge export query.

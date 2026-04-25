@@ -14,7 +14,7 @@ usage, without any explicit gesture from you.
 |---------------|---------------------------------------------------------|
 | `draft`       | A `loci draft` (or the REST equivalent) just completed. |
 | `feedback`    | You submitted citation-level feedback for a previous draft. |
-| `kickoff`     | Project kickoff (questions land directly as live nodes). |
+| `kickoff`     | Project kickoff (tension nodes land directly as live nodes). |
 | `manual`      | You called `loci reflect <project>`.                    |
 | `relevance`   | A workspace was linked to the project, the project profile changed, or incremental workspace members were added (see "Workspace context" below). Runs a focused single-pass synthesis without a self-critique stage. |
 | `update_angle` | Triggered by citation feedback on a `relevance` node when the angle appears wrong, or by a direct user edit to such a node. Retargets the node's `angle` and `rationale_md` without recreating it. |
@@ -30,10 +30,10 @@ action is one of five kinds:
 
 | kind           | effect                                                            |
 |----------------|-------------------------------------------------------------------|
-| `create`       | Write a new interpretation node (philosophy, pattern, tension, decision, question, touchstone, experiment, metaphor, or `relevance` — see "Workspace context") at confidence 0.40, `origin=agent_synthesis`. Optionally link it into the existing graph. |
+| `create`       | Write a new interpretation node (`tension`, `decision`, `philosophy`, or `relevance` — see "Workspace context") at confidence 0.40, `origin=agent_synthesis`. Optionally link it into the existing graph. |
 | `reinforce`    | Bump an existing node's confidence by +0.05.                      |
 | `soften`       | Drop an existing node's confidence by −0.05.                      |
-| `link`         | Add a typed edge between two existing nodes (or between a newly-created node and an existing one). |
+| `link`         | Add a typed edge between two existing nodes (or between a newly-created node and an existing one). Valid types: `cites` (interp → raw), `semantic` (interp ↔ interp), `actual` (raw ↔ raw). |
 | `update_angle` | Retarget an existing `relevance` node's `angle` field and `rationale_md` without recreating the node. This is the RLHF refinement path for workspace-level relevance claims. |
 
 ## Two-stage LLM pipeline
@@ -56,11 +56,17 @@ The `relevance` job skips the self-critique stage — it is a focused
 single-pass synthesis scoped to one workspace↔project pair, where the
 angle vocabulary already constrains output quality.
 
-The synthesis prompt chooses subkind based on what is actually observed in
-the candidate set. The agent does not default to `relevance`; it selects
-`relevance` only when the evidence spans multiple workspaces or when the
-relationship between a source cluster and the project's intent is the
-primary thing worth naming.
+The synthesis prompt chooses subkind from the four available types based on
+what is actually observed in the candidate set:
+
+- `tension` — open question or conflict worth pursuing
+- `decision` — concrete choice with named trade-offs
+- `philosophy` — grounding axiom invoked to settle disputes
+- `relevance` — typed bridge between workspace(s) and project intent
+
+The agent does not default to `relevance`; it selects `relevance` only when
+the evidence spans multiple workspaces or when the relationship between a
+source cluster and the project's intent is the primary thing worth naming.
 
 ## Workspace context
 
@@ -74,10 +80,10 @@ workspace boundaries.
 
 A `relevance` node expresses a typed relationship between one or more
 information workspaces and the project's intent. It is always multi-source
-(cites ≥2 raw nodes, ideally from different workspaces). Unlike a `pattern`
-(which names a recurring behaviour in *your* work) or a `decision` (which
-records an inflection point), a `relevance` node names *why a cluster of
-external sources matters to this project* — what angle the connection takes.
+(cites ≥2 raw nodes, ideally from different workspaces). Unlike a `decision`
+(which records an inflection point) or a `tension` (which names an internal
+conflict), a `relevance` node names *why a cluster of external sources matters
+to this project* — what angle the connection takes.
 
 Two required fields distinguish relevance nodes from generic interps:
 
@@ -99,11 +105,10 @@ Two required fields distinguish relevance nodes from generic interps:
 
 Use `relevance` when the thing worth naming is the relationship between a
 source cluster and the project, not something internal to the project itself.
-Use `pattern` for recurring behaviours in your own work, `tension` for
-internal contradictions, `decision` for inflection points. If the agent is
-unsure, it should prefer the more specific internal subkind and let workspace
-context appear in the `rationale_md` of ordinary nodes rather than forcing a
-`relevance` frame.
+Use `tension` for open questions and internal conflicts, `decision` for
+inflection points, `philosophy` for grounding axioms. If the agent is unsure,
+prefer the more specific internal subkind and let workspace context appear in
+the `rationale_md` of ordinary nodes rather than forcing a `relevance` frame.
 
 ### The `update_angle` action
 

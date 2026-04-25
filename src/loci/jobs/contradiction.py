@@ -160,8 +160,8 @@ def _new_raws(conn, project_id: str, since_iso: str | None) -> list:
         SELECT n.id AS id, n.title, n.body, n.created_at
         FROM nodes n
         JOIN raw_nodes r ON r.node_id = n.id
-        JOIN project_membership pm ON pm.node_id = n.id
-        WHERE pm.project_id = ? AND pm.role != 'excluded'
+        JOIN project_effective_members pm ON pm.node_id = n.id
+        WHERE pm.project_id = ?
           AND r.source_of_truth = 1
     """
     params = [project_id]

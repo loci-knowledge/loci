@@ -122,7 +122,7 @@ def _fs_audit(conn: sqlite3.Connection, project_id: str) -> dict:
         """
         SELECT r.node_id, r.canonical_path, r.source_of_truth
         FROM raw_nodes r
-        JOIN project_membership pm ON pm.node_id = r.node_id
+        JOIN project_effective_members pm ON pm.node_id = r.node_id
         WHERE pm.project_id = ?
         """,
         (project_id,),

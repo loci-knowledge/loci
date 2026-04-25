@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     openai_api_key: SecretStr | None = Field(default=None, alias="OPENAI_API_KEY")
     openrouter_api_key: SecretStr | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    openrouter_api_key_backup: SecretStr | None = Field(default=None, alias="OPENROUTER_API_KEY_BACKUP")
 
     # --- LLM model selection (per-task) ---------------------------------
     # Each spec is `<provider>:<model_name>`. Providers: anthropic, openai,
@@ -128,13 +129,25 @@ class Settings(BaseSettings):
 
     # --- Helpers --------------------------------------------------------
     def secret(self, name: str) -> str | None:
-        """Return the plain-text value of a SecretStr field, or None."""
+        """Return the plain-text value of a SecretStr field, or None.
+
+        For openrouter_api_key: falls back to openrouter_api_key_backup when
+        the primary is absent or appears invalid (wrong prefix / too short).
+        """
         val = getattr(self, name, None)
-        if val is None:
-            return None
-        if isinstance(val, SecretStr):
-            return val.get_secret_value()
-        return val
+        result = val.get_secret_value() if isinstance(val, SecretStr) else val
+        if name == "openrouter_api_key" and not _looks_valid(result):
+            backup = getattr(self, "openrouter_api_key_backup", None)
+            if backup is not None:
+                candidate = backup.get_secret_value() if isinstance(backup, SecretStr) else backup
+                if _looks_valid(candidate):
+                    return candidate
+        return result
+
+
+def _looks_valid(key: str | None) -> bool:
+    """Quick sanity check: non-empty and at least 20 chars."""
+    return bool(key and len(key) >= 20)
 
 
 @lru_cache(maxsize=1)

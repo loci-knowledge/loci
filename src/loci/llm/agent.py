@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from pydantic_ai import Agent
@@ -146,11 +147,13 @@ def _build_model(parsed: _ParsedSpec, settings: Settings) -> AnthropicModel | Op
         return OpenAIChatModel(parsed.name, provider=OpenAIProvider(api_key=key))
 
     if parsed.provider == "openrouter":
-        key = settings.secret("openrouter_api_key")
+        # Try the primary key first; fall back to OPENROUTER_API_KEY_BACKUP
+        # if the primary is absent or known to be invalid.
+        key = _resolve_openrouter_key(settings)
         if not key:
             raise LLMNotConfiguredError(
-                "OPENROUTER_API_KEY is not set; required for "
-                f"model {parsed.name!r}."
+                "OPENROUTER_API_KEY (or OPENROUTER_API_KEY_BACKUP) is not set; "
+                f"required for model {parsed.name!r}."
             )
         # OpenRouter speaks the OpenAI chat completions protocol, so we wrap
         # OpenAIChatModel with an OpenRouterProvider that injects the right
@@ -158,6 +161,33 @@ def _build_model(parsed: _ParsedSpec, settings: Settings) -> AnthropicModel | Op
         return OpenAIChatModel(parsed.name, provider=OpenRouterProvider(api_key=key))
 
     raise AssertionError(f"unhandled provider {parsed.provider}")  # parse_spec guards this
+
+
+@lru_cache(maxsize=1)
+def _probe_openrouter_key(primary: str | None, backup: str | None) -> str | None:
+    """Return the first valid OpenRouter key. Checked once per process (lru_cache)."""
+    import httpx
+    for key in (primary, backup):
+        if not key:
+            continue
+        try:
+            resp = httpx.get(
+                "https://openrouter.ai/api/v1/auth/key",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                return key
+        except Exception:  # noqa: BLE001
+            pass
+    return primary or backup  # last resort: return whatever we have
+
+
+def _resolve_openrouter_key(settings: Settings) -> str | None:
+    """Return a working OpenRouter API key (probed once per process)."""
+    primary = settings.secret("openrouter_api_key")
+    backup = settings.secret("openrouter_api_key_backup")
+    return _probe_openrouter_key(primary, backup)
 
 
 def _build_model_settings(
