@@ -10,3 +10,36 @@
 *.env.development
 *.env.test
 *.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# uv / venvs
+.venv/
+venv/
+uv.lock
+
+# Loci runtime data
+# Default data dir (override with LOCI_DATA_DIR). Tests use tmp_path.
+.loci/
+loci.sqlite*
+loci.db*
+
+# Embedding model caches
+.cache/
+sentence-transformers/
+
+
+.smoke/

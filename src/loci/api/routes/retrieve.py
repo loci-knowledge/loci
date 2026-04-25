@@ -1,0 +1,100 @@
+"""Retrieve endpoint.
+
+PLAN.md §API §Retrieval:
+
+    POST /projects/:id/retrieve
+      body: { query, k, anchors?, include?, hyde? }
+      returns: { nodes, citations, trace_id }
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+from fastapi import APIRouter, Depends, Header
+from pydantic import BaseModel, Field
+
+from loci.api.dependencies import db, project_by_id
+from loci.citations import CitationTracker, ResponseRecord
+from loci.graph.models import Project
+from loci.retrieve import RetrievalRequest, Retriever
+
+router = APIRouter(prefix="/projects", tags=["retrieve"])
+
+
+class RetrieveBody(BaseModel):
+    query: str
+    k: int = 10
+    anchors: list[str] = Field(default_factory=list)
+    include: list[str] | None = None
+    hyde: bool = False
+    session_id: str = "default"
+
+
+class RetrieveNodeOut(BaseModel):
+    id: str
+    kind: str
+    subkind: str
+    title: str
+    snippet: str
+    score: float
+    why: str
+
+
+class CitationOut(BaseModel):
+    node_id: str
+    contributing_score: float
+    edges_traversed: list[str]
+
+
+class RetrieveResponseBody(BaseModel):
+    nodes: list[RetrieveNodeOut]
+    citations: list[CitationOut]
+    trace_id: str  # = response_id; named per PLAN.md
+
+
+@router.post("/{project_id}/retrieve")
+def post_retrieve(
+    body: RetrieveBody,
+    project: Project = Depends(project_by_id),
+    conn: sqlite3.Connection = Depends(db),
+    user_agent: str = Header("unknown"),
+) -> RetrieveResponseBody:
+    req = RetrievalRequest(
+        project_id=project.id,
+        query=body.query,
+        k=body.k,
+        anchors=body.anchors,
+        include=body.include,
+        hyde=body.hyde,
+    )
+    resp = Retriever(conn).retrieve(req)
+    # Persist a Response (with no output text — retrieve has no synthesised
+    # output) and traces for everything we surfaced.
+    record = ResponseRecord(
+        project_id=project.id, session_id=body.session_id,
+        request=body.model_dump(),
+        output="",
+        cited_node_ids=[],  # nothing was *cited*; just retrieved
+        client=user_agent,
+    )
+    rid = CitationTracker(conn).write_response(
+        record, retrieved_node_ids=[n.node_id for n in resp.nodes],
+    )
+    return RetrieveResponseBody(
+        nodes=[
+            RetrieveNodeOut(
+                id=n.node_id, kind=n.kind, subkind=n.subkind, title=n.title,
+                snippet=n.snippet, score=n.score, why=n.why,
+            )
+            for n in resp.nodes
+        ],
+        citations=[
+            CitationOut(
+                node_id=c.node_id, contributing_score=c.contributing_score,
+                edges_traversed=c.edges_traversed,
+            )
+            for c in resp.citations
+        ],
+        trace_id=rid,
+    )

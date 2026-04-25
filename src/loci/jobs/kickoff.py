@@ -1,0 +1,186 @@
+"""Kickoff job — generate the first interpretation seeds for a new project.
+
+PLAN.md §Vignettes (1) calls this out — but with a twist from the agentic
+pivot: we no longer route through the proposal queue. Kickoff writes
+question nodes **directly to live state** at conservative confidence
+(`confidence=0.5`, `origin=agent_synthesis`), so they show up in retrieval
+immediately and the user starts working with them rather than reviewing
+them in a queue.
+
+PLAN's "no fabricated interpretations on day 1" rule (§Cold start) is
+preserved by virtue of subkind: kickoff produces `question` nodes only,
+not claims (no patterns, philosophies, or tensions). Questions assert
+nothing — they invite. The user's subsequent activity (drafting,
+correcting) shapes whether those questions evolve into committed
+interpretations.
+
+Without an LLM configured, kickoff returns `skipped: true` with no node
+writes.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from typing import Annotated
+
+from pydantic import BaseModel, Field
+
+from loci.citations import CitationTracker
+from loci.config import get_settings
+from loci.graph.models import InterpretationNode
+from loci.graph.nodes import NodeRepository
+from loci.graph.projects import ProjectRepository
+from loci.llm import LLMNotConfiguredError, build_agent
+
+log = logging.getLogger(__name__)
+
+# How many raw-node titles + leading text to include as "what the user has
+# actually read so far". Too few → questions are abstract; too many → token
+# cost balloons.
+RAW_SAMPLE_COUNT = 12
+RAW_EXCERPT_CHARS = 500
+TARGET_QUESTIONS = 8
+
+
+KICKOFF_INSTRUCTIONS = (
+    "You are helping a user start a new research/writing project. They will "
+    "give you a PROJECT PROFILE (their stated goals, scope, and taste) and a "
+    "SAMPLE of source material they have collected. Your job is to propose "
+    "{n} OPEN QUESTIONS worth pursuing within this project.\n\n"
+    "Rules — follow these strictly:\n"
+    "- Output a JSON-shaped Kickoff with a `questions` field; each question "
+    "  has `title` (≤80 chars, phrased as a question) and `body` (1–3 "
+    "  sentences explaining why the question matters and what answering it "
+    "  would unlock).\n"
+    "- Do NOT make claims; do NOT pretend to know the user's interpretation. "
+    "  Questions only.\n"
+    "- Stay tight to the profile. If the sample suggests directions outside "
+    "  the profile's scope, ignore them.\n"
+    "- Phrase questions in the user's voice — first person, casual."
+)
+
+
+class KickoffQuestion(BaseModel):
+    title: Annotated[str, Field(max_length=200)]
+    body: str
+
+
+class Kickoff(BaseModel):
+    questions: list[KickoffQuestion]
+
+
+def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict:
+    """Kickoff handler. Signature matches the worker dispatch convention."""
+    if project_id is None:
+        raise ValueError("kickoff requires a project_id")
+
+    project = ProjectRepository(conn).get(project_id)
+    if project is None:
+        raise ValueError(f"project not found: {project_id}")
+
+    target = int(payload.get("n", TARGET_QUESTIONS))
+    target = max(3, min(20, target))  # clamp to sane bounds
+
+    settings = get_settings()
+    try:
+        agent = build_agent(
+            settings.interpretation_model,
+            instructions=KICKOFF_INSTRUCTIONS.format(n=target),
+            output_type=Kickoff,
+        )
+    except LLMNotConfiguredError as exc:
+        log.info("kickoff: %s; skipping LLM step", exc)
+        return {"skipped": True, "reason": str(exc), "proposals": 0}
+
+    sample = _sample_raws(conn, project_id, RAW_SAMPLE_COUNT, RAW_EXCERPT_CHARS)
+    if not sample.strip() and not project.profile_md.strip():
+        return {"skipped": True, "reason": "no profile, no raws to sample", "proposals": 0}
+
+    user_msg = (
+        f"PROJECT PROFILE:\n{project.profile_md or '(empty — infer from sample)'}"
+        f"\n\n---\n\nSAMPLE OF RAW SOURCES:\n{sample}"
+    )
+
+    try:
+        result = agent.run_sync(user_msg)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("kickoff: LLM call failed")
+        return {"skipped": False, "error": str(exc), "proposals": 0}
+
+    kickoff: Kickoff = result.output
+    nodes_repo = NodeRepository(conn)
+    pr = ProjectRepository(conn)
+    tracker = CitationTracker(conn)
+
+    # Embed the questions in one batch so we pay the embedder cost once.
+    from loci.embed.local import get_embedder
+    embedder = None
+    try:
+        embedder = get_embedder()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("kickoff: embedder load failed: %s", exc)
+    questions = kickoff.questions[:target]
+    vecs = None
+    if embedder is not None and questions:
+        try:
+            vecs = embedder.encode_batch([f"{q.title}\n\n{q.body}" for q in questions])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kickoff: embedding failed: %s", exc)
+            vecs = None
+
+    written = 0
+    for i, q in enumerate(questions):
+        try:
+            node = InterpretationNode(
+                subkind="question",
+                title=q.title.strip(),
+                body=q.body.strip(),
+                origin="agent_synthesis",
+                confidence=0.5,        # questions are speculative, not asserted
+                status="live",         # but live — they show up in retrieval
+            )
+            embedding = vecs[i] if vecs is not None else None
+            nodes_repo.create_interpretation(node, embedding=embedding)
+            pr.add_member(project_id, node.id, role="included", added_by="agent")
+            tracker.append_trace(
+                project_id, node.id, "agent_synthesised", client="kickoff",
+            )
+            written += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kickoff: write question failed: %s", exc)
+
+    return {
+        "skipped": False,
+        "questions_written": written,
+        "model": settings.interpretation_model,
+    }
+
+
+def _sample_raws(conn: sqlite3.Connection, project_id: str, n: int, excerpt_chars: int) -> str:
+    """Return a stringified sample of raws for the kickoff prompt.
+
+    We pick the most recently added raws (proxy for "what the user is currently
+    working with"). Each entry includes the title + the first `excerpt_chars`
+    characters of the body — enough for the LLM to recognise the topic without
+    blowing token budget.
+    """
+    rows = conn.execute(
+        """
+        SELECT n.title, n.body, n.subkind
+        FROM nodes n
+        JOIN raw_nodes r ON r.node_id = n.id
+        JOIN project_membership pm ON pm.node_id = n.id
+        WHERE pm.project_id = ? AND pm.role != 'excluded'
+          AND r.source_of_truth = 1
+        ORDER BY n.created_at DESC
+        LIMIT ?
+        """,
+        (project_id, n),
+    ).fetchall()
+    parts: list[str] = []
+    for r in rows:
+        body = (r["body"] or "").strip()[:excerpt_chars]
+        if body:
+            parts.append(f"- [{r['subkind']}] {r['title']}\n  {body}")
+    return "\n\n".join(parts)
