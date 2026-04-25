@@ -83,6 +83,18 @@ def project(conn):
 
 
 @pytest.fixture
+def workspace(conn, project):
+    """Create a primary workspace linked to the test project."""
+    from loci.graph.models import Workspace
+    from loci.graph.workspaces import WorkspaceRepository
+    ws_repo = WorkspaceRepository(conn)
+    ws = Workspace(slug="ws-test-proj", name="Test Workspace", kind="mixed")
+    ws_repo.create(ws)
+    ws_repo.link_project(project.id, ws.id, role="primary")
+    return ws
+
+
+@pytest.fixture
 def corpus_dir(tmp_path: Path) -> Path:
     """Build a tiny on-disk corpus of markdown files."""
     src = tmp_path / "corpus"

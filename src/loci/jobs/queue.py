@@ -28,14 +28,27 @@ def enqueue(
     kind: str,
     project_id: str | None = None,
     payload: dict[str, Any] | None = None,
-) -> str:
+    fingerprint: str | None = None,
+) -> str | None:
+    """Enqueue a job. Returns job_id, or None if a duplicate fingerprint exists."""
+    if fingerprint is not None:
+        existing = conn.execute(
+            """
+            SELECT id FROM jobs
+            WHERE fingerprint = ? AND status IN ('queued', 'running')
+            LIMIT 1
+            """,
+            (fingerprint,),
+        ).fetchone()
+        if existing is not None:
+            return None
     job_id = new_id()
     conn.execute(
         """
-        INSERT INTO jobs(id, kind, project_id, payload, status)
-        VALUES (?, ?, ?, ?, 'queued')
+        INSERT INTO jobs(id, kind, project_id, payload, status, fingerprint)
+        VALUES (?, ?, ?, ?, 'queued', ?)
         """,
-        (job_id, kind, project_id, json.dumps(payload or {})),
+        (job_id, kind, project_id, json.dumps(payload or {}), fingerprint),
     )
     return job_id
 

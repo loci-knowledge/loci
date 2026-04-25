@@ -31,6 +31,7 @@ RawSubkind = Literal["pdf", "md", "code", "html", "transcript", "txt", "image"]
 InterpretationSubkind = Literal[
     "philosophy", "pattern", "tension", "decision", "question",
     "touchstone", "experiment", "metaphor",
+    "relevance",   # project↔information relationship with a typed angle
 ]
 Subkind = RawSubkind | InterpretationSubkind
 
@@ -48,6 +49,25 @@ EdgeType = Literal[
 EdgeCreator = Literal["user", "system", "proposal_accepted"]
 
 Role = Literal["included", "excluded", "pinned"]
+
+# Workspace kind — coarse hint for retrieval weighting and prompt phrasing.
+WorkspaceKind = Literal["papers", "codebase", "notes", "transcripts", "web", "mixed"]
+
+# Role of a workspace within a project link.
+WorkspaceRole = Literal["primary", "reference", "excluded"]
+
+# Closed vocabulary of relevance angles. Used on relevance interpretation nodes
+# and on their cites edges to describe *why* a source matters to a project.
+RelevanceAngle = Literal[
+    "applicable_pattern",       # a technique/approach from the source is directly usable
+    "experimental_setup",       # source's eval/experiment design matches the project's
+    "borrowed_concept",         # a concept from the source informs the project's design
+    "counterexample",           # source demonstrates what not to do / a failure mode
+    "prior_attempt",            # source tried something similar; lessons apply
+    "vocabulary_source",        # source defines terms the project adopts
+    "methodological_neighbor",  # similar method, different domain; generalises
+    "contrast_baseline",        # source is the baseline to compare against
+]
 
 # Edge type metadata. Two questions any caller may ask:
 #   - is this type symmetric? (then we auto-create the reciprocal)
@@ -124,6 +144,10 @@ class InterpretationNode(Node):
     origin: InterpretationOrigin
     origin_session_id: str | None = None
     origin_response_id: str | None = None
+    # Set on subkind='relevance' nodes; NULL for all other subkinds.
+    angle: RelevanceAngle | None = None
+    # The "because-clause": why these sources matter to the project.
+    rationale_md: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +164,10 @@ class Edge(BaseModel):
     created_at: str = Field(default_factory=now_iso)
     created_by: EdgeCreator = "user"
     symmetric: bool = False  # filled by the repo from SYMMETRIC_EDGE_TYPES
+    # Per-citation rationale: for cites edges in relevance interps, explains
+    # this specific raw's contribution. angle mirrors the interp-level angle.
+    rationale: str | None = None
+    angle: RelevanceAngle | None = None
 
     @field_validator("src", "dst")
     @classmethod
@@ -178,3 +206,52 @@ class ProjectMembership(BaseModel):
     role: Role = "included"
     added_at: str = Field(default_factory=now_iso)
     added_by: str = "user"
+
+
+# ---------------------------------------------------------------------------
+# Information Workspaces
+# ---------------------------------------------------------------------------
+
+
+class Workspace(BaseModel):
+    id: str = Field(default_factory=new_id)
+    slug: str
+    name: str
+    description_md: str = ""
+    kind: WorkspaceKind = "mixed"
+    created_at: str = Field(default_factory=now_iso)
+    last_active_at: str = Field(default_factory=now_iso)
+    last_scanned_at: str | None = None
+    config: dict[str, object] = Field(default_factory=dict)
+
+    @field_validator("slug")
+    @classmethod
+    def _slug_shape(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v or not all(c.isalnum() or c in "-_" for c in v):
+            raise ValueError("slug must be lowercase alphanumeric / dashes / underscores")
+        return v
+
+
+class WorkspaceSource(BaseModel):
+    id: str = Field(default_factory=new_id)
+    workspace_id: str
+    root_path: str
+    label: str | None = None
+    added_at: str = Field(default_factory=now_iso)
+    last_scanned_at: str | None = None
+
+
+class WorkspaceMembership(BaseModel):
+    workspace_id: str
+    node_id: str
+    added_at: str = Field(default_factory=now_iso)
+
+
+class ProjectWorkspace(BaseModel):
+    project_id: str
+    workspace_id: str
+    linked_at: str = Field(default_factory=now_iso)
+    role: WorkspaceRole = "reference"
+    weight: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+    last_relevance_pass_at: str | None = None

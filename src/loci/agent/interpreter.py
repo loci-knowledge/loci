@@ -44,8 +44,10 @@ from loci.graph.models import (
     EdgeType,
     InterpretationNode,
     InterpretationSubkind,
+    RelevanceAngle,
     new_id,
 )
+from loci.graph.workspaces import WorkspaceRepository
 from loci.llm import LLMNotConfiguredError, build_agent
 
 log = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ SOFTEN_DELTA = -0.05
 # *potential* synthesis material.
 MAX_ACTIONS_PER_REFLECTION = 8
 
-ActionKind = Literal["create", "reinforce", "soften", "link"]
+ActionKind = Literal["create", "reinforce", "soften", "link", "update_angle"]
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +85,11 @@ class Action(BaseModel):
     subkind: InterpretationSubkind | None = None
     title: Annotated[str | None, Field(max_length=200)] = None
     body: str | None = None
-    # When action ∈ {reinforce, soften, link}: the existing node handle from
-    # the candidate block we showed the LLM ([N1]..[Nk]).
+    # For relevance subkind: typed angle + bridge rationale.
+    angle: RelevanceAngle | None = None
+    rationale_md: str | None = None
+    # When action ∈ {reinforce, soften, link, update_angle}: the existing node
+    # handle from the candidate block we showed the LLM ([N1]..[Nk]).
     target_handle: str | None = None
     # Reason — the agent's one-line justification (for the reflection log).
     reason: Annotated[str, Field(max_length=400)] = ""
@@ -240,6 +245,7 @@ def _build_context(
 ) -> _Context | None:
     """Gather everything the synthesiser needs into one prompt."""
     pr = ProjectRepository(conn)
+    ws_repo = WorkspaceRepository(conn)
     project = pr.get(project_id)
     if project is None:
         return None
@@ -267,6 +273,7 @@ def _build_context(
             feedback_summary = _summarise_citation_feedback(conn, response_id)
 
     pinned_block = _materialise_pinned(conn, pinned_ids)
+    workspace_block = _materialise_workspace_context(conn, ws_repo, project_id)
 
     if not candidates and not pinned_block:
         return None
@@ -288,6 +295,8 @@ def _build_context(
         f"---\n\nUSER'S CURRENT TASK:\n{instruction}\n\n"
         f"---\n\nPINNED INTERPRETATIONS (the user's voice — match this style):\n"
         f"{pinned_block or '(none)'}\n\n"
+        f"---\n\nWORKSPACE CONTEXT (information workspaces linked to this project):\n"
+        f"{workspace_block or '(no workspaces linked)'}\n\n"
         f"---\n\nCANDIDATES SURFACED FOR THIS TASK:\n{candidate_block}\n\n"
         f"---\n\nCITATION FEEDBACK (if any):\n{feedback_summary or '(none yet)'}\n"
     )
@@ -345,6 +354,43 @@ def _materialise_pinned(conn: sqlite3.Connection, pinned_ids: list[str]) -> str:
         body = (r["body"] or "").strip()[:300]
         chunks.append(f"- [{r['subkind']}] {r['title']}\n  {body}")
     return "\n".join(chunks)
+
+
+def _materialise_workspace_context(
+    conn: sqlite3.Connection, ws_repo: WorkspaceRepository, project_id: str,
+    *,
+    recent_raws: int = 6,
+) -> str:
+    """Render linked workspace summaries for the synthesis prompt."""
+    links = ws_repo.linked_workspaces(project_id)
+    if not links:
+        return ""
+    chunks: list[str] = []
+    for ws, link in links:
+        if link.role == "excluded":
+            continue
+        header = f"[{ws.kind}] {ws.name} (role={link.role})"
+        if ws.description_md:
+            header += f"\n  {ws.description_md[:200]}"
+        # Sample recent raws from this workspace.
+        rows = conn.execute(
+            """
+            SELECT n.title, n.subkind
+            FROM nodes n
+            JOIN workspace_membership wm ON wm.node_id = n.id
+            JOIN raw_nodes r ON r.node_id = n.id
+            WHERE wm.workspace_id = ?
+              AND r.source_of_truth = 1
+            ORDER BY n.created_at DESC
+            LIMIT ?
+            """,
+            (ws.id, recent_raws),
+        ).fetchall()
+        if rows:
+            titles = [f"    - [{r['subkind']}] {r['title']}" for r in rows]
+            header += "\n  Recent sources:\n" + "\n".join(titles)
+        chunks.append(header)
+    return "\n\n".join(chunks)
 
 
 def _summarise_citation_feedback(conn: sqlite3.Connection, response_id: str) -> str:
@@ -413,6 +459,8 @@ def _apply_actions(
                     subkind=a.subkind or "pattern",
                     title=a.title or "(untitled)",
                     body=a.body or "",
+                    angle=a.angle,
+                    rationale_md=a.rationale_md or "",
                     origin="agent_synthesis",
                     origin_response_id=response_id,
                     confidence=AGENT_BASE_CONF,
@@ -450,6 +498,16 @@ def _apply_actions(
                 applied += 1
             except Exception as exc:  # noqa: BLE001
                 log.warning("reflect: soften failed: %s", exc)
+        elif a.action == "update_angle":
+            if target_id is None:
+                continue
+            try:
+                nodes_repo.set_angle(target_id, a.angle, a.rationale_md or "")
+                tracker.append_trace(project_id, target_id, "agent_updated_angle",
+                                       response_id=response_id, client="agent")
+                applied += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("reflect: update_angle failed: %s", exc)
 
     # Links — for both standalone `link` actions and links carried on a `create`.
     for i, a in enumerate(actions):
@@ -542,6 +600,10 @@ INPUT YOU RECEIVE:
 - PINNED INTERPRETATIONS: the user's voice — these are the nodes they have \
   explicitly elevated. Match this *style and level of specificity*. Avoid \
   language that the user wouldn't use.
+- WORKSPACE CONTEXT: the information workspaces linked to this project, with \
+  their kind (papers/codebase/notes/…) and a sample of recent source titles. \
+  Use this to understand *what kind of material* the user is drawing from and \
+  to name the bridge between workspaces when relevant.
 - CANDIDATES: nodes that loci surfaced for this task, with [Nxx] handles. \
   Some are marked '(cited in draft)' — those were used in the user's output.
 - CITATION FEEDBACK: if the user has reviewed earlier drafts, signals like \
@@ -553,24 +615,50 @@ YOUR JOB:
 Decide what new interpretations would help the user *next time* on a similar \
 task, and what existing interpretations should be reinforced or softened.
 
+Choose subkind based on what you actually observe in the candidates:
+- `pattern`: a recurring structure or approach that appears across sources
+- `decision`: a concrete choice the project made (or should make) with trade-offs
+- `tension`: two values or requirements that pull against each other
+- `philosophy`: a first-principle belief that grounds the project's direction
+- `question`: an open question the project must answer, not yet resolved
+- `relevance`: use ONLY when the workspace context shows material from a \
+  clearly distinct external source (codebase, paper set, etc.) and the \
+  candidates reveal a specific *angle* by which that source serves the \
+  project's intent. A relevance node names the bridge — it does NOT summarise \
+  the source. Cite ≥2 raws when possible. Requires `angle` from the closed \
+  vocabulary.
+
+Do NOT default to `relevance` for every observation. Use the most specific \
+subkind that fits.
+
 Output a Reflection with:
 - deliberation: 2-6 sentences in your voice. What pattern did you see? What \
   would help next time?
 - actions: a list of Actions. Possible kinds:
     - create: a new interpretation node. Required: subkind, title, body. \
       Subkind is one of {philosophy, pattern, tension, decision, question, \
-      touchstone, experiment, metaphor}.
+      touchstone, experiment, metaphor, relevance}. \
+      For subkind=relevance, also set `angle` (required) and `rationale_md` \
+      (1–3 sentences: the "because" — what exactly makes these sources \
+      relevant at this angle). Angle must be one of: \
+      applicable_pattern, experimental_setup, borrowed_concept, \
+      counterexample, prior_attempt, vocabulary_source, \
+      methodological_neighbor, contrast_baseline.
     - reinforce: existing node deserves more weight. Required: target_handle (Nxx).
     - soften: existing node was misaligned with the user's task. \
       Required: target_handle.
     - link: add an edge between two existing nodes. Use action="link" with \
       a single entry in `links` (src_handle, dst_handle, type).
+    - update_angle: refine the angle/rationale on an existing relevance node \
+      in response to user edits or new evidence. Required: target_handle, \
+      angle, rationale_md.
     Edge types: cites (interp→raw), reinforces, contradicts, extends, \
     specializes, generalizes, aliases, co_occurs.
 
   When you create a node, you MAY include `links` whose src_handle is "NEW" \
   to immediately connect the new node into the graph (e.g., a new pattern \
-  reinforcing a pinned philosophy).
+  reinforcing a pinned philosophy). For relevance nodes, add `cites` links \
+  to the raw candidates ([Nxx]) that justify the angle.
 
 RULES:
 - Be conservative. Better to create 1 high-quality interpretation than 5 \
@@ -581,6 +669,9 @@ RULES:
 - Never copy a candidate's body verbatim. An interpretation is a distillation, \
   not a quote.
 - Never create a question that's already answered by an existing node.
+- For relevance nodes: do NOT summarise what the sources say — name the bridge \
+  (e.g. "these codebases show how to expose a server as CLI, which is exactly \
+  what this project is building" not "these codebases contain CLI code").
 - If nothing meaningful needs to change, return actions=[].
 """
 
@@ -624,8 +715,16 @@ def _critique_prompt(ctx: _Context, actions: list[Action]) -> str:
 def _render_action(i: int, a: Action) -> str:
     head = f"[{i}] action={a.action}"
     if a.action == "create":
-        return f"{head} subkind={a.subkind} title={a.title!r}\n      body={(a.body or '')[:300]!r}\n      reason={a.reason!r}"
+        angle_str = f" angle={a.angle}" if a.angle else ""
+        return (
+            f"{head} subkind={a.subkind}{angle_str} title={a.title!r}\n"
+            f"      body={(a.body or '')[:300]!r}\n"
+            f"      rationale={(a.rationale_md or '')[:200]!r}\n"
+            f"      reason={a.reason!r}"
+        )
     head += f" target_handle={a.target_handle}"
+    if a.action == "update_angle":
+        head += f" angle={a.angle} rationale={(a.rationale_md or '')[:100]!r}"
     if a.links:
         link_str = ", ".join(f"{lk.src_handle}--{lk.type}-->{lk.dst_handle}" for lk in a.links)
         head += f" links=[{link_str}]"

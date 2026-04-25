@@ -65,10 +65,9 @@ def search_vec(
         SELECT v.node_id AS node_id, v.distance AS distance
         FROM node_vec v
         JOIN nodes n ON n.id = v.node_id
-        JOIN project_membership pm ON pm.node_id = n.id
+        JOIN project_effective_members pm ON pm.node_id = n.id
         WHERE v.embedding MATCH ? AND k = ?
           AND pm.project_id = ?
-          AND pm.role != 'excluded'
           AND n.status IN ({status_placeholders})
         ORDER BY v.distance
     """

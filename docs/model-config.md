@@ -9,8 +9,8 @@ model for interpretation maintenance and a cheap fast model for HyDE.
 
 | Setting               | What uses it                                        | Default                  |
 |-----------------------|-----------------------------------------------------|--------------------------|
-| `interpretation_model`| Kickoff (project → first questions) and the silent reflection cycle that creates / reinforces / softens interpretations after every draft | `openai:gpt-5.4`     |
-| `rag_model`           | `loci draft` — synthesises markdown with citations  | `openai:gpt-5.4`         |
+| `interpretation_model`| Kickoff (project → first questions) and the silent reflection cycle that creates / reinforces / softens interpretations after every draft | `openai:gpt-5.4-mini` |
+| `rag_model`           | `loci draft` — synthesises markdown with citations  | `openai:gpt-5.4-nano`    |
 | `classifier_model`    | Absorb's contradiction pass: 3-way classifier per (raw, interp) pair | `openai:gpt-5.4-nano` |
 | `hyde_model`          | HyDE expansion in retrieval                         | `openai:gpt-5.4-nano`    |
 

@@ -127,6 +127,28 @@ class ProjectRepository:
         ).fetchone()
         return row is not None
 
+    def effective_members(self, project_id: str) -> list[str]:
+        """Return all node_ids in a project's effective membership.
+
+        Reads from the project_effective_members view, which unions workspace-
+        based raws with explicit project_membership overrides and subtracts
+        excluded nodes. This is the canonical read path for 'what nodes does
+        this project have access to?'
+        """
+        rows = self.conn.execute(
+            "SELECT node_id FROM project_effective_members WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        return [r["node_id"] for r in rows]
+
+    def is_effective_member(self, project_id: str, node_id: str) -> bool:
+        row = self.conn.execute(
+            """SELECT 1 FROM project_effective_members
+               WHERE project_id = ? AND node_id = ?""",
+            (project_id, node_id),
+        ).fetchone()
+        return row is not None
+
     # -----------------------------------------------------------------------
     # Internals
     # -----------------------------------------------------------------------

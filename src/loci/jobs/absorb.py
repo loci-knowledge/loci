@@ -67,8 +67,44 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     # 8. Communities (igraph-gated)
     summary["steps"]["communities"] = communities.run(conn, project_id)
 
+    # 9. Co-citation edges — interp pairs that share a cited raw get co_occurs
+    summary["steps"]["co_citation"] = _update_co_citations(conn, project_id)
+
     log.info("absorb: done for project=%s", project_id)
     return summary
+
+
+def _update_co_citations(conn: sqlite3.Connection, project_id: str) -> dict:
+    """Add co_occurs edges between interpretation nodes that cite the same raw.
+
+    Safe to re-run: skips pairs that already have a co_occurs edge.
+    """
+    from loci.graph.models import new_id
+
+    pairs = conn.execute("""
+        SELECT DISTINCT e1.src AS a, e2.src AS b
+        FROM edges e1 JOIN edges e2 ON e1.dst = e2.dst AND e1.src < e2.src
+        WHERE e1.type = 'cites' AND e2.type = 'cites'
+          AND e1.src IN (SELECT node_id FROM interpretation_nodes)
+          AND e2.src IN (SELECT node_id FROM interpretation_nodes)
+          AND e1.src IN (SELECT node_id FROM project_effective_members WHERE project_id = ?)
+    """, (project_id,)).fetchall()
+
+    added = 0
+    for pair in pairs:
+        a, b = pair[0], pair[1]
+        if not conn.execute(
+            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='co_occurs'", (a, b)
+        ).fetchone():
+            conn.execute(
+                "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
+                " VALUES (?,?,?,?,?,?,datetime('now'))",
+                (new_id(), a, b, "co_occurs", 1.0, "system"),
+            )
+            added += 1
+    if added:
+        conn.commit()
+    return {"added": added}
 
 
 def _fs_audit(conn: sqlite3.Connection, project_id: str) -> dict:

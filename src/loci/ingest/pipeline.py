@@ -1,7 +1,12 @@
 """Ingest orchestrator.
 
 Walks a path → hashes → dedups → extracts → batch-embeds → writes `RawNode`s
-and project memberships. Returns a summary describing what happened.
+and workspace memberships. Returns a summary describing what happened.
+
+The pipeline is workspace-scoped: each scan run records raw nodes as members
+of the workspace (not the project directly). Projects receive those nodes
+through the project_effective_members view by virtue of being linked to the
+workspace.
 
 The loop is structured to be **batch-friendly for embedding**: we collect a
 batch of newly-extracted text bodies and call `Embedder.encode_batch()` once
@@ -9,8 +14,8 @@ per batch, rather than one model call per file. Embedding is the slow step,
 not extraction or hashing.
 
 Idempotency: a file already present in `raw_nodes` (by content_hash) is not
-re-extracted. We DO add it to the project membership if it's not there yet —
-the same paper can join multiple projects without re-ingesting.
+re-extracted. We DO add it to the workspace membership if it's not there yet —
+the same paper can join multiple workspaces without re-ingesting.
 """
 
 from __future__ import annotations
@@ -25,8 +30,7 @@ import numpy as np
 from loci.embed.local import Embedder, get_embedder
 from loci.graph.models import RawNode
 from loci.graph.nodes import NodeRepository
-from loci.graph.projects import ProjectRepository
-from loci.graph.sources import SourceRepository
+from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest.content_hash import hash_file, store_blob
 from loci.ingest.extractors import ExtractedDoc, extract
 from loci.ingest.walker import walk
@@ -40,7 +44,7 @@ class IngestResult:
     new_raw: int = 0           # files that became fresh RawNodes
     deduped: int = 0           # files already present in raw_nodes
     skipped: int = 0           # unsupported / unreadable / empty
-    members_added: int = 0     # project_membership rows newly inserted
+    members_added: int = 0     # workspace_membership rows newly inserted
     errors: list[str] = field(default_factory=list)
 
 
@@ -56,32 +60,30 @@ class _Pending:
 
 
 class IngestPipeline:
-    """Coordinates a single ingest run for a project.
+    """Coordinates a single ingest run for a workspace.
 
     Construct once per scan; not thread-safe (it batches accumulator state).
-    Concurrent scans on the same project are fine *between* pipeline instances
+    Concurrent scans on the same workspace are fine *between* pipeline instances
     because all writes go through atomic transactions in the repos.
     """
 
     def __init__(
         self,
         conn: sqlite3.Connection,
-        project_id: str,
+        workspace_id: str,
         *,
         embedder: Embedder | None = None,
         embed_batch_size: int = 32,
     ) -> None:
         self.conn = conn
-        self.project_id = project_id
+        self.workspace_id = workspace_id
         self.nodes = NodeRepository(conn)
-        self.projects = ProjectRepository(conn)
+        self.workspaces = WorkspaceRepository(conn)
         self._embedder = embedder
         self.embed_batch_size = embed_batch_size
 
     @property
     def embedder(self) -> Embedder:
-        # Resolve lazily so tests can avoid loading the model when they don't
-        # care about embeddings (passing `embedder=None` and not awaiting them).
         if self._embedder is None:
             self._embedder = get_embedder()
         return self._embedder
@@ -98,22 +100,13 @@ class IngestPipeline:
             result.scanned += 1
             try:
                 outcome = self._stage_file(path)
-            except Exception as exc:  # noqa: BLE001 - per-file failures shouldn't kill the run
+            except Exception as exc:  # noqa: BLE001
                 msg = f"{path}: {exc}"
                 log.exception("ingest staging failed")
                 result.errors.append(msg)
                 continue
             if outcome is None:
                 result.skipped += 1
-                continue
-            if outcome is _DEDUPED:
-                result.deduped += 1
-                # If the existing raw isn't in this project yet, add it.
-                # We need to look up its node_id by content_hash.
-                # _stage_file already added it as a side-effect when it
-                # detected the dedup — count it.
-                if outcome.added_membership:  # type: ignore[union-attr]
-                    result.members_added += 1
                 continue
             if isinstance(outcome, _DedupOutcome):
                 result.deduped += 1
@@ -126,8 +119,7 @@ class IngestPipeline:
                 batch = []
         if batch:
             self._flush_batch(batch, result)
-        # Bump the project's last_active_at.
-        self.projects.touch(self.project_id)
+        self.workspaces.touch(self.workspace_id)
         return result
 
     # -----------------------------------------------------------------------
@@ -139,19 +131,19 @@ class IngestPipeline:
         full_hash, trunc_hash, size = hash_file(path)
         existing = self.nodes.find_raw_by_hash(trunc_hash)
         if existing is not None:
-            # Same content already known. Add to this project if not present.
+            # Same content already known. Add to this workspace if not present.
             added = False
-            if not self.projects.is_member(self.project_id, existing.id):
-                self.projects.add_member(self.project_id, existing.id, role="included")
+            existing_members = self.conn.execute(
+                "SELECT 1 FROM workspace_membership WHERE workspace_id = ? AND node_id = ?",
+                (self.workspace_id, existing.id),
+            ).fetchone()
+            if existing_members is None:
+                self.workspaces.add_member(self.workspace_id, existing.id)
                 added = True
             return _DedupOutcome(added_membership=added)
         extracted = extract(path)
         if extracted is None:
             return None
-        # Read the raw bytes once for blob storage (we already streamed them
-        # for the hash but didn't keep them — small files cost a re-read,
-        # large ones could be optimised later by hashing while reading into
-        # a bytearray; not worth it now).
         try:
             raw_bytes = path.read_bytes()
         except OSError as exc:
@@ -168,8 +160,6 @@ class IngestPipeline:
         try:
             vectors = self.embedder.encode_batch(texts)
         except Exception as exc:  # noqa: BLE001
-            # Embedding failed for the whole batch — record errors but still
-            # write nodes without embeddings. They'll be searchable by lex.
             log.exception("batch embedding failed")
             result.errors.append(f"embed batch ({len(batch)} files): {exc}")
             vectors = np.zeros((len(batch), self.embedder.dim), dtype=np.float32)
@@ -198,25 +188,16 @@ class IngestPipeline:
             size_bytes=p.size,
         )
         self.nodes.create_raw(node, embedding=vec)
-        self.projects.add_member(self.project_id, node.id, role="included")
+        self.workspaces.add_member(self.workspace_id, node.id)
 
     @staticmethod
     def _embed_text(p: _Pending) -> str:
-        """What we actually feed to the embedder.
-
-        For PDFs and long files, we bias toward the first ~8000 chars: most
-        embedding models truncate inputs at 512–8192 tokens. The retrieval
-        score is dominated by the start of the document anyway. Full text
-        still goes into FTS5 — that's a separate path.
-        """
         text = p.extracted.text
-        # Prepend the title so the embedder weights it; titles are high-signal.
         prefix = f"{p.path.stem}\n\n"
         return (prefix + text)[:8192]
 
     @staticmethod
     def _derive_title(p: _Pending) -> str:
-        """Best-effort title. First non-empty line for markdown/text, else stem."""
         if p.extracted.subkind in {"md", "txt", "transcript"}:
             for line in p.extracted.text.splitlines():
                 line = line.strip().lstrip("# ").strip()
@@ -230,39 +211,33 @@ class _DedupOutcome:
     added_membership: bool
 
 
-# Sentinel used to differentiate "skipped because dedup" from "skipped because
-# unreadable" without carrying it through every return.
-_DEDUPED = object()
-
-
 def scan_path(
     conn: sqlite3.Connection,
-    project_id: str,
+    workspace_id: str,
     root: Path,
     *,
     embedder: Embedder | None = None,
 ) -> IngestResult:
-    """Convenience wrapper: build a pipeline and run it once."""
-    return IngestPipeline(conn, project_id, embedder=embedder).scan(root)
+    """Convenience wrapper: build a workspace pipeline and run it once."""
+    return IngestPipeline(conn, workspace_id, embedder=embedder).scan(root)
 
 
-def scan_registered_sources(
+def scan_workspace(
     conn: sqlite3.Connection,
-    project_id: str,
+    workspace_id: str,
     *,
     embedder: Embedder | None = None,
 ) -> IngestResult:
-    """Walk every root registered for `project_id`; return a single combined
-    `IngestResult`.
+    """Walk every root registered for the workspace; return a combined IngestResult.
 
     The pipeline is reused across roots so the embedder warm-up cost is paid
-    once. Each root is independently `mark_scanned()`d in the source repo so
-    the user can see which roots were last touched.
+    once. Each root is independently mark_scanned'd so the user can see which
+    roots were last touched.
     """
-    sources = SourceRepository(conn)
-    pipeline = IngestPipeline(conn, project_id, embedder=embedder)
+    ws_repo = WorkspaceRepository(conn)
+    pipeline = IngestPipeline(conn, workspace_id, embedder=embedder)
     combined = IngestResult()
-    for src in sources.list(project_id):
+    for src in ws_repo.list_sources(workspace_id):
         root_path = Path(src.root_path)
         if not root_path.exists():
             combined.errors.append(f"missing source root: {src.root_path}")
@@ -274,5 +249,43 @@ def scan_registered_sources(
         combined.skipped += partial.skipped
         combined.members_added += partial.members_added
         combined.errors.extend(partial.errors)
-        sources.mark_scanned(src.id)
+        ws_repo.mark_source_scanned(src.id)
+    ws_repo.mark_scanned(workspace_id)
     return combined
+
+
+def scan_project(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    embedder: Embedder | None = None,
+) -> IngestResult:
+    """Scan all sources for all non-excluded workspaces linked to a project.
+
+    Convenience wrapper used by the CLI `loci scan <project>` command. For
+    per-workspace scanning use scan_workspace() directly.
+    """
+    ws_repo = WorkspaceRepository(conn)
+    combined = IngestResult()
+    for workspace, link in ws_repo.linked_workspaces(project_id):
+        if link.role == "excluded":
+            continue
+        partial = scan_workspace(conn, workspace.id, embedder=embedder)
+        combined.scanned += partial.scanned
+        combined.new_raw += partial.new_raw
+        combined.deduped += partial.deduped
+        combined.skipped += partial.skipped
+        combined.members_added += partial.members_added
+        combined.errors.extend(partial.errors)
+    return combined
+
+
+# Legacy alias so tests that haven't been updated yet keep working.
+# Deprecated: use scan_workspace() or scan_project() instead.
+def scan_registered_sources(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    embedder: Embedder | None = None,
+) -> IngestResult:
+    return scan_project(conn, project_id, embedder=embedder)

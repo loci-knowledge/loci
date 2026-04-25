@@ -151,15 +151,38 @@ class NodeRepository:
                 """
                 INSERT INTO interpretation_nodes(node_id, origin,
                                                   origin_session_id,
-                                                  origin_response_id)
-                VALUES (?,?,?,?)
+                                                  origin_response_id,
+                                                  angle, rationale_md)
+                VALUES (?,?,?,?,?,?)
                 """,
-                (node.id, node.origin, node.origin_session_id, node.origin_response_id),
+                (node.id, node.origin, node.origin_session_id, node.origin_response_id,
+                 node.angle, node.rationale_md),
             )
             self._write_tags(node.id, node.tags)
             if embedding is not None:
                 self._write_embedding(node.id, embedding)
         return node
+
+    def set_angle(
+        self,
+        node_id: str,
+        angle: str | None,
+        rationale_md: str | None = None,
+    ) -> None:
+        """Update the angle (and optionally rationale_md) on a relevance interp."""
+        sets = ["angle = ?"]
+        params: list[object] = [angle]
+        if rationale_md is not None:
+            sets.append("rationale_md = ?")
+            params.append(rationale_md)
+        params.append(node_id)
+        self.conn.execute(
+            f"UPDATE interpretation_nodes SET {', '.join(sets)} WHERE node_id = ?",
+            tuple(params),
+        )
+        self.conn.execute(
+            "UPDATE nodes SET updated_at = ? WHERE id = ?", (now_iso(), node_id)
+        )
 
     def update_body(self, node_id: str, *, title: str | None = None,
                     body: str | None = None,
@@ -308,6 +331,8 @@ class NodeRepository:
             status=row["status"], tags=self._tags_for(row["id"]),
             origin=row["origin"], origin_session_id=row.get("origin_session_id"),
             origin_response_id=row.get("origin_response_id"),
+            angle=row.get("angle"),
+            rationale_md=row.get("rationale_md") or "",
         )
 
     def _tags_for(self, node_id: str) -> list[str]:

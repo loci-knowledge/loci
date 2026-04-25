@@ -150,11 +150,100 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
         except Exception as exc:  # noqa: BLE001
             log.warning("kickoff: write question failed: %s", exc)
 
+    # Anchor wiring + co-citation — runs after all nodes are written so new
+    # question nodes appear in retrieval immediately and share evidence edges.
+    if written > 0 and embedder is not None:
+        try:
+            _anchor_and_cocite(conn, project_id, embedder)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kickoff: anchor wiring failed: %s", exc)
+
     return {
         "skipped": False,
         "questions_written": written,
         "model": settings.interpretation_model,
     }
+
+
+def _anchor_and_cocite(
+    conn: sqlite3.Connection,
+    project_id: str,
+    embedder,
+) -> None:
+    """Wire isolated interpretation nodes to nearest raw nodes and build co-citation edges.
+
+    Isolated interp nodes (no `cites` edge yet) get wired to their 3 nearest raws
+    via cosine similarity. Then pairs of interp nodes that cite the same raw get a
+    `co_occurs` edge to signal shared evidence.
+    """
+    import struct
+    import numpy as np
+    from loci.graph.models import new_id
+
+    isolated = conn.execute("""
+        SELECT n.id, n.title, n.body FROM nodes n
+        JOIN interpretation_nodes i ON i.node_id = n.id
+        WHERE n.id NOT IN (SELECT src FROM edges WHERE type = 'cites')
+          AND n.status = 'live'
+          AND n.id IN (
+              SELECT node_id FROM project_effective_members WHERE project_id = ?
+          )
+    """, (project_id,)).fetchall()
+
+    if isolated:
+        raws = conn.execute("""
+            SELECT n.id, nv.embedding FROM nodes n
+            JOIN node_vec nv ON nv.node_id = n.id
+            WHERE n.kind = 'raw' AND n.status = 'live'
+              AND n.id IN (SELECT node_id FROM project_effective_members WHERE project_id = ?)
+        """, (project_id,)).fetchall()
+
+        def _decode(b: bytes) -> "np.ndarray":
+            n = len(b) // 4
+            return np.array(struct.unpack(f"{n}f", b), dtype=np.float32)
+
+        raw_embs = [(r[0], _decode(r[1])) for r in raws]
+
+        for node in isolated:
+            node_id, title, body = node[0], node[1], node[2]
+            emb = np.array(embedder.encode(body or title), dtype=np.float32)
+            sims = sorted(
+                [(rid, float(np.dot(emb, remb))) for rid, remb in raw_embs],
+                key=lambda x: -x[1],
+            )
+            for raw_id, sim in sims[:3]:
+                if not conn.execute(
+                    "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='cites'",
+                    (node_id, raw_id),
+                ).fetchone():
+                    conn.execute(
+                        "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
+                        " VALUES (?,?,?,?,?,?,datetime('now'))",
+                        (new_id(), node_id, raw_id, "cites", round(sim, 3), "system"),
+                    )
+
+    # Co-citation: interp pairs that cite the same raw
+    pairs = conn.execute("""
+        SELECT DISTINCT e1.src AS a, e2.src AS b
+        FROM edges e1 JOIN edges e2 ON e1.dst = e2.dst AND e1.src < e2.src
+        WHERE e1.type = 'cites' AND e2.type = 'cites'
+          AND e1.src IN (SELECT node_id FROM interpretation_nodes)
+          AND e2.src IN (SELECT node_id FROM interpretation_nodes)
+          AND e1.src IN (SELECT node_id FROM project_effective_members WHERE project_id = ?)
+    """, (project_id,)).fetchall()
+
+    for pair in pairs:
+        a, b = pair[0], pair[1]
+        if not conn.execute(
+            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='co_occurs'", (a, b)
+        ).fetchone():
+            conn.execute(
+                "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
+                " VALUES (?,?,?,?,?,?,datetime('now'))",
+                (new_id(), a, b, "co_occurs", 1.0, "system"),
+            )
+
+    conn.commit()
 
 
 def _sample_raws(conn: sqlite3.Connection, project_id: str, n: int, excerpt_chars: int) -> str:
@@ -170,8 +259,8 @@ def _sample_raws(conn: sqlite3.Connection, project_id: str, n: int, excerpt_char
         SELECT n.title, n.body, n.subkind
         FROM nodes n
         JOIN raw_nodes r ON r.node_id = n.id
-        JOIN project_membership pm ON pm.node_id = n.id
-        WHERE pm.project_id = ? AND pm.role != 'excluded'
+        JOIN project_effective_members pm ON pm.node_id = n.id
+        WHERE pm.project_id = ?
           AND r.source_of_truth = 1
         ORDER BY n.created_at DESC
         LIMIT ?

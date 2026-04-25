@@ -70,6 +70,9 @@ class EdgeRepository:
         type: EdgeType,
         weight: float = 1.0,
         created_by: EdgeCreator = "user",
+        *,
+        rationale: str | None = None,
+        angle: str | None = None,
     ) -> list[Edge]:
         """Create the edge plus reciprocal/inverse if applicable.
 
@@ -79,7 +82,7 @@ class EdgeRepository:
         skipped edges so the caller always sees the canonical row.
         """
         from loci.db.connection import transaction
-        primary = self._build(src, dst, type, weight, created_by)
+        primary = self._build(src, dst, type, weight, created_by, rationale=rationale, angle=angle)
         out: list[Edge] = []
         with transaction(self.conn):
             inserted = self._insert_or_get(primary)
@@ -109,7 +112,10 @@ class EdgeRepository:
     # Internals
     # -----------------------------------------------------------------------
 
-    def _build(self, src: str, dst: str, type: EdgeType, weight: float, by: EdgeCreator) -> Edge:
+    def _build(
+        self, src: str, dst: str, type: EdgeType, weight: float, by: EdgeCreator,
+        *, rationale: str | None = None, angle: str | None = None,
+    ) -> Edge:
         return Edge(
             id=new_id(),
             src=src, dst=dst, type=type,
@@ -117,6 +123,8 @@ class EdgeRepository:
             created_at=now_iso(),
             created_by=by,
             symmetric=type in SYMMETRIC_EDGE_TYPES,
+            rationale=rationale,
+            angle=angle,
         )
 
     def _insert_or_get(self, edge: Edge) -> Edge:
@@ -125,12 +133,13 @@ class EdgeRepository:
             self.conn.execute(
                 """
                 INSERT INTO edges(id, src, dst, type, weight, created_at,
-                                   created_by, symmetric)
-                VALUES (?,?,?,?,?,?,?,?)
+                                   created_by, symmetric, rationale, angle)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     edge.id, edge.src, edge.dst, edge.type, edge.weight,
                     edge.created_at, edge.created_by, int(edge.symmetric),
+                    edge.rationale, edge.angle,
                 ),
             )
             return edge
@@ -146,4 +155,6 @@ class EdgeRepository:
             id=row["id"], src=row["src"], dst=row["dst"], type=row["type"],
             weight=row["weight"], created_at=row["created_at"],
             created_by=row["created_by"], symmetric=bool(row["symmetric"]),
+            rationale=row["rationale"] if "rationale" in row.keys() else None,
+            angle=row["angle"] if "angle" in row.keys() else None,
         )

@@ -57,10 +57,9 @@ def search(
             snippet(nodes_fts, 2, '⟪', '⟫', '…', 12) AS snippet
         FROM nodes_fts f
         JOIN nodes n ON n.id = f.node_id
-        JOIN project_membership pm ON pm.node_id = n.id
+        JOIN project_effective_members pm ON pm.node_id = n.id
         WHERE nodes_fts MATCH ?
           AND pm.project_id = ?
-          AND pm.role != 'excluded'
           AND n.status IN ({status_placeholders})
         ORDER BY bm25
         LIMIT ?

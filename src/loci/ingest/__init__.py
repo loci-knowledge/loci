@@ -13,7 +13,16 @@ from loci.ingest.pipeline import (
     IngestPipeline,
     IngestResult,
     scan_path,
+    scan_project,
     scan_registered_sources,
+    scan_workspace,
 )
 
-__all__ = ["IngestPipeline", "IngestResult", "scan_path", "scan_registered_sources"]
+__all__ = [
+    "IngestPipeline",
+    "IngestResult",
+    "scan_path",
+    "scan_project",
+    "scan_registered_sources",
+    "scan_workspace",
+]

@@ -129,14 +129,13 @@ def _build_adjacency(
     nodes outside this project.
     """
     type_placeholders = ",".join("?" * len(PPR_EDGE_TYPES))
-    # Get all interp nodes in this project.
+    # Get all interp nodes in this project (via derived effective membership).
     rows = conn.execute(
         """
         SELECT n.id AS id
         FROM nodes n
-        JOIN project_membership pm ON pm.node_id = n.id
+        JOIN project_effective_members pm ON pm.node_id = n.id
         WHERE pm.project_id = ?
-          AND pm.role != 'excluded'
           AND n.kind = 'interpretation'
           AND n.status IN ('live','dirty')
         """,
@@ -147,16 +146,16 @@ def _build_adjacency(
         return [], csr_matrix((0, 0), dtype=np.float64)
     index = {nid: i for i, nid in enumerate(node_ids)}
 
-    # Edges among the interp nodes in this project.
+    # Edges among the interp nodes in this project's effective membership.
     edge_rows = conn.execute(
         f"""
         SELECT e.src AS src, e.dst AS dst, e.weight AS weight
         FROM edges e
         WHERE e.type IN ({type_placeholders})
-          AND e.src IN (SELECT node_id FROM project_membership
-                        WHERE project_id = ? AND role != 'excluded')
-          AND e.dst IN (SELECT node_id FROM project_membership
-                        WHERE project_id = ? AND role != 'excluded')
+          AND e.src IN (SELECT node_id FROM project_effective_members
+                        WHERE project_id = ?)
+          AND e.dst IN (SELECT node_id FROM project_effective_members
+                        WHERE project_id = ?)
         """,
         (*PPR_EDGE_TYPES, project_id, project_id),
     ).fetchall()

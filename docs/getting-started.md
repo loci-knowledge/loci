@@ -67,8 +67,8 @@ ANTHROPIC_API_KEY=sk-ant-...
 The four model roles default to:
 
 ```
-interpretation_model = openai:gpt-5.4         # builds + maintains the interp layer
-rag_model            = openai:gpt-5.4         # synthesises drafts
+interpretation_model = openai:gpt-5.4-mini    # builds + maintains the interp layer
+rag_model            = openai:gpt-5.4-nano    # synthesises drafts
 classifier_model     = openai:gpt-5.4-nano    # contradiction classifier in absorb
 hyde_model           = openai:gpt-5.4-nano    # hypothetical-doc expansion
 ```
@@ -173,7 +173,7 @@ questions* worth pursuing. **It does not invent interpretations on day one**
 ```bash
 uv run loci kickoff codoc --n 8
 # → result: { 'skipped': false, 'questions_written': 8,
-#            'model': 'openai:gpt-5.4' }
+#            'model': 'openai:gpt-5.4-mini' }
 ```
 
 You can list them:

@@ -66,10 +66,12 @@ def create_app() -> FastAPI:
         responses,
         retrieve,
         sources,
+        workspaces,
     )
 
     app.include_router(projects.router)
     app.include_router(anchors.router)
+    app.include_router(workspaces.router)
     app.include_router(sources.router)
     app.include_router(retrieve.router)
     app.include_router(draft.router)

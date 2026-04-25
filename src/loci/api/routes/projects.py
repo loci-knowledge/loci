@@ -28,8 +28,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from loci.api.dependencies import db, project_by_id
-from loci.graph.models import Project
+from loci.graph.models import Project, Workspace
 from loci.graph.projects import ProjectRepository
+from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest import scan_path
 from loci.ingest.content_hash import hash_file
 from loci.ingest.extractors import extract
@@ -302,7 +303,8 @@ def register_source(
     extracted = extract(p)
     if extracted is None:
         raise HTTPException(415, detail=f"unsupported file type: {p.suffix}")
-    res = scan_path(conn, project.id, p)
+    ws_id = _primary_workspace_id(conn, project)
+    res = scan_path(conn, ws_id, p)
     return {
         "content_hash": trunc,
         "full_hash": full,
@@ -319,5 +321,28 @@ def scan_sources(
     root = PPath(body.root).expanduser().resolve()
     if not root.exists():
         raise HTTPException(404, detail=f"root not found: {root}")
-    res = scan_path(conn, project.id, root)
+    ws_id = _primary_workspace_id(conn, project)
+    res = scan_path(conn, ws_id, root)
     return ScanResponse(**res.__dict__)
+
+
+def _primary_workspace_id(conn: sqlite3.Connection, project: Project) -> str:
+    """Return (creating if needed) the primary workspace id for a project.
+
+    Legacy scan endpoints route through the workspace abstraction by resolving
+    the project to its auto-created primary workspace.
+    """
+    ws_repo = WorkspaceRepository(conn)
+    links = ws_repo.linked_workspaces(project.id)
+    for ws, link in links:
+        if link.role == "primary":
+            return ws.id
+    # Auto-create a primary workspace for this project.
+    slug = f"ws-{project.slug}"
+    ws = ws_repo.get_by_slug(slug)
+    if ws is None:
+        ws = Workspace(slug=slug, name=project.name, kind="mixed",
+                       description_md=f"Primary workspace for project '{project.name}'.")
+        ws_repo.create(ws)
+    ws_repo.link_project(project.id, ws.id, role="primary")
+    return ws.id

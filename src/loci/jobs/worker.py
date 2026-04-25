@@ -43,10 +43,14 @@ def _handlers() -> dict[str, HandlerFn]:
     from loci.jobs.absorb import run as run_absorb
     from loci.jobs.kickoff import run as run_kickoff
     from loci.jobs.reflect import run as run_reflect
+    from loci.jobs.relevance import run as run_relevance
+    from loci.jobs.sweep_orphans import run as run_sweep_orphans
     return {
         "absorb": run_absorb,
         "kickoff": run_kickoff,
         "reflect": run_reflect,
+        "relevance": run_relevance,
+        "sweep_orphans": run_sweep_orphans,
     }
 
 
