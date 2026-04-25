@@ -29,9 +29,10 @@ NodeStatus = Literal["proposed", "live", "dirty", "stale", "dismissed"]
 
 RawSubkind = Literal["pdf", "md", "code", "html", "transcript", "txt", "image"]
 InterpretationSubkind = Literal[
-    "philosophy", "pattern", "tension", "decision", "question",
-    "touchstone", "experiment", "metaphor",
-    "relevance",   # project↔information relationship with a typed angle
+    "philosophy",  # grounding axiom — first-principle belief
+    "tension",     # two values pulling against each other (also: open tensions / unanswered questions)
+    "decision",    # concrete choice with named trade-offs
+    "relevance",   # typed bridge between workspace(s) and project intent (requires angle)
 ]
 Subkind = RawSubkind | InterpretationSubkind
 
@@ -42,8 +43,9 @@ InterpretationOrigin = Literal[
 ]
 
 EdgeType = Literal[
-    "cites", "reinforces", "contradicts", "extends",
-    "specializes", "generalizes", "aliases", "co_occurs",
+    "cites",     # interp → raw: interpretation draws on this source as evidence
+    "semantic",  # interp ↔ interp: meaning-based relationship (replaces co_occurs/reinforces/extends/…)
+    "actual",    # raw ↔ raw: explicit dependency (code import, paper citation, markdown file link)
 ]
 
 EdgeCreator = Literal["user", "system", "proposal_accepted"]
@@ -73,12 +75,10 @@ RelevanceAngle = Literal[
 #   - is this type symmetric? (then we auto-create the reciprocal)
 #   - what's the inverse? (only `specializes` ↔ `generalizes`)
 SYMMETRIC_EDGE_TYPES: frozenset[EdgeType] = frozenset({
-    "reinforces", "contradicts", "aliases", "co_occurs",
+    "semantic",  # meaning relationships are bidirectional
+    "actual",    # dependency/citation relationships are stored once, traversed both ways
 })
-EDGE_INVERSES: dict[EdgeType, EdgeType] = {
-    "specializes": "generalizes",
-    "generalizes": "specializes",
-}
+EDGE_INVERSES: dict[EdgeType, EdgeType] = {}  # no asymmetric inverses in the simplified vocabulary
 
 
 def new_id() -> str:

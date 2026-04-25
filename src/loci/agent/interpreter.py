@@ -456,7 +456,7 @@ def _apply_actions(
             embedding = vecs[k] if vecs is not None else None
             try:
                 node = InterpretationNode(
-                    subkind=a.subkind or "pattern",
+                    subkind=a.subkind or "decision",
                     title=a.title or "(untitled)",
                     body=a.body or "",
                     angle=a.angle,
@@ -616,11 +616,10 @@ Decide what new interpretations would help the user *next time* on a similar \
 task, and what existing interpretations should be reinforced or softened.
 
 Choose subkind based on what you actually observe in the candidates:
-- `pattern`: a recurring structure or approach that appears across sources
-- `decision`: a concrete choice the project made (or should make) with trade-offs
-- `tension`: two values or requirements that pull against each other
-- `philosophy`: a first-principle belief that grounds the project's direction
-- `question`: an open question the project must answer, not yet resolved
+- `tension`: an open question, unresolved conflict, or two values pulling against \
+  each other. Start here for the first interpretations of a new topic.
+- `decision`: a concrete choice the project made (or should make) with explicit trade-offs.
+- `philosophy`: a first-principle belief or grounding axiom that shapes the project's direction.
 - `relevance`: use ONLY when the workspace context shows material from a \
   clearly distinct external source (codebase, paper set, etc.) and the \
   candidates reveal a specific *angle* by which that source serves the \
@@ -629,15 +628,15 @@ Choose subkind based on what you actually observe in the candidates:
   vocabulary.
 
 Do NOT default to `relevance` for every observation. Use the most specific \
-subkind that fits.
+subkind that fits. Prefer `tension` when something is unresolved, `decision` \
+when a concrete trade-off has been made, `philosophy` for grounding beliefs.
 
 Output a Reflection with:
-- deliberation: 2-6 sentences in your voice. What pattern did you see? What \
+- deliberation: 2-6 sentences in your voice. What tension did you see? What \
   would help next time?
 - actions: a list of Actions. Possible kinds:
     - create: a new interpretation node. Required: subkind, title, body. \
-      Subkind is one of {philosophy, pattern, tension, decision, question, \
-      touchstone, experiment, metaphor, relevance}. \
+      Subkind is one of {tension, decision, philosophy, relevance}. \
       For subkind=relevance, also set `angle` (required) and `rationale_md` \
       (1–3 sentences: the "because" — what exactly makes these sources \
       relevant at this angle). Angle must be one of: \
@@ -652,12 +651,12 @@ Output a Reflection with:
     - update_angle: refine the angle/rationale on an existing relevance node \
       in response to user edits or new evidence. Required: target_handle, \
       angle, rationale_md.
-    Edge types: cites (interp→raw), reinforces, contradicts, extends, \
-    specializes, generalizes, aliases, co_occurs.
+    Edge types: cites (interp→raw), semantic (interp↔interp meaning link), \
+    actual (raw↔raw dependency).
 
   When you create a node, you MAY include `links` whose src_handle is "NEW" \
-  to immediately connect the new node into the graph (e.g., a new pattern \
-  reinforcing a pinned philosophy). For relevance nodes, add `cites` links \
+  to immediately connect the new node into the graph (e.g., a tension node \
+  linking to a related philosophy). For relevance nodes, add `cites` links \
   to the raw candidates ([Nxx]) that justify the angle.
 
 RULES:

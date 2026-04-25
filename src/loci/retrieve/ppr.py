@@ -5,11 +5,10 @@ implement only the PPR step here; the dual-node split is encoded in the schema
 (raw vs interpretation nodes) and the orchestrator decides what to feed in.
 
 The graph: nodes are *interpretation* node ids (raw nodes are leaves and don't
-participate in PPR). Edges are weighted; we use all interp↔interp edge types
-(reinforces, contradicts, extends, specializes, generalizes, aliases,
-co_occurs) with their weights. Direction matters — PPR walks the directed
-graph as-is. Symmetric edge types already have reciprocal rows in the table
-(see `loci/graph/edges.py`), so the random walk can move both ways.
+participate in PPR). Edges are weighted; we use the `semantic` interp↔interp
+edge type. Direction matters — PPR walks the directed graph as-is. Symmetric
+edge types already have reciprocal rows in the table (see `loci/graph/edges.py`),
+so the random walk can move both ways.
 
 Math:
 
@@ -37,13 +36,9 @@ from scipy.sparse import csr_matrix
 
 from loci.config import get_settings
 
-# Edge types that participate in the random walk. `cites` is excluded because
-# PPR runs over interpretation nodes only; cites is interp→raw and would
-# create dangling targets.
-PPR_EDGE_TYPES: tuple[str, ...] = (
-    "reinforces", "contradicts", "extends",
-    "specializes", "generalizes", "aliases", "co_occurs",
-)
+# Edge types that participate in the random walk. `cites` and `actual` are
+# excluded because PPR runs over interpretation nodes only.
+PPR_EDGE_TYPES: tuple[str, ...] = ("semantic",)
 
 
 @dataclass

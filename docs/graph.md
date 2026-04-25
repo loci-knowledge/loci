@@ -490,19 +490,15 @@ The D3.js force graph at `/tmp/loci_graph.html` uses:
 - **Filter bar** (top center): toggle subkinds on/off to reduce visual noise.
 - **Drag** nodes to re-pin them. **Scroll/pinch** to zoom. **Background click** closes the panel.
 
-To regenerate the graph from the current DB state:
+To regenerate the graph from the current DB state, use the CLI exporter:
 
 ```bash
-source .venv/bin/activate
-python3 - << 'EOF'
-import json
-from loci.db import connect
-
-conn = connect('loci.db')
-# ... export nodes + edges to /tmp/graph_data.json
-# see docs/getting-started.md §Visualize
-EOF
+uv run loci graph export codoc --output /tmp/loci_graph.html
 ```
+
+That command reads the local loci database and writes a standalone HTML
+snapshot. If your friend clones the repo, they will only see a graph after
+they create or open a project with data and run the export command.
 
 The co_occurs edges are shown at very low opacity so they don't obscure the
 structural (`cites`, `reinforces`) edges. If you want to hide them entirely,

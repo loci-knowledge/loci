@@ -13,6 +13,7 @@ Subcommands:
     loci q <project> <query> [--k] [--hyde]
     loci draft <project> <instruction> [--style] [--cite-density]
     loci absorb <project>
+    loci graph export <project> [--output FILE]
     loci status [project]
 """
 
@@ -48,6 +49,8 @@ project_app = App(name="project", help="Project commands.")
 app.command(project_app)
 source_app = App(name="source", help="Manage scan roots for a project.")
 app.command(source_app)
+graph_app = App(name="graph", help="Export graph visualizations.")
+app.command(graph_app)
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +121,14 @@ def project_create(
         slug=slug, name=name or slug, profile_md=profile_md,
     ))
     console.print(f"[green]created[/green] [bold]{proj.slug}[/bold] ({proj.id})")
+
+
+@project_app.command(name="bind")
+def project_bind(slug: str) -> None:
+    """Bind the current directory to a project. Writes .loci/project."""
+    from loci.mcp.resolve import write_project_file
+    path = write_project_file(slug)
+    console.print(f"[green]bound[/green] [bold]{slug}[/bold] → {path}")
 
 
 @project_app.command(name="list")
@@ -402,6 +413,28 @@ def absorb(project: str) -> None:
     run_once(conn)
     j = get_job(conn, jid)
     console.print(j)
+
+
+@graph_app.command(name="export")
+def graph_export(
+    project: str,
+    output: Path = Path("/tmp/loci_graph.html"),
+    include_raw: bool = True,
+) -> None:
+    """Write a standalone HTML graph snapshot for a project."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph import ProjectRepository
+    from loci.graph.export import write_graph_html
+
+    migrate()
+    conn = connect()
+    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
+    if proj is None:
+        console.print(f"[red]no such project:[/red] {project}")
+        raise SystemExit(1)
+    out = write_graph_html(proj, conn, output, include_raw=include_raw)
+    console.print(f"[green]wrote[/green] {out}")
 
 
 @app.command

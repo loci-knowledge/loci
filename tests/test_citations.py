@@ -7,7 +7,7 @@ from loci.graph import InterpretationNode, NodeRepository, ProjectRepository
 
 
 def _make_interp(conn, project, embedder):
-    n = InterpretationNode(subkind="pattern", title="X", body="x body",
+    n = InterpretationNode(subkind="decision", title="X", body="x body",
                               origin="user_explicit_create")
     NodeRepository(conn).create_interpretation(n, embedding=embedder.encode("x body"))
     ProjectRepository(conn).add_member(project.id, n.id, role="included")

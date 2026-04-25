@@ -76,7 +76,7 @@ def _make_node(conn, project) -> str:
     from loci.graph import InterpretationNode, NodeRepository, ProjectRepository
     _NODE_COUNTER[0] += 1
     n = InterpretationNode(
-        subkind="pattern", title=f"t-{_NODE_COUNTER[0]}",
+        subkind="decision", title=f"t-{_NODE_COUNTER[0]}",
         body="x", origin="user_explicit_create",
     )
     NodeRepository(conn).create_interpretation(n)

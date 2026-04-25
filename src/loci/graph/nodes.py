@@ -191,8 +191,8 @@ class NodeRepository:
                     bump_dirty: bool = True) -> None:
         """Edit a node's body / title / tags. Bumps `updated_at`.
 
-        If `bump_dirty=True` (the default), one-hop neighbours on cites/extends/
-        specializes/reinforces are marked `dirty` per PLAN.md §Edge cases (3).
+        If `bump_dirty=True` (the default), one-hop neighbours on cites/semantic
+        edges are marked `dirty` per PLAN.md §Edge cases (3).
         That neighbour walk is a single UPDATE...WHERE with a subquery — cheap.
         """
         if title is None and body is None and tags is None and new_embedding is None:
@@ -281,18 +281,17 @@ class NodeRepository:
         )
 
     def _mark_neighbors_dirty(self, node_id: str) -> None:
-        # PLAN.md §Edge cases: dirty propagates one hop on cites, extends,
-        # specializes, reinforces.
+        # PLAN.md §Edge cases: dirty propagates one hop on cites and semantic edges.
         self.conn.execute(
             """
             UPDATE nodes
             SET status = 'dirty', updated_at = ?
             WHERE status = 'live' AND id IN (
                 SELECT dst FROM edges
-                WHERE src = ? AND type IN ('cites','extends','specializes','reinforces')
+                WHERE src = ? AND type IN ('cites','semantic')
                 UNION
                 SELECT src FROM edges
-                WHERE dst = ? AND type IN ('cites','extends','specializes','reinforces')
+                WHERE dst = ? AND type IN ('cites','semantic')
             )
             """,
             (now_iso(), node_id, node_id),

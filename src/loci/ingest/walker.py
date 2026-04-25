@@ -23,9 +23,37 @@ log = logging.getLogger(__name__)
 # Directories we always skip. Personal vaults rarely have meaningful content
 # in these and they balloon walk time.
 DEFAULT_SKIP_DIRS: frozenset[str] = frozenset({
-    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
-    ".next", ".turbo", ".cache", "target",
+    # VCS
+    ".git", ".hg", ".svn",
+    # JS/TS tooling
+    "node_modules", ".next", ".turbo", ".cache", ".parcel-cache",
+    ".nuxt", ".output", ".svelte-kit",
+    # Python
+    ".venv", "venv", "env", "__pycache__", "site-packages",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "htmlcov", "coverage",
+    # Build outputs
+    "dist", "build", "out", "target", "_build", "obj", "bin",
+    # IDE
+    ".idea", ".vscode",
+    # Misc generated
+    "__snapshots__", "storybook-static", ".storybook",
+})
+
+# File name suffixes to skip even if the extension is in DEFAULT_INCLUDE_EXTS.
+# These are generated/minified files that add noise without adding knowledge.
+DEFAULT_SKIP_SUFFIXES: tuple[str, ...] = (
+    ".min.js", ".min.css", ".bundle.js", ".chunk.js",
+    ".map",        # source maps
+    ".lock",       # lock files (package-lock.json, yarn.lock, poetry.lock …)
+    ".snap",       # jest/vitest snapshots
+    "-lock.json",  # npm/pnpm style
+)
+
+# Exact file names to skip regardless of extension.
+DEFAULT_SKIP_NAMES: frozenset[str] = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "poetry.lock", "Cargo.lock", "Gemfile.lock", "composer.lock",
+    "bun.lockb",
 })
 
 # Extensions we know how to extract. PLAN.md §Memory space lists pdf/md/code/
@@ -54,6 +82,8 @@ def walk(
     *,
     include_exts: frozenset[str] = DEFAULT_INCLUDE_EXTS,
     skip_dirs: frozenset[str] = DEFAULT_SKIP_DIRS,
+    skip_suffixes: tuple[str, ...] = DEFAULT_SKIP_SUFFIXES,
+    skip_names: frozenset[str] = DEFAULT_SKIP_NAMES,
     max_size_bytes: int = 50 * 1024 * 1024,
 ) -> Iterator[Path]:
     """Yield file paths under `root` matching the include/skip filters.
@@ -65,7 +95,7 @@ def walk(
     """
     root = root.expanduser().resolve()
     if root.is_file():
-        if _accept(root, include_exts, max_size_bytes):
+        if _accept(root, include_exts, skip_suffixes, skip_names, max_size_bytes):
             yield root
         return
     if not root.is_dir():
@@ -73,16 +103,31 @@ def walk(
         return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         # In-place mutation of dirnames is the documented way to prune `os.walk`.
-        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in skip_dirs and not d.startswith(".")
+        ]
         for name in filenames:
             if name.startswith("."):
                 continue
             p = Path(dirpath) / name
-            if _accept(p, include_exts, max_size_bytes):
+            if _accept(p, include_exts, skip_suffixes, skip_names, max_size_bytes):
                 yield p
 
 
-def _accept(p: Path, include_exts: frozenset[str], max_size_bytes: int) -> bool:
+def _accept(
+    p: Path,
+    include_exts: frozenset[str],
+    skip_suffixes: tuple[str, ...],
+    skip_names: frozenset[str],
+    max_size_bytes: int,
+) -> bool:
+    name = p.name
+    if name in skip_names:
+        return False
+    name_lower = name.lower()
+    if any(name_lower.endswith(sfx) for sfx in skip_suffixes):
+        return False
     if p.suffix.lower() not in include_exts:
         return False
     try:

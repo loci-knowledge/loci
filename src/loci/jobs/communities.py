@@ -4,8 +4,8 @@ PLAN.md §Inspiration: GraphRAG-style hierarchical communities. We compute one
 snapshot per absorb run when the user has installed `loci[graph]` (igraph +
 leidenalg). Without those packages we no-op gracefully.
 
-The communities feed back into retrieval as `co_occurs` edges (if you're in
-the same community as a high-PPR node, your PPR mass goes up).
+The communities feed back into retrieval via `semantic` edges (nodes in the
+same community as a high-PPR node get higher PPR mass).
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ def run(conn: sqlite3.Connection, project_id: str) -> dict:
     nodes = conn.execute(
         """
         SELECT n.id FROM nodes n
-        JOIN project_membership pm ON pm.node_id = n.id
-        WHERE pm.project_id = ? AND pm.role != 'excluded'
+        JOIN project_effective_members pm ON pm.node_id = n.id
+        WHERE pm.project_id = ?
           AND n.kind = 'interpretation' AND n.status IN ('live','dirty')
         """,
         (project_id,),
@@ -46,7 +46,7 @@ def run(conn: sqlite3.Connection, project_id: str) -> dict:
         """
         SELECT src, dst, weight
         FROM edges
-        WHERE type IN ('reinforces','extends','specializes','generalizes','co_occurs','aliases')
+        WHERE type = 'semantic'
           AND src IN ({0}) AND dst IN ({0})
         """.format(",".join("?" * len(node_ids))),
         (*node_ids, *node_ids),

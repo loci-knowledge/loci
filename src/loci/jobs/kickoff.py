@@ -1,21 +1,12 @@
 """Kickoff job — generate the first interpretation seeds for a new project.
 
-PLAN.md §Vignettes (1) calls this out — but with a twist from the agentic
-pivot: we no longer route through the proposal queue. Kickoff writes
-question nodes **directly to live state** at conservative confidence
-(`confidence=0.5`, `origin=agent_synthesis`), so they show up in retrieval
-immediately and the user starts working with them rather than reviewing
-them in a queue.
+Kickoff writes `tension` nodes directly to live state at conservative confidence
+(`confidence=0.5`, `origin=agent_synthesis`). Tension nodes represent open questions
+and unresolved conflicts — they assert nothing but invite the user's reasoning.
+Subsequent drafting and corrections will evolve them into decisions, philosophies,
+and relevance interpretations.
 
-PLAN's "no fabricated interpretations on day 1" rule (§Cold start) is
-preserved by virtue of subkind: kickoff produces `question` nodes only,
-not claims (no patterns, philosophies, or tensions). Questions assert
-nothing — they invite. The user's subsequent activity (drafting,
-correcting) shapes whether those questions evolve into committed
-interpretations.
-
-Without an LLM configured, kickoff returns `skipped: true` with no node
-writes.
+Without an LLM configured, kickoff returns `skipped: true` with no node writes.
 """
 
 from __future__ import annotations
@@ -47,17 +38,17 @@ KICKOFF_INSTRUCTIONS = (
     "You are helping a user start a new research/writing project. They will "
     "give you a PROJECT PROFILE (their stated goals, scope, and taste) and a "
     "SAMPLE of source material they have collected. Your job is to propose "
-    "{n} OPEN QUESTIONS worth pursuing within this project.\n\n"
+    "{n} open TENSIONS worth pursuing within this project.\n\n"
     "Rules — follow these strictly:\n"
-    "- Output a JSON-shaped Kickoff with a `questions` field; each question "
-    "  has `title` (≤80 chars, phrased as a question) and `body` (1–3 "
-    "  sentences explaining why the question matters and what answering it "
-    "  would unlock).\n"
-    "- Do NOT make claims; do NOT pretend to know the user's interpretation. "
-    "  Questions only.\n"
-    "- Stay tight to the profile. If the sample suggests directions outside "
-    "  the profile's scope, ignore them.\n"
-    "- Phrase questions in the user's voice — first person, casual."
+    "- Output a JSON-shaped Kickoff with a `questions` field; each tension "
+    "  has `title` (≤80 chars, phrased as a question or conflict) and `body` "
+    "  (1–3 sentences explaining why this tension matters and what resolving "
+    "  it would unlock).\n"
+    "- Do NOT make claims or pretend to know the user's interpretation. "
+    "  Frame as open tensions: unresolved questions, competing priorities, "
+    "  or gaps between what the sources show and what the project needs.\n"
+    "- Stay tight to the profile. Ignore directions outside the scope.\n"
+    "- Phrase in the user's voice — first person, casual."
 )
 
 
@@ -133,11 +124,11 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     for i, q in enumerate(questions):
         try:
             node = InterpretationNode(
-                subkind="question",
+                subkind="tension",
                 title=q.title.strip(),
                 body=q.body.strip(),
                 origin="agent_synthesis",
-                confidence=0.5,        # questions are speculative, not asserted
+                confidence=0.5,        # open questions are speculative, not asserted
                 status="live",         # but live — they show up in retrieval
             )
             embedding = vecs[i] if vecs is not None else None
@@ -148,7 +139,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
             )
             written += 1
         except Exception as exc:  # noqa: BLE001
-            log.warning("kickoff: write question failed: %s", exc)
+            log.warning("kickoff: write tension failed: %s", exc)
 
     # Anchor wiring + co-citation — runs after all nodes are written so new
     # question nodes appear in retrieval immediately and share evidence edges.
@@ -160,7 +151,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
 
     return {
         "skipped": False,
-        "questions_written": written,
+        "tensions_written": written,
         "model": settings.interpretation_model,
     }
 
@@ -170,11 +161,11 @@ def _anchor_and_cocite(
     project_id: str,
     embedder,
 ) -> None:
-    """Wire isolated interpretation nodes to nearest raw nodes and build co-citation edges.
+    """Wire isolated interpretation nodes to nearest raw nodes and build semantic edges.
 
     Isolated interp nodes (no `cites` edge yet) get wired to their 3 nearest raws
     via cosine similarity. Then pairs of interp nodes that cite the same raw get a
-    `co_occurs` edge to signal shared evidence.
+    `semantic` edge to signal shared evidence.
     """
     import struct
     import numpy as np
@@ -235,12 +226,12 @@ def _anchor_and_cocite(
     for pair in pairs:
         a, b = pair[0], pair[1]
         if not conn.execute(
-            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='co_occurs'", (a, b)
+            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='semantic'", (a, b)
         ).fetchone():
             conn.execute(
                 "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
                 " VALUES (?,?,?,?,?,?,datetime('now'))",
-                (new_id(), a, b, "co_occurs", 1.0, "system"),
+                (new_id(), a, b, "semantic", 1.0, "system"),
             )
 
     conn.commit()

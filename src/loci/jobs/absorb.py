@@ -26,6 +26,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from loci.ingest.dependencies import extract_and_write as _extract_deps
 from loci.jobs import audits, communities, contradiction, proposals
 
 log = logging.getLogger(__name__)
@@ -67,15 +68,18 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     # 8. Communities (igraph-gated)
     summary["steps"]["communities"] = communities.run(conn, project_id)
 
-    # 9. Co-citation edges — interp pairs that share a cited raw get co_occurs
+    # 9. Co-citation edges — interp pairs that share a cited raw get semantic
     summary["steps"]["co_citation"] = _update_co_citations(conn, project_id)
+
+    # 10. Code dependency edges — actual edges from import analysis
+    summary["steps"]["code_deps"] = _extract_deps(conn, project_id)
 
     log.info("absorb: done for project=%s", project_id)
     return summary
 
 
 def _update_co_citations(conn: sqlite3.Connection, project_id: str) -> dict:
-    """Add co_occurs edges between interpretation nodes that cite the same raw.
+    """Add semantic edges between interpretation nodes that cite the same raw.
 
     Safe to re-run: skips pairs that already have a co_occurs edge.
     """
@@ -94,12 +98,12 @@ def _update_co_citations(conn: sqlite3.Connection, project_id: str) -> dict:
     for pair in pairs:
         a, b = pair[0], pair[1]
         if not conn.execute(
-            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='co_occurs'", (a, b)
+            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='semantic'", (a, b)
         ).fetchone():
             conn.execute(
                 "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
                 " VALUES (?,?,?,?,?,?,datetime('now'))",
-                (new_id(), a, b, "co_occurs", 1.0, "system"),
+                (new_id(), a, b, "semantic", 1.0, "system"),
             )
             added += 1
     if added:

@@ -49,17 +49,17 @@ def test_anchored_ppr_boosts_anchor_neighbours(conn, fake_embedder, project, wor
     nodes_repo = NodeRepository(conn)
     edges_repo = EdgeRepository(conn)
     # Two interps; one connects to the rotary raw, one is unrelated.
-    iA = InterpretationNode(subkind="pattern", title="A pattern",
+    iA = InterpretationNode(subkind="decision", title="A pattern",
                               body="anchored interp body",
                               origin="user_explicit_create")
-    iB = InterpretationNode(subkind="pattern", title="B pattern",
+    iB = InterpretationNode(subkind="decision", title="B pattern",
                               body="unrelated body",
                               origin="user_explicit_create")
     nodes_repo.create_interpretation(iA, embedding=fake_embedder.encode(iA.body))
     nodes_repo.create_interpretation(iB, embedding=fake_embedder.encode(iB.body))
     ProjectRepository(conn).add_member(project.id, iA.id, role="included")
     ProjectRepository(conn).add_member(project.id, iB.id, role="included")
-    edges_repo.create(iA.id, iB.id, type="reinforces")
+    edges_repo.create(iA.id, iB.id, type="semantic")
 
     r = Retriever(conn, embedder=fake_embedder).retrieve(
         RetrievalRequest(

@@ -129,6 +129,26 @@ def test_graph_view_includes_community_version(loci_dir):
         assert r.json()["community_version"] == 0
 
 
+def test_graph_export_writes_standalone_html(loci_dir):
+    from loci.db.connection import connect
+    from loci.graph import Project, ProjectRepository
+    from loci.graph.export import write_graph_html
+
+    from loci.db import migrate
+
+    migrate()
+    conn = connect()
+    proj = ProjectRepository(conn).create(Project(slug="p", name="Project P"))
+    output = loci_dir / "graph.html"
+
+    written = write_graph_html(proj, conn, output)
+    assert written == output
+    html = output.read_text()
+    assert "Loci Graph" in html
+    assert "const DATA =" in html
+    assert '"project": {"id":' in html
+
+
 # ---------------------------------------------------------------------------
 # Anchors (active-anchor set)
 # ---------------------------------------------------------------------------
@@ -242,7 +262,7 @@ def test_publish_node_upsert_on_create(loci_dir, fake_embedder):
             q = await bus.subscribe(f"project:{pid}")
             try:
                 resp = c.post("/nodes", json={
-                    "project_id": pid, "subkind": "pattern",
+                    "project_id": pid, "subkind": "decision",
                     "title": "T", "body": "b",
                     "origin": "user_explicit_create",
                 })
@@ -321,7 +341,7 @@ def test_seq_is_monotonic_per_project(loci_dir, fake_embedder):
                 # increasing.
                 for i in range(2):
                     c.post("/nodes", json={
-                        "project_id": pid, "subkind": "pattern",
+                        "project_id": pid, "subkind": "decision",
                         "title": f"T{i}", "body": "x",
                         "origin": "user_explicit_create",
                     })

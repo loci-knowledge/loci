@@ -1,16 +1,23 @@
 """FastMCP server exposing the curated loci tools.
 
 Tools:
-    loci.retrieve(project, query, k?, anchors?, hyde?)
-    loci.draft(project, instruction, context_md?, style?, cite_density?, k?)
-    loci.expand_citation(response_id)
-    loci.expand_node(node_id)
-    loci.propose_node(project, subkind, title, body, cites?, related?)
-    loci.accept_proposal(proposal_id)
-    loci.absorb(project)
+    loci_retrieve(query, project?, k?, anchors?, hyde?)
+    loci_draft(instruction, project?, context_md?, style?, cite_density?, k?)
+    loci_expand_citation(response_id)
+    loci_expand_node(node_id)
+    loci_propose_node(subkind, title, body, project?, cites?, related?)
+    loci_accept_proposal(proposal_id)
+    loci_absorb(project?)
+    loci_feedback(response_id, edited_markdown)
+    loci_workspace_create(slug, name, kind?, description_md?)
+    loci_workspace_list()
+    loci_workspace_link(workspace, project?)
+    loci_workspace_unlink(workspace, project?)
+    loci_workspace_add_source(workspace, root_path, label?)
+    loci_current_project()
 
-The MCP server uses the same SQLite DB and same code paths as the REST API.
-We resolve project by slug OR id so callers don't have to track ULIDs.
+All tools accept an optional `project` argument. When omitted, the project is
+auto-resolved via: LOCI_PROJECT env → .loci/project file walk-up from cwd.
 """
 
 from __future__ import annotations
@@ -29,10 +36,10 @@ from loci.draft import DraftRequest
 from loci.draft import draft as run_draft
 from loci.embed.local import get_embedder
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
-from loci.graph.models import (
-    InterpretationNode,
-)
+from loci.graph.models import InterpretationNode, Workspace, WorkspaceKind
+from loci.graph.workspaces import WorkspaceRepository
 from loci.jobs import enqueue
+from loci.mcp.resolve import ProjectNotFound, resolve_project_id
 from loci.retrieve import RetrievalRequest, Retriever
 
 log = logging.getLogger(__name__)
@@ -63,25 +70,29 @@ def build_mcp_server() -> FastMCP:
         description=(
             "Search a loci project for relevant interpretations and raw "
             "sources. Returns a ranked list of nodes with `why` strings "
-            "explaining how they matched."
+            "explaining how they matched. `project` is optional when "
+            "LOCI_PROJECT is set or a .loci/project file exists."
         ),
     )
     def loci_retrieve(
-        project: str,
         query: str,
+        project: str | None = None,
         k: int = 10,
         anchors: list[str] | None = None,
         hyde: bool = False,
     ) -> dict[str, Any]:
         conn = get_connection()
-        proj = _resolve_project(conn, project)
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
         retriever = Retriever(conn)
         resp = retriever.retrieve(RetrievalRequest(
-            project_id=proj.id, query=query, k=k,
+            project_id=project_id, query=query, k=k,
             anchors=anchors or [], hyde=hyde,
         ))
         rid = CitationTracker(conn).write_response(
-            __record_for(proj.id, query, k, hyde),
+            __record_for(project_id, query, k, hyde),
             retrieved_node_ids=[n.node_id for n in resp.nodes],
         )
         return {
@@ -101,12 +112,13 @@ def build_mcp_server() -> FastMCP:
         description=(
             "Write a markdown draft for a project, citing nodes from the "
             "graph. Returns `output_md` plus a structured citations[] array. "
-            "Pass `context_md` if the user has draft text already."
+            "Pass `context_md` if the user has draft text already. "
+            "`project` is optional when auto-resolution is configured."
         ),
     )
     def loci_draft(
-        project: str,
         instruction: str,
+        project: str | None = None,
         context_md: str | None = None,
         anchors: list[str] | None = None,
         style: str = "prose",
@@ -115,9 +127,12 @@ def build_mcp_server() -> FastMCP:
         hyde: bool = False,
     ) -> dict[str, Any]:
         conn = get_connection()
-        proj = _resolve_project(conn, project)
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
         result = run_draft(conn, DraftRequest(
-            project_id=proj.id, session_id="mcp",
+            project_id=project_id, session_id="mcp",
             instruction=instruction, context_md=context_md,
             anchors=anchors or [],
             style=style,  # type: ignore[arg-type]
@@ -161,21 +176,23 @@ def build_mcp_server() -> FastMCP:
         description=(
             "Propose a new interpretation node for the user's graph. The node "
             "lands as `proposed` and surfaces in the proposal queue until the "
-            "user accepts or dismisses it. Use `subkind` from "
-            "{philosophy, pattern, tension, decision, question, touchstone, "
-            "experiment, metaphor}."
+            "user accepts or dismisses it. `subkind` must be one of: "
+            "tension, decision, philosophy, relevance."
         ),
     )
     def loci_propose_node(
-        project: str,
         subkind: str,
         title: str,
         body: str,
+        project: str | None = None,
         cites: list[str] | None = None,
         related: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         conn = get_connection()
-        proj = _resolve_project(conn, project)
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
         nodes_repo = NodeRepository(conn)
         edges_repo = EdgeRepository(conn)
         node = InterpretationNode(
@@ -188,7 +205,7 @@ def build_mcp_server() -> FastMCP:
         emb_text = f"{title}\n\n{body}".strip()
         emb = get_embedder().encode(emb_text) if emb_text else None
         nodes_repo.create_interpretation(node, embedding=emb)
-        ProjectRepository(conn).add_member(proj.id, node.id, role="included")
+        ProjectRepository(conn).add_member(project_id, node.id, role="included")
         for raw_id in (cites or []):
             edges_repo.create(node.id, raw_id, type="cites")
         for typ, dst_ids in (related or {}).items():
@@ -210,7 +227,6 @@ def build_mcp_server() -> FastMCP:
             return {"error": "proposal not found"}
         if row["status"] != "pending":
             return {"error": f"proposal not pending (status={row['status']})"}
-        # Mark accepted. Side effects depend on the proposal kind.
         conn.execute(
             "UPDATE proposals SET status = 'accepted', resolved_at = datetime('now') WHERE id = ?",
             (proposal_id,),
@@ -233,11 +249,176 @@ def build_mcp_server() -> FastMCP:
         name="loci_absorb",
         description="Enqueue an absorb checkpoint job for the project. Returns a job_id; poll via the REST /jobs/:id endpoint.",
     )
-    def loci_absorb(project: str) -> dict[str, Any]:
+    def loci_absorb(project: str | None = None) -> dict[str, Any]:
         conn = get_connection()
-        proj = _resolve_project(conn, project)
-        job_id = enqueue(conn, kind="absorb", project_id=proj.id)
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
+        job_id = enqueue(conn, kind="absorb", project_id=project_id)
         return {"job_id": job_id, "status": "queued"}
+
+    @mcp.tool(
+        name="loci_feedback",
+        description=(
+            "Submit feedback on a previous loci response. Pass the response_id "
+            "from a prior retrieve/draft call and your edited markdown. This "
+            "queues a reflect job so the graph learns from your edits."
+        ),
+    )
+    def loci_feedback(
+        response_id: str,
+        edited_markdown: str,
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        rec = CitationTracker(conn).get_response(response_id)
+        if rec is None:
+            return {"error": "response not found", "response_id": response_id}
+        project_id = rec.get("project_id")
+        if not project_id:
+            return {"error": "response has no project_id"}
+        # Write the edited text as a follow-up response so the reflect cycle
+        # can diff against the original and learn citation feedback.
+        from loci.citations import ResponseRecord
+        follow_up = ResponseRecord(
+            project_id=project_id, session_id="mcp",
+            request={"edited_from": response_id},
+            output=edited_markdown,
+            cited_node_ids=rec.get("cited_node_ids", []),
+            client="mcp_feedback",
+        )
+        frid = CitationTracker(conn).write_response(follow_up, retrieved_node_ids=[])
+        job_id = enqueue(
+            conn, kind="reflect", project_id=project_id,
+            payload={"response_id": frid, "trigger": "user_feedback"},
+        )
+        return {"feedback_response_id": frid, "reflect_job_id": job_id, "status": "queued"}
+
+    @mcp.tool(
+        name="loci_current_project",
+        description=(
+            "Return the project that would be auto-resolved for the current "
+            "working directory. Useful for confirming which project loci tools "
+            "will target when `project` is omitted."
+        ),
+    )
+    def loci_current_project() -> dict[str, Any]:
+        conn = get_connection()
+        try:
+            project_id = resolve_project_id(conn)
+        except ProjectNotFound as e:
+            return {"error": str(e), "resolved": False}
+        proj = ProjectRepository(conn).get(project_id)
+        if proj is None:
+            return {"error": "resolved id not found", "resolved": False}
+        return {
+            "resolved": True,
+            "id": proj.id,
+            "slug": proj.slug,
+            "name": proj.name,
+        }
+
+    @mcp.tool(
+        name="loci_workspace_create",
+        description="Create a new information workspace (a labeled bag of source roots).",
+    )
+    def loci_workspace_create(
+        slug: str,
+        name: str,
+        kind: str = "mixed",
+        description_md: str = "",
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        ws = Workspace(slug=slug, name=name, kind=kind, description_md=description_md)  # type: ignore[arg-type]
+        WorkspaceRepository(conn).create(ws)
+        return {"workspace_id": ws.id, "slug": ws.slug}
+
+    @mcp.tool(
+        name="loci_workspace_list",
+        description="List all information workspaces.",
+    )
+    def loci_workspace_list() -> dict[str, Any]:
+        conn = get_connection()
+        ws_repo = WorkspaceRepository(conn)
+        workspaces = ws_repo.list()
+        return {
+            "workspaces": [
+                {"id": ws.id, "slug": ws.slug, "name": ws.name, "kind": ws.kind}
+                for ws in workspaces
+            ]
+        }
+
+    @mcp.tool(
+        name="loci_workspace_link",
+        description=(
+            "Link an information workspace to a project. Enqueues a relevance "
+            "pass so the graph gains typed bridge interpretations. "
+            "`workspace` is the workspace slug or id."
+        ),
+    )
+    def loci_workspace_link(
+        workspace: str,
+        project: str | None = None,
+        role: str = "reference",
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
+        ws_repo = WorkspaceRepository(conn)
+        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
+        if ws is None:
+            return {"error": f"workspace not found: {workspace}"}
+        ws_repo.link_project(project_id, ws.id, role=role)  # type: ignore[arg-type]
+        job_id = enqueue(conn, kind="relevance", project_id=project_id,
+                         payload={"workspace_id": ws.id, "scope": "link"})
+        return {"workspace_id": ws.id, "project_id": project_id,
+                "role": role, "relevance_job_id": job_id}
+
+    @mcp.tool(
+        name="loci_workspace_unlink",
+        description=(
+            "Unlink a workspace from a project. Queues sweep_orphans to mark "
+            "interpretations that depended on that workspace's sources as dirty."
+        ),
+    )
+    def loci_workspace_unlink(
+        workspace: str,
+        project: str | None = None,
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
+        ws_repo = WorkspaceRepository(conn)
+        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
+        if ws is None:
+            return {"error": f"workspace not found: {workspace}"}
+        ws_repo.unlink_project(project_id, ws.id)
+        job_id = enqueue(conn, kind="sweep_orphans", project_id=project_id,
+                         payload={"workspace_id": ws.id})
+        return {"workspace_id": ws.id, "project_id": project_id,
+                "sweep_job_id": job_id}
+
+    @mcp.tool(
+        name="loci_workspace_add_source",
+        description="Register a root directory as a source for a workspace.",
+    )
+    def loci_workspace_add_source(
+        workspace: str,
+        root_path: str,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        from pathlib import Path
+        ws_repo = WorkspaceRepository(conn)
+        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
+        if ws is None:
+            return {"error": f"workspace not found: {workspace}"}
+        ws_src = ws_repo.add_source(ws.id, Path(root_path), label=label)
+        return {"source_id": ws_src.id, "workspace_id": ws.id, "root_path": root_path}
 
     return mcp
 
@@ -250,14 +431,6 @@ def __record_for(project_id: str, query: str, k: int, hyde: bool):
         request={"query": query, "k": k, "hyde": hyde},
         output="", cited_node_ids=[], client="mcp",
     )
-
-
-def _resolve_project(conn, project_str: str):
-    repo = ProjectRepository(conn)
-    proj = repo.get_by_slug(project_str) or repo.get(project_str)
-    if proj is None:
-        raise ValueError(f"project not found: {project_str}")
-    return proj
 
 
 def run_stdio() -> None:
