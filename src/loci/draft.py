@@ -177,9 +177,25 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
 def _format_candidates(
     candidates, conn: sqlite3.Connection,
 ) -> tuple[str, dict[str, str]]:
-    """Render candidates as a numbered block and return (block, handle→id map)."""
+    """Render candidates as a numbered block and return (block, handle→id map).
+
+    For interpretation nodes, we append the content of each cited raw source so
+    the LLM sees the underlying evidence and can reason about *why* the
+    interpretation applies, not just that it does.
+    """
     nodes_repo = NodeRepository(conn)
-    by_id = {n.id: n for n in nodes_repo.get_many([c.node_id for c in candidates])}
+    edges_repo = EdgeRepository(conn)
+    all_ids = [c.node_id for c in candidates]
+    by_id = {n.id: n for n in nodes_repo.get_many(all_ids)}
+
+    # Pre-fetch raw sources for all interpretation candidates in one pass.
+    interp_ids = [c.node_id for c in candidates if by_id.get(c.node_id) and by_id[c.node_id].kind == "interpretation"]
+    cited_raw_ids: dict[str, list[str]] = {}
+    for nid in interp_ids:
+        cited_raw_ids[nid] = [e.dst for e in edges_repo.from_node(nid, types=["cites"])]
+    all_raw_ids = list({rid for rids in cited_raw_ids.values() for rid in rids})
+    raw_nodes_by_id = {n.id: n for n in nodes_repo.get_many(all_raw_ids)} if all_raw_ids else {}
+
     handle_to_id: dict[str, str] = {}
     lines: list[str] = []
     for i, cand in enumerate(candidates, start=1):
@@ -190,11 +206,24 @@ def _format_candidates(
             continue
         budget = INTERP_SNIPPET_BUDGET if node.kind == "interpretation" else RAW_SNIPPET_BUDGET
         snippet = _truncate(node.body, budget)
-        lines.append(
+        block = (
             f"[{handle}] kind={node.kind}/{node.subkind} title=\"{node.title}\"\n"
             f"why-retrieved: {cand.why}\n"
-            f"---\n{snippet}\n"
+            f"---\n{snippet}"
         )
+        # Append raw source excerpts so the LLM can ground the interpretation
+        # in the actual evidence and guide the user on *how* to use it.
+        if node.kind == "interpretation":
+            raw_ids = cited_raw_ids.get(node.id, [])
+            source_parts: list[str] = []
+            for rid in raw_ids[:4]:  # cap at 4 sources per interp
+                raw = raw_nodes_by_id.get(rid)
+                if raw:
+                    raw_excerpt = _truncate(raw.body, RAW_SNIPPET_BUDGET)
+                    source_parts.append(f"  SOURCE \"{raw.title}\":\n  {raw_excerpt}")
+            if source_parts:
+                block += "\n\nEVIDENCE (cited raw sources):\n" + "\n\n".join(source_parts)
+        lines.append(block + "\n")
     return "\n\n".join(lines), handle_to_id
 
 

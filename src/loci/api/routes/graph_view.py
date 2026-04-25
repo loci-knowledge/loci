@@ -39,11 +39,11 @@ def get_graph(
     kind_clause = "" if include_raw else "AND n.kind = 'interpretation'"
     rows = conn.execute(
         f"""
-        SELECT n.id, n.kind, n.subkind, n.title, n.confidence, n.status,
-               n.access_count, n.last_accessed_at, pm.role
+        SELECT n.id, n.kind, n.subkind, n.title, n.body, n.confidence, n.status,
+               n.access_count, n.last_accessed_at, pm.source AS role
         FROM nodes n
-        JOIN project_membership pm ON pm.node_id = n.id
-        WHERE pm.project_id = ? AND pm.role != 'excluded'
+        JOIN project_effective_members pm ON pm.node_id = n.id
+        WHERE pm.project_id = ?
           AND n.status IN ({placeholders})
           {kind_clause}
         """,
@@ -80,7 +80,8 @@ def get_graph(
         "nodes": [
             {
                 "id": r["id"], "kind": r["kind"], "subkind": r["subkind"],
-                "title": r["title"], "confidence": r["confidence"],
+                "title": r["title"], "body": r["body"] or "",
+                "confidence": r["confidence"],
                 "status": r["status"], "access_count": r["access_count"],
                 "last_accessed_at": r["last_accessed_at"],
                 "role": r["role"],

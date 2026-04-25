@@ -49,6 +49,8 @@ project_app = App(name="project", help="Project commands.")
 app.command(project_app)
 source_app = App(name="source", help="Manage scan roots for a project.")
 app.command(source_app)
+workspace_app = App(name="workspace", help="Information workspace commands.")
+app.command(workspace_app)
 graph_app = App(name="graph", help="Export graph visualizations.")
 app.command(graph_app)
 
@@ -267,6 +269,154 @@ def source_remove(project: str, source: str) -> None:
     console.print("[green]removed[/green]" if ok else "[red]not found[/red]")
 
 
+# ---------------------------------------------------------------------------
+# Workspace commands
+# ---------------------------------------------------------------------------
+
+
+def _resolve_workspace(conn, ws_str: str):
+    from loci.graph.workspaces import WorkspaceRepository
+    repo = WorkspaceRepository(conn)
+    ws = repo.get_by_slug(ws_str) or repo.get(ws_str)
+    if ws is None:
+        console.print(f"[red]no such workspace:[/red] {ws_str}")
+        raise SystemExit(1)
+    return ws
+
+
+@workspace_app.command(name="create")
+def workspace_create(
+    slug: str,
+    name: str | None = None,
+    kind: str = "mixed",
+    description: str = "",
+) -> None:
+    """Create an information workspace.
+
+    kind: papers | codebase | notes | transcripts | web | mixed
+    """
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.models import Workspace, new_id, now_iso
+    from loci.graph.workspaces import WorkspaceRepository
+
+    migrate()
+    conn = connect()
+    ws = WorkspaceRepository(conn).create(Workspace(
+        id=new_id(), slug=slug, name=name or slug,
+        description_md=description, kind=kind,
+        created_at=now_iso(), last_active_at=now_iso(),
+    ))
+    conn.commit()
+    console.print(f"[green]created workspace[/green] [bold]{ws.slug}[/bold] ({ws.id})")
+
+
+@workspace_app.command(name="list")
+def workspace_list() -> None:
+    """List all information workspaces."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.workspaces import WorkspaceRepository
+
+    migrate()
+    conn = connect()
+    wss = WorkspaceRepository(conn).list()
+    if not wss:
+        console.print("[dim]no workspaces[/dim]")
+        return
+    table = Table("slug", "name", "kind", "id", "last_scanned_at")
+    for ws in wss:
+        table.add_row(ws.slug, ws.name, ws.kind, ws.id, ws.last_scanned_at or "—")
+    console.print(table)
+
+
+@workspace_app.command(name="info")
+def workspace_info(slug: str) -> None:
+    """Show details for a workspace including linked projects and sources."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.workspaces import WorkspaceRepository
+
+    migrate()
+    conn = connect()
+    ws = _resolve_workspace(conn, slug)
+    repo = WorkspaceRepository(conn)
+    sources = repo.list_sources(ws.id)
+    console.print({"id": ws.id, "slug": ws.slug, "name": ws.name,
+                    "kind": ws.kind, "last_scanned_at": ws.last_scanned_at})
+    table = Table("id", "root_path", "label", "last_scanned_at")
+    for s in sources:
+        table.add_row(s.id, s.root_path, s.label or "", s.last_scanned_at or "—")
+    console.print(table)
+
+
+@workspace_app.command(name="add-source")
+def workspace_add_source(workspace: str, root: Path, label: str | None = None) -> None:
+    """Register a directory as a source root for a workspace."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.workspaces import WorkspaceRepository
+
+    migrate()
+    conn = connect()
+    ws = _resolve_workspace(conn, workspace)
+    src = WorkspaceRepository(conn).add_source(ws.id, root, label=label)
+    conn.commit()
+    console.print(f"[green]registered[/green] {src.root_path} (id={src.id})")
+
+
+@workspace_app.command(name="link")
+def workspace_link(workspace: str, project: str, role: str = "primary") -> None:
+    """Link a workspace to a project.
+
+    role: primary | reference | excluded
+    """
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.workspaces import WorkspaceRepository
+
+    migrate()
+    conn = connect()
+    ws = _resolve_workspace(conn, workspace)
+    proj = _resolve_project(conn, project)
+    WorkspaceRepository(conn).link_project(proj.id, ws.id, role=role)  # type: ignore[arg-type]
+    conn.commit()
+    console.print(f"[green]linked[/green] [bold]{ws.slug}[/bold] → [bold]{proj.slug}[/bold] (role={role})")
+
+
+@workspace_app.command(name="unlink")
+def workspace_unlink(workspace: str, project: str) -> None:
+    """Remove the link between a workspace and a project."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.workspaces import WorkspaceRepository
+
+    migrate()
+    conn = connect()
+    ws = _resolve_workspace(conn, workspace)
+    proj = _resolve_project(conn, project)
+    WorkspaceRepository(conn).unlink_project(proj.id, ws.id)
+    conn.commit()
+    console.print(f"[yellow]unlinked[/yellow] {ws.slug} from {proj.slug}")
+
+
+@workspace_app.command(name="scan")
+def workspace_scan(workspace: str) -> None:
+    """Scan all source roots registered to a workspace."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.ingest.pipeline import scan_workspace
+
+    migrate()
+    conn = connect()
+    ws = _resolve_workspace(conn, workspace)
+    res = scan_workspace(conn, ws.id)
+    console.print({"scanned": res.scanned, "new_raw": res.new_raw,
+                    "deduped": res.deduped, "skipped": res.skipped,
+                    "members_added": res.members_added,
+                    "errors": res.errors[:5]})
+
+
 @app.command(name="q")
 def query(
     project: str,
@@ -413,6 +563,40 @@ def absorb(project: str) -> None:
     run_once(conn)
     j = get_job(conn, jid)
     console.print(j)
+
+
+@graph_app.command(name="json")
+def graph_json(
+    project: str,
+    output: Path | None = None,
+    include_raw: bool = True,
+) -> None:
+    """Write the graph payload as JSON (nodes + edges).
+
+    Omit --output to print to stdout. The JSON is the same shape the frontend
+    force-directed layout consumes: nodes[]{id,kind,subkind,title,body,cited_raws[]}
+    and edges[]{source,target,type,weight}.
+    """
+    import json as _json
+
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph import ProjectRepository
+    from loci.graph.export import build_graph_payload
+
+    migrate()
+    conn = connect()
+    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
+    if proj is None:
+        console.print(f"[red]no such project:[/red] {project}")
+        raise SystemExit(1)
+    payload = build_graph_payload(proj, conn, include_raw=include_raw)
+    out_str = _json.dumps(payload, ensure_ascii=False, indent=2)
+    if output:
+        output.write_text(out_str)
+        console.print(f"[green]wrote[/green] {output}")
+    else:
+        print(out_str)
 
 
 @graph_app.command(name="export")
