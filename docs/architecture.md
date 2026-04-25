@@ -263,5 +263,7 @@ Bright lines:
 - It never silently invents a citation in `loci draft` — handles that don't
   map to candidates are stripped.
 
-The gestures all flow through the user-driven proposal queue, even when the
-LLM is the one *suggesting* the action.
+Day-to-day interpretation construction is the silent reflect cycle (no
+queue). The user-driven proposal queue is only used by absorb's
+housekeeping suggestions — alias merges, broken-support flags, forgetting
+candidates — never for new interpretations on the hot path.

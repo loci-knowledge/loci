@@ -119,9 +119,20 @@ def extract(path: Path) -> ExtractedDoc | None:
         except OSError as exc:
             log.warning("extract: %s read failed: %s", path, exc)
             return None
+    text = _scrub_surrogates(text)
     if not text.strip():
         return None
     return ExtractedDoc(text=text, mime=mime, subkind=subkind)
+
+
+def _scrub_surrogates(text: str) -> str:
+    """Strip lone UTF-16 surrogates that SQLite's UTF-8 encoder rejects.
+
+    pypdf occasionally emits unpaired surrogates from CMap-mapped math glyphs
+    (e.g. \\ud835 for the U+1D400 mathematical alphabet block). They can't be
+    encoded to UTF-8 and would crash the bulk INSERT.
+    """
+    return text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
 
 
 # ---------------------------------------------------------------------------

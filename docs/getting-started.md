@@ -1,9 +1,34 @@
 # Getting started
 
-This walks you from `git clone` to a working project with cited drafts in
-about 10 minutes.
+Imagine you have a folder of mixed PDFs, code, and notes — you want loci to
+build a memory graph over them, then a town-style visualization in VSCode for
+exploring it. This walks you all the way through.
 
-## 0. Install
+We'll use a real example folder throughout: `~/Documents/codoc/` — three roots
+side-by-side under one parent:
+
+```
+~/Documents/codoc/
+  papers/   # PDFs of research I'm reading
+  code/     # open-source projects I'm studying
+  notes/    # my own working notes (markdown)
+```
+
+You can substitute your own folder anywhere you see `codoc`.
+
+## The two pieces
+
+You're standing up two repos:
+
+- **`loci/`** — the server. Owns SQLite, the embedding model, the agent. Talks
+  HTTP/WS on `127.0.0.1:7077` and MCP over stdio.
+- **`loki-frontend/`** — a VSCode extension that opens a "Town" panel. Talks to
+  the loci server. *Optional* — everything works from the CLI; the extension
+  is a richer UI when you want one.
+
+You always start `loci` first. The extension connects to it.
+
+## 0. Install loci
 
 loci targets Python 3.12+. We use [uv](https://docs.astral.sh/uv/) for
 dependency management.
@@ -15,189 +40,259 @@ uv sync                 # creates .venv with the runtime deps
 uv sync --extra dev     # add test/lint deps if you want to run pytest
 ```
 
-This will install `pydantic-ai-slim`, `sqlite-vec`, `sentence-transformers`,
-FastAPI, and friends. The first run downloads the embedding model
-(`BAAI/bge-small-en-v1.5`, ~130 MB) on first use, into `~/.loci/models/`.
+This installs `pydantic-ai-slim`, `sqlite-vec`, `sentence-transformers`,
+FastAPI, and friends. The first scan downloads the embedding model
+(`BAAI/bge-small-en-v1.5`, ~130 MB) into `~/.loci/models/`.
 
-For Apple Silicon, MPS is auto-detected. For CUDA, set `LOCI_EMBEDDING_DEVICE=cuda`.
+For Apple Silicon, MPS is auto-detected. For CUDA, set
+`LOCI_EMBEDDING_DEVICE=cuda`.
 
-## 1. Configure provider keys (optional but recommended)
+## 1. Configure provider keys
 
-loci runs without any LLM keys, but the LLM-dependent features (drafting,
-HyDE, kickoff, contradiction detection in absorb) degrade to no-ops. Set at
-least one provider key in your shell or in a `.env` file at the repo root:
+loci runs without LLM keys (retrieval, FTS, scan all work LLM-free), but the
+LLM-dependent features — drafting, kickoff, the silent reflection cycle, HyDE
+— degrade to no-ops. Set at least one provider key in `.env` at the repo
+root:
 
 ```bash
-# pick one (or any combination)
-export ANTHROPIC_API_KEY=sk-ant-...
-export OPENAI_API_KEY=sk-...
-export OPENROUTER_API_KEY=sk-or-...
+# .env (any one of these is enough; loci will pick whichever the model spec
+# points at — see step 1b)
+OPENAI_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-By default, all four LLM tasks (interpretation, RAG, classifier, HyDE) point
-at Anthropic models. To change them, see [model-config.md](./model-config.md).
+### 1b. Pick your models (defaults are OpenAI)
 
-## 2. Create your first project
+The four model roles default to:
 
-A project is a *view* over the global graph: a profile, a config blob, and
-the set of nodes you've explicitly included. One paper can participate in
-many projects without duplication.
+```
+interpretation_model = openai:gpt-5.4         # builds + maintains the interp layer
+rag_model            = openai:gpt-5.4         # synthesises drafts
+classifier_model     = openai:gpt-5.4-nano    # contradiction classifier in absorb
+hyde_model           = openai:gpt-5.4-nano    # hypothetical-doc expansion
+```
+
+Override any of them in `.env`:
 
 ```bash
-# Write a profile first — this becomes the seed for kickoff and is what the
-# draft engine sees as the project's "mission". Keep it 50–300 words.
-cat > /tmp/profile.md <<'EOF'
-# Project: Transformer attention variants
+LOCI_INTERPRETATION_MODEL=anthropic:claude-opus-4-7
+LOCI_RAG_MODEL=openrouter:google/gemini-3-pro
+```
 
-I want to understand how positional information is encoded across attention
-variants — sinusoidal, learned positional embeddings, RoPE, ALiBi, etc.
-The angle I care about: **where in the architecture** the position lives
-(input embedding, projection, attention pattern, output) and what each
-choice trades off.
+Full guide: [model-config.md](./model-config.md).
 
-Avoid: history-of-NLP framing. Avoid: tutorial-level explanations.
-Prefer: ablation papers, criticism papers, "we tried X and it broke" notes.
+## 2. Create your project
+
+A project is a *view* over the global graph: a profile, the set of nodes
+included, and the agent's voice anchor. One PDF can participate in many
+projects without duplication.
+
+The profile is the seed for kickoff and the agent's "what are we doing
+here?" prompt. Keep it 50–300 words and write it from the user's
+perspective — what you want from loci, not a description of the files.
+
+```bash
+cat > /tmp/codoc-profile.md <<'EOF'
+# codoc — research project
+
+I'm investigating how documentation, code, and notes intermix in real
+codebases — especially for tools that bridge code and natural language
+(deepwiki-open, codenav-vscode), with the goal of designing better
+"code-as-document" UX.
+
+The vault has three roots, organised by *modality*:
+- `papers/` — published research I'm drawing on (PDFs).
+- `code/`   — open-source projects I'm reading and learning from.
+- `notes/`  — my own working notes, including a paper-in-progress.
+
+What I want from loci:
+1. Surface conceptual links across modalities — e.g. how a UIST paper's
+   claim about navigation relates to a specific function in the code, or
+   how my own RR plan responds to a reviewer point.
+2. When I draft new text, cite spans inside files, not just file names.
+3. Build interpretations that compress how I actually think about this
+   work — not summaries of every paper.
+
+Style: concise, technical. Prefer interpretations as short claims with
+evidence pointers, not prose blurbs.
 EOF
 
-uv run loci project create transformer-attention \
-  --name "Transformer Attention Variants" \
-  --profile /tmp/profile.md
+uv run loci project create codoc \
+  --name "Code-as-Document" \
+  --profile /tmp/codoc-profile.md
+# → created codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
 ```
 
-The slug `transformer-attention` is how you'll address the project from now on
-(the CLI also accepts the ULID it printed).
+Save that ULID — the frontend uses it. (You can always look it up later
+with `uv run loci project list`.)
 
-## 3. Tell loci where your files are
+## 3. Register your sources
 
-Files can live anywhere on your filesystem. You register *roots* with the
-project; `loci scan` walks every registered root.
+Files can live anywhere on your filesystem. Register one *root* per
+modality so each scan picks up everything underneath.
 
 ```bash
-uv run loci source add transformer-attention ~/papers/attention/  --label "papers"
-uv run loci source add transformer-attention ~/notes/attention/    --label "notes"
-uv run loci source add transformer-attention ~/code/transformer-lab/ --label "code"
-
-uv run loci source list transformer-attention
+uv run loci source add codoc ~/Documents/codoc/papers --label papers
+uv run loci source add codoc ~/Documents/codoc/code   --label code
+uv run loci source add codoc ~/Documents/codoc/notes  --label notes
+uv run loci source list codoc
 ```
 
-Supported file types out of the box: PDF, Markdown, plain text, RST/org,
-HTML, transcripts (VTT/SRT), and ~30 source-code extensions. See
-[sources.md](./sources.md) for the full list and how to add more.
+Supported file types: PDF, Markdown, plain text, RST/org, HTML, transcripts
+(VTT/SRT), and ~30 source-code extensions. See [sources.md](./sources.md)
+for the full list and high-quality PDF parsing via marker.
 
 ## 4. Scan
 
 ```bash
-uv run loci scan transformer-attention
+uv run loci scan codoc
 ```
 
 This walks every registered root, content-hashes each file, deduplicates
-against the global raw store (so the same PDF in two projects becomes two
-memberships of one underlying node), extracts text, batches embeddings
-through the local model, and writes `RawNode`s. Output:
+against the global raw store, extracts text, batches embeddings through the
+local model, and writes one `RawNode` per file. Sample output:
 
 ```
 {
-  'scanned': 47, 'new_raw': 47, 'deduped': 0,
-  'skipped': 0, 'members_added': 47, 'errors': []
+  'scanned': 131, 'new_raw': 131, 'deduped': 0,
+  'skipped': 0, 'members_added': 131, 'errors': []
 }
 ```
 
-Re-run `loci scan` whenever you add files — it's idempotent. Files already
-present (by content hash) are skipped without re-extraction.
+Re-run `loci scan codoc` whenever you add files — it's idempotent. Files
+already present (by content hash) are skipped without re-extraction.
 
 ## 5. Kickoff: get the first questions
 
-The bootstrap step. loci reads your `profile.md` plus a sample of the raws
-you just scanned, and proposes 5–10 *open questions* worth pursuing in this
-project. **It does not invent interpretations on day one** — that's the
-"no fabricated interpretations on day 1" rule from the design.
+Kickoff reads your profile + a sample of the raws and proposes 5–10 *open
+questions* worth pursuing. **It does not invent interpretations on day one**
+— questions only, at confidence 0.5, written directly into the live graph
+(not into a proposal queue).
 
 ```bash
-uv run loci kickoff transformer-attention --n 8
+uv run loci kickoff codoc --n 8
+# → result: { 'skipped': false, 'questions_written': 8,
+#            'model': 'openai:gpt-5.4' }
 ```
 
-You'll see something like:
-
-```
-{
-  'status': 'done',
-  'result': {'skipped': false, 'proposals': 8, 'model': 'anthropic:claude-opus-4-7'}
-}
-```
-
-The questions land as **proposals**, not live nodes. Review them:
+You can list them:
 
 ```bash
-uv run loci status transformer-attention
-# → proposals  pending   8
-
-# To see them:
-curl http://localhost:7077/projects/<project_id>/proposals    # if server running
+uv run loci q codoc "what counts as a cite-worthy span?" --k 5
 ```
 
-Accept the ones you actually want via the REST API or the MCP tool
-`loci_accept_proposal`. (CLI command coming next.)
+The questions show up in the ranked results alongside raw sources because
+they're real graph nodes from minute one.
 
-## 6. Query the graph
+## 6. Draft something
+
+Now the high-leverage operation. Ask loci to write something using your
+sources:
 
 ```bash
-uv run loci q transformer-attention "how does rotary attention encode position?"
+uv run loci draft codoc \
+  "Synthesize what CoDoc, codenav-vscode, and Knuth's literate programming
+   each say about the relation between code and prose. Where do they agree,
+   where do they diverge?" \
+  --k 12
 ```
 
-You'll get a ranked table of nodes (raw + interpretation), with `score` and a
-short `why` string explaining how each match arose: which lex terms matched,
-how near in vector space, whether it's reachable from your pinned anchors via
-the graph (Personalized PageRank).
+You'll get markdown with inline `[C1]`, `[C2]`, … citations that map to
+specific nodes (PDFs, code files, notes), followed by a `citations[]` block.
+Each citation includes the node id, kind, title, and *why* it was retrieved
+(which signals matched).
 
-`loci q` writes a `Response` row + per-node `Trace` rows so the absorb job
-can later replay them into `access_count` / `confidence`.
+**While you read the draft**, a `reflect` job auto-enqueues. The agent reads
+your task + the citations the draft used, and (silently, in the worker
+thread) decides whether to add new interpretation nodes, reinforce existing
+ones, or soften ones that didn't help. Background; non-blocking.
 
-## 7. Draft something with citations
+By the time you come back tomorrow, the graph has a few new live
+interpretation nodes you didn't write. See [agent.md](./agent.md) for what
+the agent is allowed to do.
+
+## 7. Close the alignment loop with feedback
+
+If you edit the draft (kept these citations, dropped those, rewrote the
+sentence around C2…) and submit your edit:
 
 ```bash
-uv run loci draft transformer-attention \
-  "Summarize the rotary embedding insight, citing the papers I've read." \
-  --style prose --cite-density normal
+loci feedback <response_id> /path/to/your-edit.md
 ```
 
-The output is markdown with inline `[C1]`-style citations that map to nodes.
-A `citations[]` block follows, listing for each citation: the node id, kind
-(raw/interpretation), title, why it was cited, and any `raw_supports` (the
-raw papers an interpretation draws on).
+loci diffs the `[Cn]` markers, emits per-citation traces (kept / dropped /
+replaced), then enqueues a follow-up reflection that aligns the
+interpretation layer with how you actually used the draft. Citations you
+kept reinforce the underlying nodes; ones you dropped soften them.
 
-If the configured `rag_model` provider has no key, draft returns a stub
-showing the candidates it *would* have used, so you still see what loci
-retrieved. Set the key, re-run.
+This is the core alignment loop. Three or four cycles in, the agent's voice
+starts to sound like yours.
 
-## 8. Run the server (for clients like Claude Code)
+## 8. Start the server
+
+For the VSCode extension, MCP clients, or the REST API, run the server:
 
 ```bash
 uv run loci server
-# → Uvicorn on http://127.0.0.1:7077
-# → worker thread started (handles absorb, kickoff jobs)
+# → worker thread started
+# → Uvicorn running on http://127.0.0.1:7077
 ```
 
-The HTTP API is documented at `http://127.0.0.1:7077/docs` (FastAPI's
-auto-generated OpenAPI UI). For Claude Code, point your MCP client at:
+The HTTP API is at `http://127.0.0.1:7077/docs` (FastAPI auto-generated).
+
+For Claude Code MCP integration:
 
 ```bash
-# stdio transport — Claude Code subprocesses this
-uv run loci mcp
+uv run loci mcp        # stdio transport — Claude subprocesses this
 ```
 
-The MCP server exposes the curated subset from `PLAN §Open questions`:
-`loci_retrieve`, `loci_draft`, `loci_expand_citation`, `loci_expand_node`,
-`loci_propose_node`, `loci_accept_proposal`, `loci_absorb`.
+## 9. Connect the VSCode extension (loki-frontend)
 
-## 9. Maintain: absorb
-
-After ~15 sessions, run absorb to consolidate:
+The extension lives in a separate repo. Once the loci server is running on
+127.0.0.1:7077, the extension picks it up automatically.
 
 ```bash
-uv run loci absorb transformer-attention
+git clone https://github.com/<you>/loki-frontend.git
+cd loki-frontend
+npm install
+npm run build       # builds extension/ + webview/
 ```
 
-What absorb does (PLAN §Background jobs):
+Then open the `loki-frontend` folder in VSCode and press F5 to launch the
+Extension Development Host. In the new window:
+
+1. Cmd+Shift+P → **"Loci: Open Town"**.
+2. The first time, you get a project picker — select **Code-as-Document**
+   (or whatever you slugged your project as). Selection is remembered in
+   workspace settings.
+3. The Town panel opens. The webview subscribes via WebSocket and renders
+   nodes as villagers, communities as districts, pinned interpretations on
+   pedestals, and traces as villager animations (walking to the council
+   plaza when a citation fires).
+
+Configure the server URL or pre-pin a project in VSCode settings:
+
+```jsonc
+{
+  "lokiTown.serverUrl": "http://127.0.0.1:7077",
+  "lokiTown.projectId": "01KQ2AGY2T146QMDSF5QMFVJ7A"
+}
+```
+
+Full extension guide: [frontend.md](./frontend.md).
+
+## 10. Maintain: absorb (occasionally)
+
+Every ~30 sessions or once a week, run absorb to consolidate:
+
+```bash
+uv run loci absorb codoc
+```
+
+What absorb does — periodic *housekeeping*, not the primary maintenance
+surface (the silent reflect cycle handles per-draft work):
+
 - replays trace logs into `access_count` / `confidence`
 - audits orphan nodes, broken `cites` (raws gone missing), bloat
 - alias-detection over interpretation nodes (cosine > 0.92 → propose merge)
@@ -205,15 +300,12 @@ What absorb does (PLAN §Background jobs):
 - contradiction pass (LLM-mediated; needs an API key)
 - community detection (Leiden; needs `loci[graph]` extra)
 
-Each pass is idempotent. The absorb job is **enqueued** by `loci absorb` and
-runs synchronously in the CLI; in server mode the worker thread picks it up.
-
 ## What's next
 
-- [architecture.md](./architecture.md) — the mental model.
-- [model-config.md](./model-config.md) — pointing each task at a different
-  provider/model.
-- [sources.md](./sources.md) — file format support, marker setup, formats
-  loci can't yet read.
-- [session-lifecycle.md](./session-lifecycle.md) — how a project evolves over
-  weeks/months.
+- [frontend.md](./frontend.md) — the VSCode extension in depth.
+- [agent.md](./agent.md) — what the silent reflection cycle actually does
+  to your graph.
+- [architecture.md](./architecture.md) — the three layers; how files flow.
+- [model-config.md](./model-config.md) — picking provider/model per task.
+- [sources.md](./sources.md) — file format support, marker setup.
+- [session-lifecycle.md](./session-lifecycle.md) — months-later view.

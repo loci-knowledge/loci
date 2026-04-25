@@ -73,19 +73,19 @@ class Settings(BaseSettings):
     # Used by the absorb pipeline's contradiction pass and the kickoff job.
     # Maintains/regenerates interpretation nodes; sees the project profile
     # plus a sample of raw nodes. Wants strong reasoning + long context.
-    interpretation_model: str = "anthropic:claude-opus-4-7"
+    interpretation_model: str = "openai:gpt-5.4-mini"
 
     # Used by `loci draft` to synthesise output_md from retrieved candidates
     # while honouring the [Cn] citation contract. Wants strong instruction
     # following and prompt-cache friendliness.
-    rag_model: str = "anthropic:claude-sonnet-4-6"
+    rag_model: str = "openai:gpt-5.4-nano"
 
     # Used by the contradiction 3-way classifier (raw vs interpretation).
     # Many small calls; favour cheap + fast.
-    classifier_model: str = "anthropic:claude-haiku-4-5-20251001"
+    classifier_model: str = "openai:gpt-5.4-nano"
 
     # Used by HyDE expansion. Throwaway hypothetical answers; favour fast.
-    hyde_model: str = "anthropic:claude-haiku-4-5-20251001"
+    hyde_model: str = "openai:gpt-5.4-nano"
 
     # --- LLM behaviour --------------------------------------------------
     # Whether to enable Anthropic prompt caching on instructions / system
