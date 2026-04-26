@@ -62,22 +62,18 @@ workspace becomes available to all linked projects without re-embedding.
 
 ### 2. Interpretation graph — `InterpretationNode`s + `Edge`s
 
-Your distillations. Subkinds (PLAN §Inspiration carried forward):
+Your distillations. Four subkinds:
 
-- `philosophy` — articulated intellectual positions
-- `pattern` — recurring trigger/cycle/break behaviors
-- `tension` — unresolvable contradictions between two values
-- `decision` — inflection points with enumerated reasoning
-- `question` — open question without a settled answer (kickoff lives here)
-- `touchstone` — a pinned anchor for a project
-- `experiment` — time-boxed test with a hypothesis
-- `metaphor` — figurative framework for understanding something
-- `relevance` — a typed bridge between one or more workspaces and the project's intent, at a named angle; always multi-source (cites ≥2 raws)
+- `philosophy` — first-principle belief that grounds the project's direction
+- `tension` — open question or unresolved conflict (kickoff writes these; they assert nothing and invite reasoning; confidence 0.5)
+- `decision` — concrete choice with named trade-offs
+- `relevance` — typed bridge between workspace(s) and the project's intent; always multi-source (cites ≥2 raws), requires `angle`
 
-Edges are typed. Symmetric (`reinforces`, `contradicts`, `aliases`,
-`co_occurs`) auto-create their reciprocal; `specializes` auto-creates an
-inverse `generalizes` edge. `cites` is interp→raw and is what later becomes
-the `raw_supports[]` block in citations.
+Edges are typed: `cites` (interp→raw, grounds interpretations in sources),
+`semantic` (interp↔interp, symmetric — meaning-based relationships created by
+the reflect cycle and absorb passes), `actual` (raw↔raw, explicit dependencies
+like code imports or paper citations). `cites` edges are what become the
+`raw_supports[]` block in citations.
 
 A node moves through a small state machine:
 

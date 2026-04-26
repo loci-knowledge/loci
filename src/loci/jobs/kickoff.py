@@ -167,7 +167,6 @@ def _anchor_and_cocite(
     via cosine similarity. Then pairs of interp nodes that cite the same raw get a
     `semantic` edge to signal shared evidence.
     """
-    import struct
     import numpy as np
     from loci.graph.models import new_id
 
@@ -182,6 +181,8 @@ def _anchor_and_cocite(
     """, (project_id,)).fetchall()
 
     if isolated:
+        from loci.embed.local import blob_to_vec
+
         raws = conn.execute("""
             SELECT n.id, nv.embedding FROM nodes n
             JOIN node_vec nv ON nv.node_id = n.id
@@ -189,11 +190,17 @@ def _anchor_and_cocite(
               AND n.id IN (SELECT node_id FROM project_effective_members WHERE project_id = ?)
         """, (project_id,)).fetchall()
 
-        def _decode(b: bytes) -> "np.ndarray":
-            n = len(b) // 4
-            return np.array(struct.unpack(f"{n}f", b), dtype=np.float32)
+        raw_embs = [(r[0], blob_to_vec(r[1], len(r[1]) // 4)) for r in raws]
 
-        raw_embs = [(r[0], _decode(r[1])) for r in raws]
+        # Pre-fetch existing cites edges for these nodes to avoid per-row queries.
+        isolated_ids = [n[0] for n in isolated]
+        ph = ",".join("?" * len(isolated_ids))
+        existing_cites: set[tuple[str, str]] = {
+            (row[0], row[1]) for row in conn.execute(
+                f"SELECT src, dst FROM edges WHERE type='cites' AND src IN ({ph})",
+                tuple(isolated_ids),
+            ).fetchall()
+        }
 
         for node in isolated:
             node_id, title, body = node[0], node[1], node[2]
@@ -203,15 +210,13 @@ def _anchor_and_cocite(
                 key=lambda x: -x[1],
             )
             for raw_id, sim in sims[:3]:
-                if not conn.execute(
-                    "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='cites'",
-                    (node_id, raw_id),
-                ).fetchone():
+                if (node_id, raw_id) not in existing_cites:
                     conn.execute(
                         "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
                         " VALUES (?,?,?,?,?,?,datetime('now'))",
                         (new_id(), node_id, raw_id, "cites", round(sim, 3), "system"),
                     )
+                    existing_cites.add((node_id, raw_id))
 
     # Co-citation: interp pairs that cite the same raw
     pairs = conn.execute("""
@@ -223,16 +228,25 @@ def _anchor_and_cocite(
           AND e1.src IN (SELECT node_id FROM project_effective_members WHERE project_id = ?)
     """, (project_id,)).fetchall()
 
-    for pair in pairs:
-        a, b = pair[0], pair[1]
-        if not conn.execute(
-            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='semantic'", (a, b)
-        ).fetchone():
-            conn.execute(
-                "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
-                " VALUES (?,?,?,?,?,?,datetime('now'))",
-                (new_id(), a, b, "semantic", 1.0, "system"),
-            )
+    if pairs:
+        # Pre-fetch existing semantic edges to avoid per-pair queries.
+        pair_srcs = list({p[0] for p in pairs})
+        ph2 = ",".join("?" * len(pair_srcs))
+        existing_semantic: set[tuple[str, str]] = {
+            (row[0], row[1]) for row in conn.execute(
+                f"SELECT src, dst FROM edges WHERE type='semantic' AND src IN ({ph2})",
+                tuple(pair_srcs),
+            ).fetchall()
+        }
+        for pair in pairs:
+            a, b = pair[0], pair[1]
+            if (a, b) not in existing_semantic:
+                conn.execute(
+                    "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
+                    " VALUES (?,?,?,?,?,?,datetime('now'))",
+                    (new_id(), a, b, "semantic", 1.0, "system"),
+                )
+                existing_semantic.add((a, b))
 
     conn.commit()
 

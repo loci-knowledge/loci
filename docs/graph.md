@@ -454,18 +454,17 @@ The D3.js force graph at `/tmp/loci_graph.html` uses:
 - **Node size** — proportional to degree + base size by subkind. High-degree
   nodes (heavily connected interpretations) appear larger.
 - **Node color** by subkind:
-  - tension: blue
-  - relevance: green
+  - tension: red
+  - decision: yellow
   - philosophy: purple
-  - decision: cyan
+  - relevance: cyan
   - raw: grey
 - **Edge style**:
-  - `cites`: solid indigo
-  - `semantic`: faint dashed (background structure — shared evidence or semantic relationship)
-  - `actual`: solid amber (explicit raw→raw dependency)
+  - `cites`: dashed grey (grounding link — interp draws on this raw)
+  - `semantic`: solid blue (meaning relationship between interpretations)
+  - `actual`: solid indigo (explicit raw→raw dependency like code imports)
 - **Click** any node for the side panel: full body, angle (if relevance),
-  rationale, and the connection list.
-- **Filter bar** (top center): toggle subkinds on/off to reduce visual noise.
+  and the connection list.
 - **Drag** nodes to re-pin them. **Scroll/pinch** to zoom. **Background click** closes the panel.
 
 To regenerate the graph from the current DB state, use the CLI exporter:

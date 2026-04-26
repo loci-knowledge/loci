@@ -67,10 +67,10 @@ ANTHROPIC_API_KEY=sk-ant-...
 The four model roles default to:
 
 ```
-interpretation_model = openai:gpt-5.4-mini    # builds + maintains the interp layer
-rag_model            = openai:gpt-5.4-nano    # synthesises drafts
-classifier_model     = openai:gpt-5.4-nano    # contradiction classifier in absorb
-hyde_model           = openai:gpt-5.4-nano    # hypothetical-doc expansion
+interpretation_model = openrouter:google/gemini-3-flash-preview  # builds + maintains the interp layer
+rag_model            = openrouter:google/gemini-3-flash-preview  # synthesises drafts
+classifier_model     = openrouter:deepseek/deepseek-v4-flash     # contradiction classifier in absorb
+hyde_model           = openrouter:deepseek/deepseek-v4-flash     # hypothetical-doc expansion
 ```
 
 Override any of them in `.env`:

@@ -37,15 +37,24 @@ def get_graph(
 ) -> dict:
     placeholders = ",".join("?" * len(statuses))
     kind_clause = "" if include_raw else "AND n.kind = 'interpretation'"
+    # A node may appear under multiple sources ('workspace' + 'pinned') when it
+    # is both in a linked workspace and explicitly pinned. Aggregate to the
+    # highest-priority source: pinned > override > workspace.
     rows = conn.execute(
         f"""
         SELECT n.id, n.kind, n.subkind, n.title, n.body, n.confidence, n.status,
-               n.access_count, n.last_accessed_at, pm.source AS role
+               n.access_count, n.last_accessed_at,
+               CASE
+                 WHEN SUM(CASE pm.source WHEN 'pinned'   THEN 1 ELSE 0 END) > 0 THEN 'pinned'
+                 WHEN SUM(CASE pm.source WHEN 'override' THEN 1 ELSE 0 END) > 0 THEN 'override'
+                 ELSE 'workspace'
+               END AS role
         FROM nodes n
         JOIN project_effective_members pm ON pm.node_id = n.id
         WHERE pm.project_id = ?
           AND n.status IN ({placeholders})
           {kind_clause}
+        GROUP BY n.id
         """,
         (project.id, *statuses),
     ).fetchall()

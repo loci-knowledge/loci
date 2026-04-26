@@ -10,25 +10,27 @@ draft**. There is no proposal queue you have to drain. Reading
 
 ## Day 0 — kickoff
 
-You write a profile, register sources, scan, and run kickoff:
+You write a profile, create a workspace, scan sources, and run kickoff:
 
 ```bash
 loci project create big-bet --profile profile.md
-loci source add big-bet ~/papers/big-bet/
-loci scan big-bet
+loci workspace create big-bet-ws --kind papers
+loci workspace add-source big-bet-ws ~/papers/big-bet/
+loci workspace link big-bet-ws big-bet
+loci workspace scan big-bet-ws
 loci kickoff big-bet --n 8
 ```
 
 After kickoff, your graph contains:
 
 - ~50 RawNodes (whatever you scanned)
-- 8 **live** question interpretations at confidence 0.5 (`origin=agent_synthesis`)
+- 8 **live** tension interpretations at confidence 0.5 (`origin=agent_synthesis`)
 - 1 project with profile + memberships
 - 0 pending proposals
 
-The "no fabricated interpretations on day 1" rule (PLAN §Cold start) is
-preserved by virtue of subkind: kickoff produces *questions only* — no
-patterns, philosophies, or tensions. Questions assert nothing; they invite.
+The "no fabricated interpretations on day 1" rule is preserved by virtue of
+subkind: kickoff produces *tensions only* — open questions and unresolved
+conflicts that assert nothing and invite your reasoning.
 
 The questions are immediately retrievable. Run `loci q big-bet "<topic>"`
 and they'll show up in the ranked results alongside raw sources.
@@ -51,7 +53,7 @@ What happens behind the scenes:
 2. **Without you doing anything**, a `reflect` job auto-enqueues. The
    interpreter agent reads your task, the candidates surfaced, and the
    citations the draft chose. It synthesises — possibly creating a new
-   pattern/decision/philosophy node, possibly reinforcing existing ones.
+   tension/decision/philosophy/relevance node, possibly reinforcing existing ones.
 3. By the next session, your graph has new live nodes you didn't write.
 
 You read the draft. If it's right, you keep it. If it's wrong, you edit
@@ -145,7 +147,7 @@ At ~200 drafts:
 - ~500 raw nodes
 - ~120 live interpretation nodes (mix of agent-synthesised and explicit)
 - ~80 of those are agent-synthesised at confidence 0.4–0.7
-- ~30 are pinned touchstones (your highest-conviction interpretations)
+- ~30 are pinned (your highest-conviction interpretations at confidence ≥ 0.8)
 - ~600 typed edges
 - 5–10 communities
 
