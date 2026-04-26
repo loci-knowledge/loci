@@ -1,43 +1,35 @@
-"""Textual TUI wizard for loci project setup and management.
+"""Lightweight terminal wizard for loci project setup.
 
-Launched by `loci project create <slug>` (and `loci project manage`) when
-stdin is a terminal. Provides full back/forward navigation, edit existing
-projects, delete, and inline workspace creation.
+create-next-app style: linear prompts → review summary → apply.
+Any step can be re-done from the review screen before applying.
 
-Screens
--------
-HomeScreen            list all projects; new / edit / delete
-ProjectFormScreen     step 1 – name, slug, profile
-WorkspaceScreen       step 2 – link/unlink workspaces with roles
-ReviewScreen          step 3 – summary + scan/kickoff toggles
-RunScreen             step 4 – live progress log
-ConfirmDeleteModal    overlay – confirm project deletion
-WorkspaceCreateModal  overlay – create a new workspace inline
+Uses questionary (arrow-key prompts) + rich (formatted output).
 """
 from __future__ import annotations
 
 import re
 import sqlite3
-import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from textual import work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Container, Horizontal, ScrollableContainer
-from textual.screen import ModalScreen, Screen
-from textual.widgets import (
-    Button,
-    Checkbox,
-    Footer,
-    Header,
-    Input,
-    Label,
-    RichLog,
-    Select,
-    Static,
-    TextArea,
-)
+import questionary
+from rich.console import Console
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+
+console = Console()
+
+STYLE = questionary.Style([
+    ("qmark", "fg:#00BFFF bold"),
+    ("question", "bold"),
+    ("answer", "fg:#00FF7F bold"),
+    ("pointer", "fg:#00BFFF bold"),
+    ("highlighted", "fg:#00BFFF bold"),
+    ("selected", "fg:#00FF7F"),
+    ("instruction", "fg:#555555"),
+    ("separator", "fg:#444444"),
+])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,905 +37,465 @@ from textual.widgets import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class WizardState:
-    project_id: str | None = None      # None → create new; set → edit
-    project_slug: str = ""
-    project_name: str = ""
+class _State:
+    project_id: str | None = None       # None = create new
+    slug: str = ""
+    name: str = ""
     profile_md: str = ""
     workspace_links: dict[str, str] = field(default_factory=dict)  # ws_id → role
-    scan: bool = True
-    kickoff: bool = True
+    do_scan: bool = True
+    do_kickoff: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CSS
+# Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-APP_CSS = """
-Screen {
-    layers: base overlay;
-}
-
-/* ── Layout globals ── */
-#step-label {
-    text-style: bold;
-    color: $accent;
-    padding: 1 2 0 2;
-    height: 2;
-}
-
-.field-label {
-    padding: 1 2 0 2;
-    color: $text-muted;
-    height: 2;
-}
-
-Input, Select {
-    margin: 0 2;
-}
-
-TextArea {
-    margin: 0 2;
-    height: 10;
-}
-
-/* ── Navigation bar ── */
-#nav-buttons {
-    dock: bottom;
-    height: 5;
-    align: center middle;
-    padding: 1 2;
-    background: $surface-darken-1;
-}
-
-#nav-buttons Button {
-    margin: 0 1;
-    min-width: 18;
-}
-
-/* ── Home screen ── */
-#home-title {
-    text-style: bold;
-    color: $accent;
-    text-align: center;
-    padding: 1 2;
-    height: 3;
-    border-bottom: solid $accent;
-}
-
-#new-project-btn {
-    margin: 1 2;
-}
-
-.project-row {
-    height: 3;
-    layout: horizontal;
-    padding: 0 2;
-}
-
-.project-row:hover {
-    background: $surface-lighten-1;
-}
-
-.project-row .proj-label {
-    width: 1fr;
-    height: 3;
-    content-align: left middle;
-}
-
-.project-row .row-actions {
-    width: auto;
-    layout: horizontal;
-    height: 3;
-}
-
-.project-row Button {
-    min-width: 10;
-    height: 3;
-    margin: 0 0 0 1;
-}
-
-#home-empty {
-    text-align: center;
-    color: $text-muted;
-    padding: 4 2;
-}
-
-/* ── Workspace rows ── */
-.ws-row {
-    height: 3;
-    layout: horizontal;
-    padding: 0 2;
-}
-
-.ws-row:hover {
-    background: $surface-lighten-1;
-}
-
-.ws-row Checkbox {
-    width: 5;
-    height: 3;
-}
-
-.ws-row .ws-label {
-    width: 1fr;
-    height: 3;
-    content-align: left middle;
-}
-
-.ws-row Select {
-    width: 18;
-    margin: 0;
-    height: 3;
-}
-
-#new-ws-btn {
-    margin: 1 2;
-}
-
-/* ── Review screen ── */
-#review-body {
-    padding: 1 2;
-}
-
-/* ── Run screen ── */
-#run-log {
-    margin: 0 2;
-    height: 1fr;
-    border: solid $surface-darken-1;
-}
-
-/* ── Confirm delete modal ── */
-ConfirmDeleteModal {
-    align: center middle;
-}
-
-#confirm-dialog {
-    background: $surface;
-    border: thick $error;
-    padding: 2 4;
-    width: 60;
-    height: auto;
-}
-
-#confirm-dialog Label {
-    text-align: center;
-    padding: 0 0 1 0;
-    width: 100%;
-}
-
-#confirm-btns {
-    layout: horizontal;
-    align: center middle;
-    height: 4;
-}
-
-#confirm-btns Button {
-    margin: 0 1;
-    min-width: 14;
-}
-
-/* ── Workspace create modal ── */
-WorkspaceCreateModal {
-    align: center middle;
-}
-
-#create-ws-dialog {
-    background: $surface;
-    border: thick $accent;
-    padding: 2 4;
-    width: 70;
-    height: auto;
-}
-
-#create-ws-dialog .field-label {
-    padding: 1 0 0 0;
-}
-
-#create-ws-dialog Input,
-#create-ws-dialog Select {
-    margin: 0;
-    width: 100%;
-}
-
-#ws-create-btns {
-    layout: horizontal;
-    align: center middle;
-    height: 4;
-}
-
-#ws-create-btns Button {
-    margin: 0 1;
-    min-width: 14;
-}
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Compound widgets
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ProjectRow(Static):
-    """Single project row in the home screen."""
-
-    def __init__(self, proj_id: str, slug: str, name: str) -> None:
-        super().__init__("")
-        self.proj_id = proj_id
-        self.add_class("project-row")
-        self._slug = slug
-        self._name = name
-
-    def compose(self) -> ComposeResult:
-        yield Label(
-            f"[bold]{self._slug}[/bold]  [dim]{self._name}[/dim]",
-            classes="proj-label",
-        )
-        with Horizontal(classes="row-actions"):
-            yield Button("Edit", id=f"edit-{self.proj_id}", variant="default")
-            yield Button("Delete", id=f"del-{self.proj_id}", variant="error")
-
-
-class WorkspaceRow(Static):
-    """Checkbox + label + role select for a single workspace."""
-
-    def __init__(
-        self,
-        ws_id: str,
-        slug: str,
-        name: str,
-        kind: str,
-        *,
-        checked: bool = False,
-        role: str = "primary",
-    ) -> None:
-        super().__init__("")
-        self.ws_id = ws_id
-        self.add_class("ws-row")
-        self._slug = slug
-        self._name = name
-        self._kind = kind
-        self._checked = checked
-        self._role = role
-
-    def compose(self) -> ComposeResult:
-        yield Checkbox("", value=self._checked, id=f"cb-{self.ws_id}")
-        yield Label(
-            f"[bold]{self._slug}[/bold]  {self._name}  [dim]{self._kind}[/dim]",
-            classes="ws-label",
-        )
-        yield Select(
-            [("primary", "primary"), ("reference", "reference"), ("excluded", "excluded")],
-            value=self._role,
-            id=f"role-{self.ws_id}",
-            disabled=not self._checked,
-        )
-
-    @property
-    def is_checked(self) -> bool:
-        return self.query_one(Checkbox).value
-
-    @property
-    def current_role(self) -> str:
-        v = self.query_one(Select).value
-        return str(v) if v != Select.BLANK else "primary"
-
-    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
-        self.query_one(Select).disabled = not event.value
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Modal screens
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ConfirmDeleteModal(ModalScreen[bool]):
-    """'Are you sure?' overlay for project deletion."""
-
-    def __init__(self, project_name: str) -> None:
-        super().__init__()
-        self._project_name = project_name
-
-    def compose(self) -> ComposeResult:
-        with Container(id="confirm-dialog"):
-            yield Label(
-                f"Delete project [bold]{self._project_name}[/bold]?",
-                markup=True,
-            )
-            yield Label(
-                "[dim]Removes the project and all its memberships.\n"
-                "Raw nodes and workspaces are preserved.[/dim]",
-                markup=True,
-            )
-            with Horizontal(id="confirm-btns"):
-                yield Button("Cancel", id="cancel-del", variant="default")
-                yield Button("Delete", id="confirm-del", variant="error")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "confirm-del")
-
-
-@dataclass
-class _WsCreateResult:
-    slug: str
-    name: str
-    kind: str
-    source: str  # may be empty
-
-
-class WorkspaceCreateModal(ModalScreen[_WsCreateResult | None]):
-    """Inline form to create a new workspace."""
-
-    def compose(self) -> ComposeResult:
-        with Container(id="create-ws-dialog"):
-            yield Label("[bold]Create workspace[/bold]", markup=True)
-            yield Label("Slug", classes="field-label")
-            yield Input(placeholder="my-sources", id="ws-slug")
-            yield Label("Name", classes="field-label")
-            yield Input(placeholder="My Sources", id="ws-name")
-            yield Label("Kind", classes="field-label")
-            yield Select(
-                [
-                    ("mixed", "mixed"),
-                    ("papers", "papers"),
-                    ("codebase", "codebase"),
-                    ("notes", "notes"),
-                    ("transcripts", "transcripts"),
-                    ("web", "web"),
-                ],
-                value="mixed",
-                id="ws-kind",
-            )
-            yield Label(
-                "Source root path  [dim](optional — add more later with workspace add-source)[/dim]",
-                classes="field-label",
-                markup=True,
-            )
-            yield Input(placeholder="/path/to/files", id="ws-source")
-            with Horizontal(id="ws-create-btns"):
-                yield Button("Cancel", id="ws-cancel", variant="default")
-                yield Button("Create", id="ws-create", variant="primary")
-
-    def on_mount(self) -> None:
-        self.query_one("#ws-slug", Input).focus()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "ws-cancel":
-            self.dismiss(None)
-        elif event.button.id == "ws-create":
-            slug = self.query_one("#ws-slug", Input).value.strip()
-            name = self.query_one("#ws-name", Input).value.strip()
-            kind_val = self.query_one("#ws-kind", Select).value
-            kind = str(kind_val) if kind_val != Select.BLANK else "mixed"
-            source = self.query_one("#ws-source", Input).value.strip()
-            if not slug:
-                self.notify("Slug is required", severity="error")
-                self.query_one("#ws-slug", Input).focus()
-                return
-            self.dismiss(_WsCreateResult(slug=slug, name=name or slug, kind=kind, source=source))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main screens
-# ─────────────────────────────────────────────────────────────────────────────
-
-class HomeScreen(Screen):
-    """Landing screen — lists all projects, offers new / edit / delete."""
-
-    BINDINGS = [Binding("q", "quit", "Quit")]
-
-    def __init__(self, conn: sqlite3.Connection, slug_hint: str = "") -> None:
-        super().__init__()
-        self.conn = conn
-        self._slug_hint = slug_hint
-
-    # ── Layout ──────────────────────────────────────────────────────────────
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield Static("loci — project manager", id="home-title")
-        yield Button("+ New project", id="new-project-btn", variant="success")
-        yield ScrollableContainer(id="project-list")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self._refresh()
-        if self._slug_hint:
-            from loci.graph import ProjectRepository
-            existing = ProjectRepository(self.conn).get_by_slug(self._slug_hint)
-            if existing is None:
-                state = WizardState(
-                    project_slug=self._slug_hint,
-                    project_name=self._slug_hint,
-                )
-                self.app.push_screen(ProjectFormScreen(state, self.conn))
+def run_wizard(conn: sqlite3.Connection, slug_hint: str = "") -> None:
+    """Launch the wizard.  Blocks until done or the user cancels."""
+    from loci.graph import ProjectRepository
+
+    _print_banner()
+    try:
+        if slug_hint:
+            existing = ProjectRepository(conn).get_by_slug(slug_hint)
+            if existing:
+                console.print(f"[yellow]⚠[/yellow]  Project [bold]{slug_hint}[/bold] already exists.")
+                edit = questionary.confirm(
+                    f"Edit '{slug_hint}' instead?", default=True, style=STYLE,
+                ).ask()
+                if edit is None:
+                    return
+                if edit:
+                    _full_flow(conn, _load_state(conn, existing.id))
             else:
-                self.notify(
-                    f"'{self._slug_hint}' already exists — click Edit to modify it",
-                    severity="warning",
-                    timeout=6,
-                )
-
-    def on_screen_resume(self) -> None:
-        """Refresh the list whenever we return from a child screen."""
-        self._refresh()
-
-    # ── Helpers ─────────────────────────────────────────────────────────────
-
-    def _refresh(self) -> None:
-        from loci.graph import ProjectRepository
-        projects = ProjectRepository(self.conn).list()
-        container = self.query_one("#project-list", ScrollableContainer)
-        container.remove_children()
-        if not projects:
-            container.mount(Static(
-                "No projects yet.  Click [bold]+ New project[/bold] to get started.",
-                id="home-empty",
-                markup=True,
-            ))
+                _full_flow(conn, _State(slug=slug_hint, name=slug_hint))
         else:
-            for p in projects:
-                container.mount(ProjectRow(p.id, p.slug, p.name))
+            _manage_menu(conn)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Cancelled.[/dim]")
 
-    # ── Events ──────────────────────────────────────────────────────────────
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        btn = event.button.id or ""
-        if btn == "new-project-btn":
-            self.app.push_screen(ProjectFormScreen(WizardState(), self.conn))
-        elif btn.startswith("edit-"):
-            self._open_edit(btn[5:])
-        elif btn.startswith("del-"):
-            self._open_delete(btn[4:])
+# ─────────────────────────────────────────────────────────────────────────────
+# Menus
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def _open_edit(self, proj_id: str) -> None:
-        from loci.graph import ProjectRepository
-        from loci.graph.workspaces import WorkspaceRepository
-        proj = ProjectRepository(self.conn).get(proj_id)
-        if not proj:
+def _manage_menu(conn: sqlite3.Connection) -> None:
+    """Top-level menu for `loci project manage`."""
+    from loci.graph import ProjectRepository
+
+    while True:
+        _show_projects_table(conn)
+        projects = ProjectRepository(conn).list()
+
+        choices = [questionary.Choice("+ Create new project", value="new")]
+        for p in projects:
+            choices.append(questionary.Choice(f"  Edit  {p.slug}  — {p.name}", value=f"edit:{p.id}"))
+        if projects:
+            choices.append(questionary.Choice("  Delete a project…", value="delete"))
+        choices.append(questionary.Choice("  Exit", value="exit"))
+
+        action = questionary.select("What would you like to do?", choices=choices, style=STYLE).ask()
+
+        if action is None or action == "exit":
             return
-        links = {
-            ws.id: link.role
-            for ws, link in WorkspaceRepository(self.conn).linked_workspaces(proj_id)
-        }
-        state = WizardState(
-            project_id=proj.id,
-            project_slug=proj.slug,
-            project_name=proj.name,
-            profile_md=proj.profile_md,
-            workspace_links=links,
-        )
-        self.app.push_screen(ProjectFormScreen(state, self.conn))
+        elif action == "new":
+            _full_flow(conn, _State())
+        elif isinstance(action, str) and action.startswith("edit:"):
+            _full_flow(conn, _load_state(conn, action[5:]))
+        elif action == "delete":
+            _delete_flow(conn)
+        console.print()
 
-    def _open_delete(self, proj_id: str) -> None:
-        from loci.graph import ProjectRepository
-        proj = ProjectRepository(self.conn).get(proj_id)
-        if not proj:
+
+def _delete_flow(conn: sqlite3.Connection) -> None:
+    from loci.graph import ProjectRepository
+
+    projects = ProjectRepository(conn).list()
+    if not projects:
+        console.print("[dim]No projects to delete.[/dim]")
+        return
+
+    choices = [questionary.Choice(f"{p.slug}  —  {p.name}", value=p.id) for p in projects]
+    choices.append(questionary.Choice("← Back", value="back"))
+
+    proj_id = questionary.select("Select project to delete:", choices=choices, style=STYLE).ask()
+    if proj_id is None or proj_id == "back":
+        return
+
+    proj = ProjectRepository(conn).get(proj_id)
+    if not proj:
+        return
+
+    confirmed = questionary.confirm(
+        f"Delete '{proj.slug}'? This cannot be undone.",
+        default=False, style=STYLE,
+    ).ask()
+
+    if confirmed:
+        ProjectRepository(conn).delete(proj_id)
+        conn.commit()
+        console.print(f"[red]✗[/red]  Deleted [bold]{proj.slug}[/bold]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full create / edit flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _full_flow(conn: sqlite3.Connection, state: _State) -> None:
+    console.print()
+    console.rule("[dim]Project setup[/dim]")
+    console.print()
+
+    _step_name(state)
+    _step_slug(conn, state)
+    _step_profile(state)
+    _step_workspaces(conn, state)
+    _step_scan_kickoff(state)
+
+    # Review loop — the user can change any answer before applying
+    while True:
+        console.print()
+        _print_summary(conn, state)
+        console.print()
+
+        action = questionary.select(
+            "Apply, or change something?",
+            choices=[
+                questionary.Choice("✓  Apply", value="apply"),
+                questionary.Separator(),
+                questionary.Choice("  Change name", value="name"),
+                questionary.Choice("  Change slug", value="slug"),
+                questionary.Choice("  Change profile", value="profile"),
+                questionary.Choice("  Change workspace links", value="workspaces"),
+                questionary.Choice("  Change scan / kickoff", value="scan"),
+                questionary.Separator(),
+                questionary.Choice("✗  Cancel without saving", value="cancel"),
+            ],
+            style=STYLE,
+        ).ask()
+
+        if action is None or action == "cancel":
             return
+        if action == "apply":
+            break
+        if action == "name":
+            _step_name(state)
+            _step_slug(conn, state, force=False)
+        elif action == "slug":
+            _step_slug(conn, state, force=True)
+        elif action == "profile":
+            _step_profile(state)
+        elif action == "workspaces":
+            _step_workspaces(conn, state)
+        elif action == "scan":
+            _step_scan_kickoff(state)
 
-        def _after(confirmed: bool | None) -> None:
-            if confirmed:
-                from loci.graph import ProjectRepository
-                ProjectRepository(self.conn).delete(proj_id)
-                self.conn.commit()
-                self.notify("Project deleted")
-                self._refresh()
-
-        self.app.push_screen(ConfirmDeleteModal(proj.name), _after)
-
-    def action_quit(self) -> None:
-        self.app.exit()
+    _apply(conn, state)
 
 
-class ProjectFormScreen(Screen):
-    """Step 1 — edit project name, slug, and profile markdown."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Steps
+# ─────────────────────────────────────────────────────────────────────────────
 
-    BINDINGS = [Binding("escape", "back", "Back")]
+def _step_name(state: _State) -> None:
+    name = questionary.text("Project name:", default=state.name, style=STYLE).ask()
+    if name is not None:
+        state.name = name.strip() or state.name
 
-    def __init__(self, state: WizardState, conn: sqlite3.Connection) -> None:
-        super().__init__()
-        self.state = state
-        self.conn = conn
-        self._last_auto_slug = ""
 
-    # ── Layout ──────────────────────────────────────────────────────────────
-
-    def compose(self) -> ComposeResult:
-        action = "Edit" if self.state.project_id else "New"
-        yield Header(show_clock=False)
-        yield Static(f"Step 1 of 3  —  {action} project details", id="step-label")
-        with ScrollableContainer():
-            yield Label("Name", classes="field-label")
-            yield Input(
-                value=self.state.project_name,
-                placeholder="My Research Project",
-                id="proj-name",
-            )
-            yield Label("Slug  [dim](lowercase letters, numbers, hyphens)[/dim]", classes="field-label", markup=True)
-            yield Input(
-                value=self.state.project_slug,
-                placeholder="my-research",
-                id="proj-slug",
-            )
-            yield Label(
-                "Profile  [dim](markdown; seeds kickoff — what you want from loci, 50–300 words)[/dim]",
-                classes="field-label",
-                markup=True,
-            )
-            yield TextArea(text=self.state.profile_md, id="proj-profile")
-        with Horizontal(id="nav-buttons"):
-            yield Button("← Back", id="back", variant="default")
-            yield Button("Next →", id="next", variant="primary")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self._last_auto_slug = _slugify(self.state.project_name)
-        self.query_one("#proj-name", Input).focus()
-
-    # ── Events ──────────────────────────────────────────────────────────────
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back":
-            self.app.pop_screen()
-        elif event.button.id == "next":
-            self._validate_and_advance()
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        """Auto-derive slug from the name field while the user hasn't edited it manually."""
-        if event.input.id != "proj-name":
+def _step_slug(conn: sqlite3.Connection, state: _State, force: bool = True) -> None:
+    default = _slugify(state.name) if (force or not state.slug) else state.slug
+    while True:
+        slug = questionary.text(
+            "Slug  (lowercase, hyphens only):", default=default, style=STYLE,
+        ).ask()
+        if slug is None:
             return
-        auto = _slugify(event.value)
-        slug_input = self.query_one("#proj-slug", Input)
-        if not slug_input.value or slug_input.value == self._last_auto_slug:
-            slug_input.value = auto
-            self._last_auto_slug = auto
-
-    # ── Validation ──────────────────────────────────────────────────────────
-
-    def _validate_and_advance(self) -> None:
-        name = self.query_one("#proj-name", Input).value.strip()
-        slug = self.query_one("#proj-slug", Input).value.strip()
-        profile = self.query_one("#proj-profile", TextArea).text
-
-        if not name:
-            self.notify("Name is required", severity="error")
-            self.query_one("#proj-name", Input).focus()
-            return
+        slug = slug.strip()
         if not slug:
-            self.notify("Slug is required", severity="error")
-            self.query_one("#proj-slug", Input).focus()
-            return
+            continue
         if not re.match(r"^[a-z0-9][a-z0-9-]*$", slug):
-            self.notify("Slug: lowercase letters, numbers, and hyphens only", severity="error")
-            self.query_one("#proj-slug", Input).focus()
-            return
-
-        # Check slug collision
+            console.print("[yellow]  Slug: lowercase letters, numbers, hyphens only.[/yellow]")
+            default = slug
+            continue
         from loci.graph import ProjectRepository
-        existing = ProjectRepository(self.conn).get_by_slug(slug)
-        if existing and existing.id != self.state.project_id:
-            self.notify(
-                f"Slug '{slug}' is already used by '{existing.name}' — choose another",
-                severity="error",
-            )
-            self.query_one("#proj-slug", Input).focus()
-            return
-
-        self.state.project_name = name
-        self.state.project_slug = slug
-        self.state.profile_md = profile
-        self.app.push_screen(WorkspaceScreen(self.state, self.conn))
+        existing = ProjectRepository(conn).get_by_slug(slug)
+        if existing and existing.id != state.project_id:
+            console.print(f"[yellow]  Slug '{slug}' is already taken by '{existing.name}'.[/yellow]")
+            default = slug
+            continue
+        state.slug = slug
+        return
 
 
-class WorkspaceScreen(Screen):
-    """Step 2 — choose which workspaces to link and with what role."""
+def _step_profile(state: _State) -> None:
+    choices = [
+        questionary.Choice("Load from a .md file", value="file"),
+        questionary.Choice("Enter a quick one-line description", value="quick"),
+        questionary.Choice("Skip for now", value="skip"),
+    ]
+    if state.profile_md:
+        choices.insert(0, questionary.Choice("Keep current profile", value="keep"))
 
-    BINDINGS = [Binding("escape", "back", "Back")]
+    choice = questionary.select("Project profile:", choices=choices, style=STYLE).ask()
 
-    def __init__(self, state: WizardState, conn: sqlite3.Connection) -> None:
-        super().__init__()
-        self.state = state
-        self.conn = conn
+    if choice is None or choice in ("skip", "keep"):
+        return
+    if choice == "file":
+        path_str = questionary.text(
+            "Path to profile .md file:", style=STYLE,
+        ).ask()
+        if path_str:
+            p = Path(path_str.strip()).expanduser()
+            if p.exists():
+                state.profile_md = p.read_text()
+                console.print(f"  [dim]Loaded {len(state.profile_md)} chars from {p.name}[/dim]")
+            else:
+                console.print(f"  [yellow]File not found: {p}[/yellow]")
+    elif choice == "quick":
+        desc = questionary.text(
+            "Brief description (you can expand it in a file later):",
+            default=state.profile_md if "\n" not in state.profile_md else "",
+            style=STYLE,
+        ).ask()
+        if desc:
+            state.profile_md = desc.strip()
 
-    # ── Layout ──────────────────────────────────────────────────────────────
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield Static("Step 2 of 3  —  Link workspaces", id="step-label")
-        with ScrollableContainer():
-            yield Container(id="ws-rows")
-            yield Button("+ Create new workspace", id="new-ws-btn", variant="default")
-        with Horizontal(id="nav-buttons"):
-            yield Button("← Back", id="back", variant="default")
-            yield Button("Next →", id="next", variant="primary")
-        yield Footer()
+def _step_workspaces(conn: sqlite3.Connection, state: _State) -> None:
+    from loci.graph.workspaces import WorkspaceRepository
 
-    def on_mount(self) -> None:
-        self._refresh_rows()
+    workspaces = WorkspaceRepository(conn).list()
 
-    # ── Events ──────────────────────────────────────────────────────────────
+    wants = questionary.confirm(
+        "Link a workspace to this project?",
+        default=bool(workspaces),
+        style=STYLE,
+    ).ask()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back":
-            self.app.pop_screen()
-        elif event.button.id == "next":
-            self._collect_and_advance()
-        elif event.button.id == "new-ws-btn":
-            self.app.push_screen(WorkspaceCreateModal(), self._after_ws_created)
+    if not wants:
+        state.workspace_links = {}
+        return
 
-    def action_back(self) -> None:
-        self.app.pop_screen()
-
-    # ── Helpers ─────────────────────────────────────────────────────────────
-
-    def _refresh_rows(self) -> None:
-        from loci.graph.workspaces import WorkspaceRepository
-        workspaces = WorkspaceRepository(self.conn).list()
-        container = self.query_one("#ws-rows", Container)
-        container.remove_children()
+    if not workspaces:
+        if questionary.confirm("No workspaces exist. Create one now?", default=True, style=STYLE).ask():
+            ws = _create_workspace_inline(conn)
+            if ws:
+                workspaces = WorkspaceRepository(conn).list()
         if not workspaces:
-            container.mount(Static(
-                "[dim]No workspaces yet — click '+ Create new workspace' below.[/dim]",
-                markup=True,
-            ))
             return
-        for ws in workspaces:
-            container.mount(WorkspaceRow(
-                ws.id, ws.slug, ws.name, ws.kind,
-                checked=ws.id in self.state.workspace_links,
-                role=self.state.workspace_links.get(ws.id, "primary"),
-            ))
 
-    def _collect_and_advance(self) -> None:
-        links: dict[str, str] = {}
-        for row in self.query(WorkspaceRow):
-            if row.is_checked:
-                links[row.ws_id] = row.current_role
-        self.state.workspace_links = links
-        self.app.push_screen(ReviewScreen(self.state, self.conn))
-
-    def _after_ws_created(self, result: _WsCreateResult | None) -> None:
-        if result is None:
-            return
-        from pathlib import Path
-
-        from loci.graph.models import Workspace, new_id, now_iso
-        from loci.graph.workspaces import WorkspaceRepository
-        ws_repo = WorkspaceRepository(self.conn)
-        if ws_repo.get_by_slug(result.slug):
-            self.notify(f"Workspace slug '{result.slug}' already exists", severity="error")
-            return
-        ws = Workspace(
-            id=new_id(), slug=result.slug, name=result.name,
-            description_md="", kind=result.kind,
-            created_at=now_iso(), last_active_at=now_iso(),
+    # Multi-select with checkboxes
+    ws_choices = [
+        questionary.Choice(
+            f"{ws.slug}  [{ws.kind}]  {ws.name}",
+            value=ws.id,
+            checked=ws.id in state.workspace_links,
         )
-        ws_repo.create(ws)
-        if result.source:
-            ws_repo.add_source(ws.id, Path(result.source).expanduser())
-        self.conn.commit()
-        self.notify(f"Workspace '{result.slug}' created", severity="information")
-        self._refresh_rows()
+        for ws in workspaces
+    ]
+    ws_choices.append(questionary.Choice("+ Create new workspace", value="__new__"))
+
+    selected = questionary.checkbox(
+        "Select workspaces to link  (Space to toggle, Enter to confirm):",
+        choices=ws_choices,
+        style=STYLE,
+    ).ask()
+
+    if selected is None:
+        return
+
+    # Handle inline workspace creation
+    if "__new__" in selected:
+        selected.remove("__new__")
+        ws = _create_workspace_inline(conn)
+        if ws:
+            selected.append(ws.id)
+            workspaces = WorkspaceRepository(conn).list()
+
+    # Ask role for each selected workspace
+    new_links: dict[str, str] = {}
+    for ws_id in selected:
+        ws = next((w for w in workspaces if w.id == ws_id), None)
+        if ws is None:
+            ws = WorkspaceRepository(conn).get(ws_id)
+        label = ws.slug if ws else ws_id
+        role = questionary.select(
+            f"Role for '{label}':",
+            choices=["primary", "reference", "excluded"],
+            default=state.workspace_links.get(ws_id, "primary"),
+            style=STYLE,
+        ).ask()
+        new_links[ws_id] = role or "primary"
+
+    state.workspace_links = new_links
 
 
-class ReviewScreen(Screen):
-    """Step 3 — summary of changes + scan/kickoff toggles."""
+def _create_workspace_inline(conn: sqlite3.Connection):
+    """Prompt for a new workspace and create it immediately. Returns Workspace or None."""
+    from loci.graph.models import Workspace, new_id, now_iso
+    from loci.graph.workspaces import WorkspaceRepository
 
-    BINDINGS = [Binding("escape", "back", "Back")]
+    slug = questionary.text("New workspace slug:", style=STYLE).ask()
+    if not slug:
+        return None
+    slug = slug.strip()
 
-    def __init__(self, state: WizardState, conn: sqlite3.Connection) -> None:
-        super().__init__()
-        self.state = state
-        self.conn = conn
+    ws_repo = WorkspaceRepository(conn)
+    if ws_repo.get_by_slug(slug):
+        console.print(f"[yellow]  Slug '{slug}' already exists.[/yellow]")
+        return None
 
-    # ── Layout ──────────────────────────────────────────────────────────────
+    name = questionary.text("Name:", default=slug, style=STYLE).ask()
+    kind = questionary.select(
+        "Kind:",
+        choices=["mixed", "papers", "codebase", "notes", "transcripts", "web"],
+        default="mixed",
+        style=STYLE,
+    ).ask()
+    source = questionary.text(
+        "Source root path  (press Enter to skip):",
+        default="",
+        style=STYLE,
+    ).ask()
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield Static("Step 3 of 3  —  Review & apply", id="step-label")
-        with ScrollableContainer():
-            yield Static(self._summary_text(), id="review-body", markup=True)
-            yield Checkbox("Scan linked workspaces after setup", value=True, id="do-scan")
-            yield Checkbox(
-                "Run kickoff to seed interpretation graph  [dim](requires scan)[/dim]",
-                value=True,
-                id="do-kickoff",
-                markup=True,
-            )
-        with Horizontal(id="nav-buttons"):
-            yield Button("← Back", id="back", variant="default")
-            yield Button("✓  Apply", id="apply", variant="success")
-        yield Footer()
-
-    # ── Events ──────────────────────────────────────────────────────────────
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back":
-            self.app.pop_screen()
-        elif event.button.id == "apply":
-            self.state.scan = self.query_one("#do-scan", Checkbox).value
-            self.state.kickoff = self.query_one("#do-kickoff", Checkbox).value
-            # switch_screen: no going back from the run screen
-            self.app.switch_screen(RunScreen(self.state, self.conn))
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
-
-    # ── Helpers ─────────────────────────────────────────────────────────────
-
-    def _summary_text(self) -> str:
-        from loci.graph.workspaces import WorkspaceRepository
-        action = "Update" if self.state.project_id else "Create"
-        lines = [
-            f"[bold]{action} project:[/bold]  "
-            f"{self.state.project_name}  [dim][{self.state.project_slug}][/dim]",
-            "",
-        ]
-        if self.state.workspace_links:
-            lines.append("[bold]Workspaces to link:[/bold]")
-            ws_repo = WorkspaceRepository(self.conn)
-            for ws_id, role in self.state.workspace_links.items():
-                ws = ws_repo.get(ws_id)
-                label = ws.slug if ws else ws_id
-                lines.append(f"  • [bold]{label}[/bold]  [dim]({role})[/dim]")
-        else:
-            lines.append("[dim]No workspaces selected — you can link them later.[/dim]")
-        lines.append("")
-        return "\n".join(lines)
+    ws = Workspace(
+        id=new_id(), slug=slug, name=(name or slug),
+        description_md="", kind=(kind or "mixed"),
+        created_at=now_iso(), last_active_at=now_iso(),
+    )
+    ws_repo.create(ws)
+    if source and source.strip():
+        ws_repo.add_source(ws.id, Path(source.strip()).expanduser())
+    conn.commit()
+    console.print(f"  [green]✓[/green]  Workspace [bold]{slug}[/bold] created")
+    return ws
 
 
-class RunScreen(Screen):
-    """Step 4 — executes all operations in a background thread, streams output."""
+def _step_scan_kickoff(state: _State) -> None:
+    if state.workspace_links:
+        ans = questionary.confirm(
+            "Scan linked workspaces after setup?", default=True, style=STYLE,
+        ).ask()
+        state.do_scan = bool(ans)
+    else:
+        state.do_scan = False
 
-    def __init__(self, state: WizardState, conn: sqlite3.Connection) -> None:
-        super().__init__()
-        self.state = state
-        self.conn = conn
+    ans = questionary.confirm(
+        "Run kickoff to seed interpretation graph?",
+        default=state.do_scan,
+        style=STYLE,
+    ).ask()
+    state.do_kickoff = bool(ans)
 
-    # ── Layout ──────────────────────────────────────────────────────────────
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield Static("Applying…", id="step-label")
-        yield RichLog(id="run-log", markup=True, highlight=True, auto_scroll=True)
-        with Horizontal(id="nav-buttons"):
-            yield Button("Done — exit", id="done", variant="primary", disabled=True)
-        yield Footer()
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def on_mount(self) -> None:
-        self._do_run()
+def _print_summary(conn: sqlite3.Connection, state: _State) -> None:
+    from loci.graph.workspaces import WorkspaceRepository
 
-    # ── Background worker ────────────────────────────────────────────────────
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column(style="dim", min_width=14)
+    t.add_column()
 
-    @work(thread=True)
-    def _do_run(self) -> None:
-        log = self.query_one(RichLog)
+    action = "Update" if state.project_id else "Create"
+    t.add_row(f"{action} project", f"[bold]{state.name}[/bold]  [dim][{state.slug}][/dim]")
 
-        def emit(msg: str) -> None:
-            self.call_from_thread(log.write, msg)
+    profile_preview = (state.profile_md[:80] + "…") if len(state.profile_md) > 80 else state.profile_md
+    t.add_row("Profile", profile_preview or "[dim]none[/dim]")
 
-        try:
-            self._apply(emit)
-        except Exception as exc:
-            emit(f"[red]✗  Unexpected error:[/red] {exc}")
-            emit(f"[dim]{traceback.format_exc()}[/dim]")
-
-        emit("\n[bold green]All done![/bold green]  Press Done to exit.")
-        done_btn = self.query_one("#done", Button)
-        self.call_from_thread(setattr, done_btn, "disabled", False)
-        self.call_from_thread(done_btn.focus)
-
-    def _apply(self, emit: callable) -> None:  # type: ignore[type-arg]
-        from loci.graph import Project, ProjectRepository
-        from loci.graph.workspaces import WorkspaceRepository
-
-        conn = self.conn
-        state = self.state
-        proj_repo = ProjectRepository(conn)
+    if state.workspace_links:
         ws_repo = WorkspaceRepository(conn)
+        lines = []
+        for ws_id, role in state.workspace_links.items():
+            ws = ws_repo.get(ws_id)
+            label = ws.slug if ws else ws_id
+            lines.append(f"[bold]{label}[/bold]  [dim]({role})[/dim]")
+        t.add_row("Workspaces", "\n".join(lines))
+    else:
+        t.add_row("Workspaces", "[dim]none[/dim]")
 
-        # ── 1. Create or update project ──────────────────────────────────
-        if state.project_id is None:
-            proj = Project(
-                slug=state.project_slug,
-                name=state.project_name,
-                profile_md=state.profile_md,
-            )
-            proj_repo.create(proj)
-            conn.commit()
-            state.project_id = proj.id
-            emit(f"[green]✓[/green] Created project [bold]{proj.slug}[/bold]  [dim]{proj.id}[/dim]")
-        else:
-            proj_repo.update(
-                state.project_id,
-                state.project_slug,
-                state.project_name,
-                state.profile_md,
-            )
-            conn.commit()
-            emit(f"[green]✓[/green] Updated project [bold]{state.project_slug}[/bold]")
+    t.add_row("Scan", "[green]yes[/green]" if state.do_scan else "[dim]no[/dim]")
+    t.add_row("Kickoff", "[green]yes[/green]" if state.do_kickoff else "[dim]no[/dim]")
 
-        # ── 2. Sync workspace links ──────────────────────────────────────
-        if state.project_id:
-            existing_ids = {
-                ws.id for ws, _ in ws_repo.linked_workspaces(state.project_id)
-            }
-            # Unlink removed ones (edit mode only)
-            for ws_id in existing_ids - set(state.workspace_links):
-                ws_repo.unlink_project(state.project_id, ws_id)
-                ws = ws_repo.get(ws_id)
-                emit(f"[yellow]−[/yellow]  Unlinked {ws.slug if ws else ws_id}")
+    console.print(Panel(t, title="[bold]Summary[/bold]", border_style="cyan", expand=False))
 
-            # Link new / update existing
-            for ws_id, role in state.workspace_links.items():
-                ws = ws_repo.get(ws_id)
-                if ws:
-                    ws_repo.link_project(state.project_id, ws_id, role=role)  # type: ignore[arg-type]
-                    emit(f"[green]✓[/green] Linked [bold]{ws.slug}[/bold] as {role}")
-            conn.commit()
 
-        # ── 3. Scan ──────────────────────────────────────────────────────
-        if state.scan and state.workspace_links:
-            from loci.ingest.pipeline import scan_workspace
-            for ws_id in state.workspace_links:
-                ws = ws_repo.get(ws_id)
-                if not ws:
-                    continue
-                emit(f"[dim]  Scanning {ws.slug}…[/dim]")
+# ─────────────────────────────────────────────────────────────────────────────
+# Apply
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply(conn: sqlite3.Connection, state: _State) -> None:
+    from loci.graph import Project, ProjectRepository
+    from loci.graph.workspaces import WorkspaceRepository
+
+    console.print()
+    proj_repo = ProjectRepository(conn)
+    ws_repo = WorkspaceRepository(conn)
+
+    # 1. Create or update project
+    if state.project_id is None:
+        proj = Project(slug=state.slug, name=state.name, profile_md=state.profile_md)
+        proj_repo.create(proj)
+        conn.commit()
+        state.project_id = proj.id
+        console.print(f"[green]✓[/green]  Created project [bold]{proj.slug}[/bold]  [dim]{proj.id}[/dim]")
+    else:
+        proj_repo.update(state.project_id, state.slug, state.name, state.profile_md)
+        conn.commit()
+        console.print(f"[green]✓[/green]  Updated project [bold]{state.slug}[/bold]")
+
+    # 2. Sync workspace links
+    existing_ids = {ws.id for ws, _ in ws_repo.linked_workspaces(state.project_id)}
+    for ws_id in existing_ids - set(state.workspace_links):
+        ws_repo.unlink_project(state.project_id, ws_id)
+        ws = ws_repo.get(ws_id)
+        console.print(f"[yellow]−[/yellow]  Unlinked {ws.slug if ws else ws_id}")
+    for ws_id, role in state.workspace_links.items():
+        ws = ws_repo.get(ws_id)
+        if ws:
+            ws_repo.link_project(state.project_id, ws_id, role=role)  # type: ignore[arg-type]
+            console.print(f"[green]✓[/green]  Linked [bold]{ws.slug}[/bold] as {role}")
+    conn.commit()
+
+    # 3. Scan
+    if state.do_scan and state.workspace_links:
+        from loci.ingest.pipeline import scan_workspace
+        for ws_id in state.workspace_links:
+            ws = ws_repo.get(ws_id)
+            if not ws:
+                continue
+            with console.status(f"  Scanning [bold]{ws.slug}[/bold]…"):
                 res = scan_workspace(conn, ws_id)
-                emit(
-                    f"[green]✓[/green] Scanned [bold]{ws.slug}[/bold]  "
-                    f"{res.new_raw} new  {res.deduped} deduped  {res.skipped} skipped"
-                )
-                for err in res.errors[:3]:
-                    emit(f"  [yellow]⚠[/yellow]  {err}")
+            console.print(
+                f"[green]✓[/green]  Scanned [bold]{ws.slug}[/bold]  "
+                f"{res.new_raw} new · {res.deduped} deduped · {res.skipped} skipped"
+            )
+            for err in res.errors[:3]:
+                console.print(f"  [yellow]⚠[/yellow]  {err}")
 
-        # ── 4. Kickoff ────────────────────────────────────────────────────
-        if state.kickoff and state.project_id:
-            emit("[dim]  Running kickoff…[/dim]")
+    # 4. Kickoff
+    if state.do_kickoff and state.project_id:
+        with console.status("  Running kickoff…"):
             from loci.jobs import enqueue
             from loci.jobs.queue import get_job
             from loci.jobs.worker import run_once
             jid = enqueue(conn, kind="kickoff", project_id=state.project_id, payload={"n": 6})
             run_once(conn)
             job = get_job(conn, jid)
-            status = job.get("status", "?") if job else "unknown"
-            color = "green" if status == "done" else "yellow"
-            emit(f"[{color}]✓[/{color}]  Kickoff {status}")
+        status = job.get("status", "?") if job else "unknown"
+        color = "green" if status == "done" else "yellow"
+        console.print(f"[{color}]✓[/{color}]  Kickoff {status}")
 
-    # ── Events ──────────────────────────────────────────────────────────────
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "done":
-            self.app.exit()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# App entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ProjectWizardApp(App):
-    CSS = APP_CSS
-    TITLE = "loci"
-    SUB_TITLE = "project manager"
-    BINDINGS = [Binding("ctrl+c", "quit", "Quit", priority=True)]
-
-    def __init__(self, conn: sqlite3.Connection, slug_hint: str = "") -> None:
-        super().__init__()
-        self.conn = conn
-        self._slug_hint = slug_hint
-
-    def on_mount(self) -> None:
-        self.push_screen(HomeScreen(self.conn, self._slug_hint))
-
-    def action_quit(self) -> None:
-        self.exit()
-
-
-def run_wizard(conn: sqlite3.Connection, slug_hint: str = "") -> None:
-    """Launch the TUI wizard, blocking until the user exits."""
-    ProjectWizardApp(conn, slug_hint).run()
+    console.print()
+    console.print(
+        f"[bold green]All done![/bold green]  "
+        f"Try: [cyan]loci draft {state.slug} \"your question\"[/cyan]"
+    )
+    console.print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -953,3 +505,46 @@ def run_wizard(conn: sqlite3.Connection, slug_hint: str = "") -> None:
 def _slugify(s: str) -> str:
     s = re.sub(r"[^\w\s-]", "", s.lower().strip())
     return re.sub(r"[\s_]+", "-", s).strip("-")
+
+
+def _load_state(conn: sqlite3.Connection, proj_id: str) -> _State:
+    from loci.graph import ProjectRepository
+    from loci.graph.workspaces import WorkspaceRepository
+
+    proj = ProjectRepository(conn).get(proj_id)
+    if not proj:
+        return _State()
+    links = {
+        ws.id: link.role
+        for ws, link in WorkspaceRepository(conn).linked_workspaces(proj_id)
+    }
+    return _State(
+        project_id=proj.id,
+        slug=proj.slug,
+        name=proj.name,
+        profile_md=proj.profile_md,
+        workspace_links=links,
+    )
+
+
+def _print_banner() -> None:
+    console.print()
+    console.rule("[bold cyan]loci[/bold cyan] — project manager")
+    console.print()
+
+
+def _show_projects_table(conn: sqlite3.Connection) -> None:
+    from loci.graph import ProjectRepository
+
+    projects = ProjectRepository(conn).list()
+    if not projects:
+        return
+    t = Table("slug", "name", "last active", show_lines=False, box=None)
+    for p in projects:
+        t.add_row(
+            f"[bold]{p.slug}[/bold]",
+            p.name,
+            (p.last_active_at or "—")[:10],
+        )
+    console.print(t)
+    console.print()
