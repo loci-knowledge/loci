@@ -234,10 +234,9 @@ def run_research(
     except Exception as exc:  # noqa: BLE001
         log.exception("research: agent run failed")
         if sandbox is not None:
-            try:
+            import contextlib
+            with contextlib.suppress(Exception):
                 sandbox.delete()
-            except Exception:  # noqa: BLE001
-                pass
         return ResearchReport(
             summary_md=f"Research run failed: {exc}",
             artifacts=recorder.artifacts,

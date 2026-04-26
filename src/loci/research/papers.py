@@ -150,9 +150,12 @@ def _parse_paper_html(html: str) -> dict[str, Any]:
     abstract = ""
     if abstract_el:
         for child in abstract_el.children:
-            if isinstance(child, Tag) and child.name in ("h6", "h2", "h3", "p", "span"):
-                if child.get_text(strip=True).lower() == "abstract":
-                    continue
+            if (
+                isinstance(child, Tag)
+                and child.name in ("h6", "h2", "h3", "p", "span")
+                and child.get_text(strip=True).lower() == "abstract"
+            ):
+                continue
             if isinstance(child, Tag) and child.name == "p":
                 abstract += child.get_text(separator=" ", strip=True) + " "
         abstract = abstract.strip()

@@ -453,11 +453,10 @@ class Sandbox:
 
         def _check_cancel() -> None:
             if cancel_event and cancel_event.is_set():
+                import contextlib
                 _log("Sandbox creation cancelled, cleaning up...")
-                try:
+                with contextlib.suppress(Exception):
                     api.delete_repo(space_id, repo_type="space")
-                except Exception:  # noqa: BLE001
-                    pass
                 raise cls.Cancelled(f"Sandbox creation cancelled: {space_id}")
 
         base = name or "loci-sandbox"
