@@ -96,10 +96,15 @@ class IngestPipeline:
         """Walk `root`, ingest everything new, return a summary."""
         result = IngestResult()
         batch: list[_Pending] = []
+        # Track hashes staged in the current batch but not yet written to DB.
+        # Without this, duplicate files in the same walk (same content in two
+        # locations) both pass find_raw_by_hash → batch → second INSERT fails
+        # with UNIQUE constraint on raw_nodes.content_hash.
+        batch_hashes: set[str] = set()
         for path in walk(root):
             result.scanned += 1
             try:
-                outcome = self._stage_file(path)
+                outcome = self._stage_file(path, batch_hashes)
             except Exception as exc:  # noqa: BLE001
                 msg = f"{path}: {exc}"
                 log.exception("ingest staging failed")
@@ -117,6 +122,7 @@ class IngestPipeline:
             if len(batch) >= self.embed_batch_size:
                 self._flush_batch(batch, result)
                 batch = []
+                batch_hashes.clear()
         if batch:
             self._flush_batch(batch, result)
         self.workspaces.touch(self.workspace_id)
@@ -126,9 +132,15 @@ class IngestPipeline:
     # Internals
     # -----------------------------------------------------------------------
 
-    def _stage_file(self, path: Path) -> _Pending | _DedupOutcome | None:
+    def _stage_file(
+        self, path: Path, batch_hashes: set[str] | None = None,
+    ) -> _Pending | _DedupOutcome | None:
         """Per-file pre-embed work: hash → dedup check → extract → return pending."""
         full_hash, trunc_hash, size = hash_file(path)
+        # Check both the DB and the in-flight batch so duplicate files in the
+        # same directory scan don't cause a UNIQUE constraint failure on write.
+        if batch_hashes is not None and trunc_hash in batch_hashes:
+            return _DedupOutcome(added_membership=False)
         existing = self.nodes.find_raw_by_hash(trunc_hash)
         if existing is not None:
             # Same content already known. Add to this workspace if not present.
@@ -149,6 +161,8 @@ class IngestPipeline:
         except OSError as exc:
             log.warning("read_bytes failed for %s: %s", path, exc)
             return None
+        if batch_hashes is not None:
+            batch_hashes.add(trunc_hash)
         return _Pending(
             path=path, full_hash=full_hash, trunc_hash=trunc_hash,
             size=size, raw_bytes=raw_bytes, extracted=extracted,

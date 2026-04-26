@@ -610,7 +610,7 @@ def graph_export(
     from loci.db import migrate
     from loci.db.connection import connect
     from loci.graph import ProjectRepository
-    from loci.graph.export import write_graph_html
+    from loci.graph.export import build_graph_payload, write_graph_html
 
     migrate()
     conn = connect()
@@ -620,6 +620,37 @@ def graph_export(
         raise SystemExit(1)
     out = write_graph_html(proj, conn, output, include_raw=include_raw)
     console.print(f"[green]wrote[/green] {out}")
+
+    # Diagnostics when the graph looks thin
+    payload = build_graph_payload(proj, conn, include_raw=include_raw)
+    stats = payload["stats"]
+    console.print(
+        f"  [dim]{stats['total_nodes']} nodes "
+        f"({stats['raw_nodes']} raw · {stats['interpretation_nodes']} interp) "
+        f"· {stats['edges']} edges[/dim]"
+    )
+    if stats["edges"] == 0 and stats["raw_nodes"] > 0:
+        console.print("[yellow]⚠  No edges found.[/yellow] Possible reasons:")
+        linked = conn.execute(
+            "SELECT COUNT(*) FROM project_workspaces WHERE project_id = ?", (proj.id,)
+        ).fetchone()[0]
+        interp_count = conn.execute(
+            "SELECT COUNT(*) FROM nodes n JOIN project_membership pm ON pm.node_id = n.id"
+            " WHERE pm.project_id = ? AND n.kind = 'interpretation'", (proj.id,)
+        ).fetchone()[0]
+        if linked == 0:
+            console.print(
+                f"  1. No workspace linked — run: [cyan]loci workspace link <ws> {proj.slug}[/cyan]"
+            )
+        if interp_count == 0:
+            console.print(
+                f"  2. No interpretation nodes — run: [cyan]loci kickoff {proj.slug}[/cyan]"
+            )
+        if linked > 0 and interp_count == 0:
+            console.print(
+                "     (kickoff may have skipped if workspace was empty when it ran; "
+                "re-run after scanning)"
+            )
 
 
 @app.command

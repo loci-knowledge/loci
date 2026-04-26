@@ -267,26 +267,126 @@ def _step_workspaces(conn: sqlite3.Connection, state: _State) -> None:
     from loci.graph.workspaces import WorkspaceRepository
 
     workspaces = WorkspaceRepository(conn).list()
-
-    wants = questionary.confirm(
-        "Link a workspace to this project?",
-        default=bool(workspaces),
+    method = questionary.select(
+        "Information workspace:",
+        choices=[
+            questionary.Choice(
+                "Set up from a folder  (recommended — auto-detects subfolders)",
+                value="folder",
+            ),
+            questionary.Choice(
+                "Link an existing workspace",
+                value="existing",
+                disabled=None if workspaces else "no workspaces yet",
+            ),
+            questionary.Choice("Create a workspace manually", value="manual"),
+            questionary.Choice("Skip for now", value="skip"),
+        ],
         style=STYLE,
     ).ask()
 
-    if not wants:
+    if method is None or method == "skip":
         state.workspace_links = {}
         return
 
-    if not workspaces:
-        if questionary.confirm("No workspaces exist. Create one now?", default=True, style=STYLE).ask():
-            ws = _create_workspace_inline(conn)
-            if ws:
-                workspaces = WorkspaceRepository(conn).list()
-        if not workspaces:
-            return
+    if method == "folder":
+        _setup_workspace_from_folder(conn, state)
+    elif method == "existing":
+        _link_existing_workspaces(conn, state, workspaces)
+    elif method == "manual":
+        ws = _create_workspace_inline(conn)
+        if ws:
+            state.workspace_links = {ws.id: "primary"}
 
-    # Multi-select with checkboxes
+
+def _setup_workspace_from_folder(conn: sqlite3.Connection, state: _State) -> None:
+    """Smart setup: root path → auto-detect subfolders → sources → workspace."""
+    from loci.graph.models import Workspace, new_id, now_iso
+    from loci.graph.workspaces import WorkspaceRepository
+
+    root_str = questionary.text(
+        "Information workspace root path:",
+        style=STYLE,
+    ).ask()
+    if not root_str:
+        return
+
+    root = Path(root_str.strip()).expanduser()
+    if not root.exists() or not root.is_dir():
+        console.print(f"[yellow]  Path not found or not a directory: {root}[/yellow]")
+        return
+
+    # Detect subfolders
+    subfolders = _scan_subfolders(root)
+
+    sources_to_add: list[tuple[Path, str | None]] = []  # (path, label|None)
+
+    if subfolders:
+        console.print(f"\n  Found [bold]{len(subfolders)}[/bold] subfolder(s) in {root.name}/:\n")
+        choices = [
+            questionary.Choice(
+                f"{name}/  [dim]({count} file{'s' if count != 1 else ''})[/dim]",
+                value=name,
+                checked=True,
+            )
+            for name, count in subfolders
+        ]
+        choices.append(questionary.Choice(
+            f"  (also add {root.name}/ root itself as a source)", value="__root__",
+        ))
+        selected = questionary.checkbox(
+            "Select subfolders to add as labeled sources:",
+            choices=choices,
+            style=STYLE,
+        ).ask()
+        if not selected:
+            return
+        for sel in selected:
+            if sel == "__root__":
+                sources_to_add.append((root, None))
+            else:
+                sources_to_add.append((root / sel, sel))
+    else:
+        console.print(f"  [dim]No subfolders in {root.name}/ — adding the folder itself as source.[/dim]")
+        sources_to_add = [(root, None)]
+
+    # Create workspace (slug derived from project slug)
+    ws_repo = WorkspaceRepository(conn)
+    ws_slug = _slugify(f"{state.slug}-ws") or "workspace"
+    # Avoid slug collisions
+    base = ws_slug
+    counter = 2
+    while ws_repo.get_by_slug(ws_slug) and ws_repo.get_by_slug(ws_slug).id not in state.workspace_links:
+        ws_slug = f"{base}-{counter}"
+        counter += 1
+
+    kind = _infer_kind(subfolders)
+    ws = Workspace(
+        id=new_id(),
+        slug=ws_slug,
+        name=f"{state.name} sources" if state.name else ws_slug,
+        description_md="",
+        kind=kind,
+        created_at=now_iso(),
+        last_active_at=now_iso(),
+    )
+    ws_repo.create(ws)
+    console.print(f"  [green]✓[/green]  Created workspace [bold]{ws_slug}[/bold] (kind={kind})")
+
+    for path, label in sources_to_add:
+        ws_repo.add_source(ws.id, path, label=label)
+        tag = f"  label=[bold]{label}[/bold]" if label else ""
+        console.print(f"  [green]✓[/green]  Added source [dim]{path.name}/[/dim]{tag}")
+
+    conn.commit()
+    state.workspace_links = {ws.id: "primary"}
+
+
+def _link_existing_workspaces(
+    conn: sqlite3.Connection,
+    state: _State,
+    workspaces: list,
+) -> None:
     ws_choices = [
         questionary.Choice(
             f"{ws.slug}  [{ws.kind}]  {ws.name}",
@@ -295,31 +395,19 @@ def _step_workspaces(conn: sqlite3.Connection, state: _State) -> None:
         )
         for ws in workspaces
     ]
-    ws_choices.append(questionary.Choice("+ Create new workspace", value="__new__"))
-
     selected = questionary.checkbox(
-        "Select workspaces to link  (Space to toggle, Enter to confirm):",
+        "Select workspaces to link  (Space to toggle):",
         choices=ws_choices,
         style=STYLE,
     ).ask()
-
     if selected is None:
         return
 
-    # Handle inline workspace creation
-    if "__new__" in selected:
-        selected.remove("__new__")
-        ws = _create_workspace_inline(conn)
-        if ws:
-            selected.append(ws.id)
-            workspaces = WorkspaceRepository(conn).list()
-
-    # Ask role for each selected workspace
+    from loci.graph.workspaces import WorkspaceRepository
+    ws_repo = WorkspaceRepository(conn)
     new_links: dict[str, str] = {}
     for ws_id in selected:
         ws = next((w for w in workspaces if w.id == ws_id), None)
-        if ws is None:
-            ws = WorkspaceRepository(conn).get(ws_id)
         label = ws.slug if ws else ws_id
         role = questionary.select(
             f"Role for '{label}':",
@@ -328,7 +416,6 @@ def _step_workspaces(conn: sqlite3.Connection, state: _State) -> None:
             style=STYLE,
         ).ask()
         new_links[ws_id] = role or "primary"
-
     state.workspace_links = new_links
 
 
@@ -371,6 +458,32 @@ def _create_workspace_inline(conn: sqlite3.Connection):
     conn.commit()
     console.print(f"  [green]✓[/green]  Workspace [bold]{slug}[/bold] created")
     return ws
+
+
+def _scan_subfolders(root: Path) -> list[tuple[str, int]]:
+    """Return [(subfolder_name, file_count)] for visible direct children."""
+    result = []
+    try:
+        for child in sorted(root.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                count = sum(1 for _ in child.rglob("*") if _.is_file())
+                result.append((child.name, count))
+    except PermissionError:
+        pass
+    return result
+
+
+def _infer_kind(subfolders: list[tuple[str, int]]) -> str:
+    names = {n.lower() for n, _ in subfolders}
+    if names & {"papers", "pdf", "pdfs", "articles", "publications", "references"}:
+        return "papers"
+    if names & {"code", "src", "source", "lib"}:
+        return "codebase"
+    if names & {"notes", "journal", "diary", "writing"}:
+        return "notes"
+    if names & {"interviews", "transcripts", "recordings"}:
+        return "transcripts"
+    return "mixed"
 
 
 def _step_scan_kickoff(state: _State) -> None:
@@ -478,6 +591,7 @@ def _apply(conn: sqlite3.Connection, state: _State) -> None:
                 console.print(f"  [yellow]⚠[/yellow]  {err}")
 
     # 4. Kickoff
+    kickoff_skipped_reason = ""
     if state.do_kickoff and state.project_id:
         with console.status("  Running kickoff…"):
             from loci.jobs import enqueue
@@ -486,15 +600,39 @@ def _apply(conn: sqlite3.Connection, state: _State) -> None:
             jid = enqueue(conn, kind="kickoff", project_id=state.project_id, payload={"n": 6})
             run_once(conn)
             job = get_job(conn, jid)
-        status = job.get("status", "?") if job else "unknown"
-        color = "green" if status == "done" else "yellow"
-        console.print(f"[{color}]✓[/{color}]  Kickoff {status}")
+        if job:
+            result_payload = job.get("result") or {}
+            if isinstance(result_payload, str):
+                import json as _json
+                try:
+                    result_payload = _json.loads(result_payload)
+                except Exception:
+                    result_payload = {}
+            if result_payload.get("skipped"):
+                kickoff_skipped_reason = result_payload.get("reason", "unknown")
+                console.print(f"[yellow]⚠[/yellow]  Kickoff skipped: {kickoff_skipped_reason}")
+            else:
+                written = result_payload.get("observations_written", "?")
+                console.print(f"[green]✓[/green]  Kickoff done — {written} loci written")
+        else:
+            console.print("[yellow]⚠[/yellow]  Kickoff job not found")
 
     console.print()
     console.print(
         f"[bold green]All done![/bold green]  "
         f"Try: [cyan]loci draft {state.slug} \"your question\"[/cyan]"
     )
+    if kickoff_skipped_reason and "no profile" in kickoff_skipped_reason:
+        console.print(
+            "\n[dim]Tip: kickoff needs a profile to generate loci. Add one then re-run:[/dim]\n"
+            f"  [cyan]loci kickoff {state.slug}[/cyan]  [dim](after adding a profile via[/dim] "
+            f"[cyan]loci project manage[/cyan][dim])[/dim]"
+        )
+    elif kickoff_skipped_reason:
+        console.print(
+            f"\n[dim]Tip: once sources are scanned, re-run: [/dim]"
+            f"[cyan]loci kickoff {state.slug}[/cyan]"
+        )
     console.print()
 
 
