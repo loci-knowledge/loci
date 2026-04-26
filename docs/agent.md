@@ -14,9 +14,10 @@ usage, without any explicit gesture from you.
 |---------------|---------------------------------------------------------|
 | `draft`       | A `loci draft` (or the REST equivalent) just completed. |
 | `feedback`    | You submitted citation-level feedback for a previous draft. |
-| `kickoff`     | Project kickoff (tension nodes land directly as live nodes). |
+| `kickoff`     | Project kickoff (relationship observations land directly as live nodes). |
 | `manual`      | You called `loci reflect <project>`.                    |
-| `relevance`   | A workspace was linked to the project, the project profile changed, or incremental workspace members were added (see "Workspace context" below). Runs a focused single-pass synthesis without a self-critique stage. |
+| `retrieve`    | A `loci_retrieve` MCP tool call completed (lightweight — no self-critique). Throttled to at most one per 5 minutes per project. |
+| `relevance`   | A workspace was linked to the project, the project profile changed, or incremental workspace members were added. Runs a focused single-pass synthesis without a self-critique stage. |
 | `update_angle` | Triggered by citation feedback on a `relevance` node when the angle appears wrong, or by a direct user edit to such a node. Retargets the node's `angle` and `rationale_md` without recreating it. |
 
 The first four are auto-enqueued. The agent runs in the worker thread, so

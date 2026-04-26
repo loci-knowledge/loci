@@ -201,32 +201,28 @@ idempotent. Files already present (by content hash) are skipped without
 re-extraction. Because the workspace is linked to the project, newly scanned
 nodes immediately become part of `codoc`'s effective members.
 
-## 6. Kickoff: get the first tensions
+## 6. Kickoff: seed the interpretation graph
 
-Kickoff reads your profile + a sample of the raws and proposes 5–10 *open
-tensions* worth pursuing. **It does not invent interpretations on day one**
-— `tension` nodes only, at confidence 0.5, written directly into the live
-graph (not into a proposal queue). Tensions are open questions and conflicts
-that invite your reasoning rather than assert conclusions.
+Kickoff reads your profile + a sample of the raws and generates 5–8
+*relationship observations* — `relevance`, `philosophy`, and `decision`
+nodes that capture **how the workspace content connects to the project's
+goals**. They land at confidence 0.5, directly into the live graph.
 
-```bash
-uv run loci kickoff codoc --n 8
-# → result: { 'skipped': false, 'tensions_written': 8,
-#            'model': 'openai:gpt-5.4-mini' }
-```
-
-You can list them:
+Unlike open questions, these seed the graph with actionable observations:
+"these codebases show the server-as-CLI pattern this project needs" is more
+useful on day one than "what should the CLI look like?"
 
 ```bash
-uv run loci q codoc "what counts as a cite-worthy span?" --k 5
+uv run loci kickoff codoc --n 6
+# → result: { 'skipped': false, 'observations_written': 6,
+#            'model': 'openrouter:google/gemini-3-flash-preview' }
 ```
 
-The tensions show up in the ranked results alongside raw sources because
-they're real graph nodes from minute one.
+The observations show up in retrieval immediately alongside raw sources.
 
 Note: if the `relevance` job from the workspace link (step 4) has not yet
 finished, kickoff will still work — it draws from whatever raws are already
-scanned. The relevance synthesis runs on top of that.
+scanned.
 
 ## 7. Draft something
 

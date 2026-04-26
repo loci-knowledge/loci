@@ -95,6 +95,8 @@ def build_mcp_server() -> FastMCP:
             __record_for(project_id, query, k, hyde),
             retrieved_node_ids=[n.node_id for n in resp.nodes],
         )
+        # Enqueue a lightweight reflect if the project hasn't reflected recently.
+        _maybe_enqueue_reflect(conn, project_id, rid)
         return {
             "nodes": [
                 {
@@ -319,6 +321,114 @@ def build_mcp_server() -> FastMCP:
         }
 
     @mcp.tool(
+        name="loci_context",
+        description=(
+            "Return full situational context for the current project: project info, "
+            "linked information workspaces, graph stats, recently accessed nodes, and "
+            "interpretation nodes created or updated in the last N hours. Call this at "
+            "the start of a session to understand what knowledge is available and what "
+            "has changed recently. `hours` controls the recency window for updated nodes "
+            "(default 24)."
+        ),
+    )
+    def loci_context(
+        project: str | None = None,
+        hours: int = 24,
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
+        proj = ProjectRepository(conn).get(project_id)
+        if proj is None:
+            return {"error": "project not found"}
+
+        ws_repo = WorkspaceRepository(conn)
+        links = ws_repo.linked_workspaces(project_id)
+        workspaces = []
+        for ws, link in links:
+            if link.role == "excluded":
+                continue
+            raw_count = conn.execute(
+                "SELECT COUNT(*) FROM nodes n JOIN workspace_membership wm ON wm.node_id = n.id "
+                "WHERE wm.workspace_id = ? AND n.kind = 'raw'",
+                (ws.id,),
+            ).fetchone()[0]
+            workspaces.append({
+                "id": ws.id, "slug": ws.slug, "name": ws.name,
+                "kind": ws.kind, "role": link.role,
+                "raw_count": raw_count,
+                "description_md": ws.description_md,
+            })
+
+        stats_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE n.kind WHEN 'raw' THEN 1 ELSE 0 END) AS raw_nodes,
+                SUM(CASE n.kind WHEN 'interpretation' THEN 1 ELSE 0 END) AS interpretation_nodes,
+                SUM(CASE n.status WHEN 'live' THEN 1 ELSE 0 END) AS live_nodes
+            FROM nodes n
+            JOIN project_effective_members pm ON pm.node_id = n.id
+            WHERE pm.project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+
+        recent_accessed = conn.execute(
+            """
+            SELECT n.id, n.title, n.kind, n.subkind, n.last_accessed_at, n.confidence
+            FROM nodes n
+            JOIN project_effective_members pm ON pm.node_id = n.id
+            WHERE pm.project_id = ? AND n.last_accessed_at IS NOT NULL
+            ORDER BY n.last_accessed_at DESC LIMIT 8
+            """,
+            (project_id,),
+        ).fetchall()
+
+        from datetime import UTC, datetime, timedelta
+        since = (datetime.now(UTC) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        recent_nodes = conn.execute(
+            """
+            SELECT n.id, n.kind, n.subkind, n.title, n.body, n.confidence, n.status,
+                   n.created_at, n.updated_at
+            FROM nodes n
+            JOIN project_effective_members pm ON pm.node_id = n.id
+            WHERE pm.project_id = ? AND n.kind = 'interpretation'
+              AND (n.created_at >= ? OR n.updated_at >= ?)
+            ORDER BY n.updated_at DESC LIMIT 20
+            """,
+            (project_id, since, since),
+        ).fetchall()
+
+        return {
+            "project": {
+                "id": proj.id, "slug": proj.slug, "name": proj.name,
+                "last_active_at": proj.last_active_at,
+            },
+            "workspaces": workspaces,
+            "stats": {
+                "raw_nodes": stats_row["raw_nodes"] or 0,
+                "interpretation_nodes": stats_row["interpretation_nodes"] or 0,
+                "live_nodes": stats_row["live_nodes"] or 0,
+            },
+            "recent_activity": [
+                {"id": r["id"], "title": r["title"], "kind": r["kind"],
+                 "subkind": r["subkind"], "last_accessed_at": r["last_accessed_at"],
+                 "confidence": r["confidence"]}
+                for r in recent_accessed
+            ],
+            "recently_updated": [
+                {"id": r["id"], "kind": r["kind"], "subkind": r["subkind"],
+                 "title": r["title"], "body": (r["body"] or "")[:300],
+                 "confidence": r["confidence"], "status": r["status"],
+                 "created_at": r["created_at"], "updated_at": r["updated_at"]}
+                for r in recent_nodes
+            ],
+            "since": since,
+        }
+
+    @mcp.tool(
         name="loci_workspace_create",
         description="Create a new information workspace (a labeled bag of source roots).",
     )
@@ -431,6 +541,28 @@ def __record_for(project_id: str, query: str, k: int, hyde: bool):
         request={"query": query, "k": k, "hyde": hyde},
         output="", cited_node_ids=[], client="mcp",
     )
+
+
+_REFLECT_COOLDOWN_SECONDS = 300  # 5 minutes
+
+
+def _maybe_enqueue_reflect(conn, project_id: str, response_id: str) -> None:
+    """Enqueue a lightweight reflect after retrieve, with cooldown."""
+    last = conn.execute(
+        "SELECT MAX(ts) FROM agent_reflections WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()[0]
+    if last:
+        from datetime import UTC, datetime
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            elapsed = (datetime.now(UTC) - last_dt).total_seconds()
+            if elapsed < _REFLECT_COOLDOWN_SECONDS:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+    enqueue(conn, kind="reflect", project_id=project_id,
+            payload={"response_id": response_id, "trigger": "retrieve", "lightweight": True})
 
 
 def run_stdio() -> None:

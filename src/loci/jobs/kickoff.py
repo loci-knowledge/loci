@@ -1,10 +1,8 @@
-"""Kickoff job — generate the first interpretation seeds for a new project.
+"""Kickoff job — generate relationship observations for a new project.
 
-Kickoff writes `tension` nodes directly to live state at conservative confidence
-(`confidence=0.5`, `origin=agent_synthesis`). Tension nodes represent open questions
-and unresolved conflicts — they assert nothing but invite the user's reasoning.
-Subsequent drafting and corrections will evolve them into decisions, philosophies,
-and relevance interpretations.
+Kickoff writes `relevance`, `philosophy`, and `decision` interpretation nodes
+that capture HOW workspace sources connect to the project's goals. Nodes land
+at conservative confidence (`confidence=0.5`, `origin=agent_synthesis`, `status=live`).
 
 Without an LLM configured, kickoff returns `skipped: true` with no node writes.
 """
@@ -19,46 +17,59 @@ from pydantic import BaseModel, Field
 
 from loci.citations import CitationTracker
 from loci.config import get_settings
-from loci.graph.models import InterpretationNode
+from loci.graph import EdgeRepository
+from loci.graph.models import InterpretationNode, RelevanceAngle
 from loci.graph.nodes import NodeRepository
 from loci.graph.projects import ProjectRepository
+from loci.graph.workspaces import WorkspaceRepository
 from loci.llm import LLMNotConfiguredError, build_agent
 
 log = logging.getLogger(__name__)
 
-# How many raw-node titles + leading text to include as "what the user has
-# actually read so far". Too few → questions are abstract; too many → token
-# cost balloons.
+# How many raw-node excerpts to include as sample.
 RAW_SAMPLE_COUNT = 12
 RAW_EXCERPT_CHARS = 500
-TARGET_QUESTIONS = 8
+TARGET_OBSERVATIONS = 6
 
 
-KICKOFF_INSTRUCTIONS = (
-    "You are helping a user start a new research/writing project. They will "
-    "give you a PROJECT PROFILE (their stated goals, scope, and taste) and a "
-    "SAMPLE of source material they have collected. Your job is to propose "
-    "{n} open TENSIONS worth pursuing within this project.\n\n"
-    "Rules — follow these strictly:\n"
-    "- Output a JSON-shaped Kickoff with a `questions` field; each tension "
-    "  has `title` (≤80 chars, phrased as a question or conflict) and `body` "
-    "  (1–3 sentences explaining why this tension matters and what resolving "
-    "  it would unlock).\n"
-    "- Do NOT make claims or pretend to know the user's interpretation. "
-    "  Frame as open tensions: unresolved questions, competing priorities, "
-    "  or gaps between what the sources show and what the project needs.\n"
-    "- Stay tight to the profile. Ignore directions outside the scope.\n"
-    "- Phrase in the user's voice — first person, casual."
-)
+KICKOFF_INSTRUCTIONS = """\
+You are helping a user start a new research/writing project. They have given you a \
+PROJECT PROFILE (their goals, scope, and taste) and WORKSPACE SOURCES (titled excerpts \
+labeled [R1], [R2], etc.). Generate {n} relationship observations that capture how this \
+workspace content connects to the project's goals.
+
+Each observation must be one of three subkinds:
+- `relevance`: a typed bridge between specific workspace sources and the project's intent. \
+  Requires: angle (one of applicable_pattern, experimental_setup, borrowed_concept, \
+  counterexample, prior_attempt, vocabulary_source, methodological_neighbor, \
+  contrast_baseline), rationale_md (1-3 sentences: WHY these specific sources matter at \
+  this angle). Cite ≥2 raws via raw_handles (e.g. ["R1", "R3"]). Name the bridge — \
+  do not summarise the sources.
+- `philosophy`: a first-principle belief the sources reveal the project should adopt. \
+  No angle required.
+- `decision`: a concrete choice the sources suggest the project should make, with \
+  explicit trade-offs named.
+
+Rules:
+- Output OBSERVATIONS, not questions. Never use question marks in titles.
+- For relevance nodes: name what the sources OFFER for the project, not what they say.
+- raw_handles must reference actual [Rn] labels present in the sample.
+- Generate a mix of subkinds; lean toward relevance when the workspace has distinct sources.
+- Stay grounded in the project profile and the sources given.
+"""
 
 
-class KickoffQuestion(BaseModel):
+class KickoffObservation(BaseModel):
+    subkind: str  # "relevance" | "philosophy" | "decision"
     title: Annotated[str, Field(max_length=200)]
     body: str
+    angle: RelevanceAngle | None = None
+    rationale_md: str | None = None
+    raw_handles: list[str] = Field(default_factory=list)
 
 
-class Kickoff(BaseModel):
-    questions: list[KickoffQuestion]
+class KickoffOutput(BaseModel):
+    observations: list[KickoffObservation]
 
 
 def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict:
@@ -70,28 +81,37 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     if project is None:
         raise ValueError(f"project not found: {project_id}")
 
-    target = int(payload.get("n", TARGET_QUESTIONS))
-    target = max(3, min(20, target))  # clamp to sane bounds
+    target = int(payload.get("n", TARGET_OBSERVATIONS))
+    target = max(2, min(12, target))  # clamp to sane bounds
 
     settings = get_settings()
     try:
         agent = build_agent(
             settings.interpretation_model,
             instructions=KICKOFF_INSTRUCTIONS.format(n=target),
-            output_type=Kickoff,
+            output_type=KickoffOutput,
         )
     except LLMNotConfiguredError as exc:
         log.info("kickoff: %s; skipping LLM step", exc)
         return {"skipped": True, "reason": str(exc), "proposals": 0}
 
-    sample = _sample_raws(conn, project_id, RAW_SAMPLE_COUNT, RAW_EXCERPT_CHARS)
-    if not sample.strip() and not project.profile_md.strip():
+    sample_str, handle_to_id = _sample_raws_with_handles(
+        conn, project_id, RAW_SAMPLE_COUNT, RAW_EXCERPT_CHARS
+    )
+    workspace_summary = _workspace_summary(conn, project_id)
+
+    if not sample_str.strip() and not project.profile_md.strip():
         return {"skipped": True, "reason": "no profile, no raws to sample", "proposals": 0}
 
-    user_msg = (
-        f"PROJECT PROFILE:\n{project.profile_md or '(empty — infer from sample)'}"
-        f"\n\n---\n\nSAMPLE OF RAW SOURCES:\n{sample}"
-    )
+    user_msg_parts = [
+        f"PROJECT PROFILE:\n{project.profile_md or '(empty — infer from sample)'}",
+    ]
+    if workspace_summary:
+        user_msg_parts.append(f"LINKED WORKSPACES:\n{workspace_summary}")
+    if sample_str:
+        user_msg_parts.append(f"WORKSPACE SOURCES:\n{sample_str}")
+
+    user_msg = "\n\n---\n\n".join(user_msg_parts)
 
     try:
         result = agent.run_sync(user_msg)
@@ -99,37 +119,43 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
         log.exception("kickoff: LLM call failed")
         return {"skipped": False, "error": str(exc), "proposals": 0}
 
-    kickoff: Kickoff = result.output
+    output: KickoffOutput = result.output
     nodes_repo = NodeRepository(conn)
     pr = ProjectRepository(conn)
+    edges_repo = EdgeRepository(conn)
     tracker = CitationTracker(conn)
 
-    # Embed the questions in one batch so we pay the embedder cost once.
+    # Embed all observations in one batch.
     from loci.embed.local import get_embedder
     embedder = None
     try:
         embedder = get_embedder()
     except Exception as exc:  # noqa: BLE001
         log.warning("kickoff: embedder load failed: %s", exc)
-    questions = kickoff.questions[:target]
+
+    observations = output.observations[:target]
     vecs = None
-    if embedder is not None and questions:
+    if embedder is not None and observations:
         try:
-            vecs = embedder.encode_batch([f"{q.title}\n\n{q.body}" for q in questions])
+            vecs = embedder.encode_batch(
+                [f"{o.title}\n\n{o.body}" for o in observations]
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("kickoff: embedding failed: %s", exc)
             vecs = None
 
     written = 0
-    for i, q in enumerate(questions):
+    for i, obs in enumerate(observations):
         try:
             node = InterpretationNode(
-                subkind="tension",
-                title=q.title.strip(),
-                body=q.body.strip(),
+                subkind=obs.subkind,  # type: ignore[arg-type]
+                title=obs.title.strip(),
+                body=obs.body.strip(),
+                angle=obs.angle,
+                rationale_md=obs.rationale_md or "",
                 origin="agent_synthesis",
-                confidence=0.5,        # open questions are speculative, not asserted
-                status="live",         # but live — they show up in retrieval
+                confidence=0.5,
+                status="live",
             )
             embedding = vecs[i] if vecs is not None else None
             nodes_repo.create_interpretation(node, embedding=embedding)
@@ -137,12 +163,31 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
             tracker.append_trace(
                 project_id, node.id, "agent_synthesised", client="kickoff",
             )
+
+            # Wire cites edges to referenced raw nodes.
+            for handle in obs.raw_handles:
+                raw_id = handle_to_id.get(handle.upper().lstrip("R").zfill(0))
+                # Try both "R1" and "1" forms.
+                if raw_id is None:
+                    # handle might be "R1" → strip "R" prefix
+                    key = handle.upper()
+                    if key.startswith("R"):
+                        key = key[1:]
+                    raw_id = handle_to_id.get(key)
+                if raw_id is None:
+                    # direct lookup with the handle as-is
+                    raw_id = handle_to_id.get(handle)
+                if raw_id is not None:
+                    try:
+                        edges_repo.create(node.id, raw_id, type="cites", created_by="system")
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("kickoff: cites edge failed: %s", exc)
+
             written += 1
         except Exception as exc:  # noqa: BLE001
-            log.warning("kickoff: write tension failed: %s", exc)
+            log.warning("kickoff: write observation failed: %s", exc)
 
-    # Anchor wiring + co-citation — runs after all nodes are written so new
-    # question nodes appear in retrieval immediately and share evidence edges.
+    # Anchor wiring + co-citation — runs after all nodes are written.
     if written > 0 and embedder is not None:
         try:
             _anchor_and_cocite(conn, project_id, embedder)
@@ -151,7 +196,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
 
     return {
         "skipped": False,
-        "tensions_written": written,
+        "observations_written": written,
         "model": settings.interpretation_model,
     }
 
@@ -251,17 +296,21 @@ def _anchor_and_cocite(
     conn.commit()
 
 
-def _sample_raws(conn: sqlite3.Connection, project_id: str, n: int, excerpt_chars: int) -> str:
-    """Return a stringified sample of raws for the kickoff prompt.
+def _sample_raws_with_handles(
+    conn: sqlite3.Connection,
+    project_id: str,
+    n: int,
+    excerpt_chars: int,
+) -> tuple[str, dict[str, str]]:
+    """Return a formatted sample string with [R1]..[Rn] labels AND a dict mapping
+    numeric key (e.g. '1') → raw_node_id.
 
-    We pick the most recently added raws (proxy for "what the user is currently
-    working with"). Each entry includes the title + the first `excerpt_chars`
-    characters of the body — enough for the LLM to recognise the topic without
-    blowing token budget.
+    Query joins nodes + raw_nodes + project_effective_members, ordered by
+    created_at DESC LIMIT n.
     """
     rows = conn.execute(
         """
-        SELECT n.title, n.body, n.subkind
+        SELECT n.id, n.title, n.body, n.subkind
         FROM nodes n
         JOIN raw_nodes r ON r.node_id = n.id
         JOIN project_effective_members pm ON pm.node_id = n.id
@@ -272,9 +321,34 @@ def _sample_raws(conn: sqlite3.Connection, project_id: str, n: int, excerpt_char
         """,
         (project_id, n),
     ).fetchall()
+
     parts: list[str] = []
-    for r in rows:
-        body = (r["body"] or "").strip()[:excerpt_chars]
+    handle_to_id: dict[str, str] = {}
+
+    for idx, row in enumerate(rows, start=1):
+        key = str(idx)
+        handle_to_id[key] = row["id"]
+        body = (row["body"] or "").strip()[:excerpt_chars]
+        label = f"[R{idx}]"
+        header = f"{label} [{row['subkind']}] {row['title']}"
         if body:
-            parts.append(f"- [{r['subkind']}] {r['title']}\n  {body}")
-    return "\n\n".join(parts)
+            parts.append(f"{header}\n  {body}")
+        else:
+            parts.append(header)
+
+    return "\n\n".join(parts), handle_to_id
+
+
+def _workspace_summary(conn: sqlite3.Connection, project_id: str) -> str:
+    """List linked workspace names/kinds for context header."""
+    ws_repo = WorkspaceRepository(conn)
+    links = ws_repo.linked_workspaces(project_id)
+    if not links:
+        return ""
+    lines: list[str] = []
+    for ws, link in links:
+        if link.role == "excluded":
+            continue
+        desc = f" — {ws.description_md[:100]}" if ws.description_md else ""
+        lines.append(f"- [{ws.kind}] {ws.name} (role={link.role}){desc}")
+    return "\n".join(lines)

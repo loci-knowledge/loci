@@ -24,13 +24,15 @@ loci kickoff big-bet --n 8
 After kickoff, your graph contains:
 
 - ~50 RawNodes (whatever you scanned)
-- 8 **live** tension interpretations at confidence 0.5 (`origin=agent_synthesis`)
+- 6 **live** interpretation nodes at confidence 0.5 — a mix of `relevance`,
+  `philosophy`, and `decision` (`origin=agent_synthesis`)
 - 1 project with profile + memberships
 - 0 pending proposals
 
-The "no fabricated interpretations on day 1" rule is preserved by virtue of
-subkind: kickoff produces *tensions only* — open questions and unresolved
-conflicts that assert nothing and invite your reasoning.
+Kickoff generates *relationship observations*, not open questions. The first
+seeds capture what the workspace offers the project: bridges to source patterns,
+grounding principles, concrete choices the evidence suggests. Tensions and
+finer distinctions emerge from the reflect cycle as you work.
 
 The questions are immediately retrievable. Run `loci q big-bet "<topic>"`
 and they'll show up in the ranked results alongside raw sources.
@@ -53,7 +55,7 @@ What happens behind the scenes:
 2. **Without you doing anything**, a `reflect` job auto-enqueues. The
    interpreter agent reads your task, the candidates surfaced, and the
    citations the draft chose. It synthesises — possibly creating a new
-   tension/decision/philosophy/relevance node, possibly reinforcing existing ones.
+   relevance/decision/philosophy/tension node, possibly reinforcing existing ones.
 3. By the next session, your graph has new live nodes you didn't write.
 
 You read the draft. If it's right, you keep it. If it's wrong, you edit

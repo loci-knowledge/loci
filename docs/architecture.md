@@ -138,11 +138,29 @@ loci.retrieve.Retriever
 materialise nodes (incl. snippets) →
 update access_count, last_accessed_at →
 write Response + per-node Trace rows →
+enqueue lightweight reflect (if MCP, with 5-min cooldown) →
 return { nodes[], citations[], trace_id }
 ```
 
 `why` strings are derived per-node from the channels that matched —
 no extra LLM call.
+
+### Awareness endpoints
+
+Two endpoints expose the graph's live state for clients (VSCode extension, MCP):
+
+```
+GET /projects/:id/context
+   → project info + linked workspaces (with raw_count) + graph stats + last 10 accessed nodes
+
+GET /projects/:id/recent-nodes?hours=24&kind=interpretation
+   → nodes created or updated in the last N hours (max 168); kind filter optional
+```
+
+These are the primary feed for the frontend "what's active" panel and the
+`loci_context` MCP tool. The VSCode extension subscribes to the WebSocket
+`project:{id}` channel for push updates, and polls `recent-nodes` to show
+what the agent has been adding or modifying.
 
 ### A draft call
 

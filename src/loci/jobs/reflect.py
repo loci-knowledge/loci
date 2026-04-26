@@ -26,9 +26,11 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
         raise ValueError("reflect requires a project_id")
     response_id = payload.get("response_id")
     trigger = payload.get("trigger") or "manual"
-    if trigger not in {"draft", "feedback", "manual", "kickoff"}:
+    if trigger not in {"draft", "feedback", "manual", "kickoff", "retrieve"}:
         trigger = "manual"
-    res = reflect(conn, project_id, response_id=response_id, trigger=trigger)
+    lightweight = payload.get("lightweight", False)
+    res = reflect(conn, project_id, response_id=response_id, trigger=trigger,
+                  lightweight=lightweight)
     return {
         "reflection_id": res.reflection_id,
         "actions_taken": res.actions_taken,

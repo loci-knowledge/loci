@@ -55,6 +55,7 @@ def create_app() -> FastAPI:
     # cheap and tests can swap implementations.
     from loci.api.routes import (
         anchors,
+        context,
         draft,
         edges,
         feedback,
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
 
     app.include_router(projects.router)
     app.include_router(anchors.router)
+    app.include_router(context.router)
     app.include_router(workspaces.router)
     app.include_router(sources.router)
     app.include_router(retrieve.router)

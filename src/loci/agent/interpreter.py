@@ -130,7 +130,8 @@ def reflect(
     project_id: str,
     *,
     response_id: str | None,
-    trigger: Literal["draft", "feedback", "manual", "kickoff"] = "draft",
+    trigger: Literal["draft", "feedback", "manual", "kickoff", "retrieve"] = "draft",
+    lightweight: bool = False,
 ) -> ReflectionResult:
     """Run one reflection cycle. Returns a summary; full audit is in the DB.
 
@@ -191,6 +192,18 @@ def reflect(
             deliberation=synth.deliberation,
             actions=[],
             applied=0,
+        )
+
+    if lightweight:
+        # skip critique, apply all
+        applied = _apply_actions(conn, project_id, response_id, ctx, actions)
+        deliberation = synth.deliberation + "\n\n(lightweight: critique skipped)"
+        return _log_and_return(
+            conn, project_id, response_id, trigger,
+            instruction=ctx.instruction,
+            deliberation=deliberation,
+            actions=[a.model_dump() for a in actions],
+            applied=applied,
         )
 
     # Self-critique.

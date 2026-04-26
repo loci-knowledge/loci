@@ -15,10 +15,21 @@ repo implements it.
 
 ```bash
 uv sync
-uv run loci server          # start the HTTP/MCP server
 uv run loci project create transformer-attention --profile ./profile.md
-uv run loci scan transformer-attention ~/papers/transformers/
+uv run loci workspace create transformer-attention-ws --kind mixed
+uv run loci workspace add-source transformer-attention-ws ~/papers/transformers --label papers
+uv run loci workspace link transformer-attention-ws transformer-attention --role primary
+uv run loci workspace scan transformer-attention-ws
+uv run loci server          # start the HTTP/MCP server
 uv run loci q transformer-attention "what is the rotary embedding insight?"
+```
+
+Use a **project** for intent and a **workspace** for source roots. If you
+want MCP auto-resolution in the current directory, bind the project after
+creating it:
+
+```bash
+uv run loci project bind transformer-attention
 ```
 
 ## Layout
