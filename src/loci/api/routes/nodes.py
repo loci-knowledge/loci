@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from loci.api.dependencies import db
-from loci.api.publishers import publish_node_upsert
+from loci.api.publishers import publish_node_delete, publish_node_upsert
 from loci.citations import CitationTracker
 from loci.embed.local import get_embedder
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
@@ -63,6 +63,13 @@ class PatchNode(BaseModel):
     body: str | None = None
     tags: list[str] | None = None
     status: NodeStatus | None = None
+
+
+class PatchLocus(BaseModel):
+    relation_md: str | None = None
+    overlap_md: str | None = None
+    source_anchor_md: str | None = None
+    angle: str | None = None
 
 
 @router.post("/nodes", status_code=201)
@@ -230,3 +237,71 @@ def get_node_responses(
     conn: sqlite3.Connection = Depends(db),
 ) -> dict:
     return {"responses": CitationTracker(conn).responses_citing_node(node_id, limit=limit)}
+
+
+@router.patch("/nodes/{node_id}/locus")
+def patch_node_locus(
+    node_id: str,
+    body: PatchLocus,
+    if_match: str | None = Header(None, alias="If-Match"),
+    conn: sqlite3.Connection = Depends(db),
+) -> dict:
+    from loci.api.publishers import projects_for_node
+    nodes_repo = NodeRepository(conn)
+    n = nodes_repo.get(node_id)
+    if n is None:
+        raise HTTPException(404, detail="node not found")
+    if n.kind != "interpretation":
+        raise HTTPException(400, detail="locus patch only applies to interpretation nodes")
+    if if_match is not None and n.updated_at != if_match:
+        raise HTTPException(409, detail="conflict: node modified since If-Match value was read")
+    # Re-embed using the merged (old + new) slot text.
+    rel = body.relation_md if body.relation_md is not None else getattr(n, "relation_md", "")
+    ovl = body.overlap_md if body.overlap_md is not None else getattr(n, "overlap_md", "")
+    anc = body.source_anchor_md if body.source_anchor_md is not None else getattr(n, "source_anchor_md", "")
+    emb_text = "\n\n".join(p for p in [n.title, rel, ovl, anc] if p).strip()
+    new_emb = get_embedder().encode(emb_text) if emb_text else None
+    nodes_repo.update_locus(
+        node_id,
+        relation_md=body.relation_md, overlap_md=body.overlap_md,
+        source_anchor_md=body.source_anchor_md, angle=body.angle,
+        new_embedding=new_emb,
+    )
+    pids = projects_for_node(conn, node_id)
+    if pids:
+        CitationTracker(conn).append_trace(pids[0], node_id, "edited")
+    updated = nodes_repo.get(node_id)
+    if updated is not None:
+        publish_node_upsert(conn, updated)
+    return {"updated": True}
+
+
+@router.delete("/nodes/{node_id}")
+def delete_node(
+    node_id: str, conn: sqlite3.Connection = Depends(db),
+) -> dict:
+    from loci.api.publishers import (
+        projects_for_edge,
+        projects_for_node,
+        publish_edge_delete,
+    )
+    nodes_repo = NodeRepository(conn)
+    n = nodes_repo.get(node_id)
+    if n is None:
+        raise HTTPException(404, detail="node not found")
+    if n.kind == "raw":
+        raise HTTPException(400, detail="raw nodes cannot be deleted via this endpoint")
+    # Snapshot edge fan-out BEFORE deletion (rows are gone after hard_delete).
+    edge_rows = conn.execute(
+        "SELECT id, src, dst FROM edges WHERE src = ? OR dst = ?", (node_id, node_id)
+    ).fetchall()
+    edge_fan = [
+        (r["id"], r["src"], r["dst"], projects_for_edge(conn, r["src"], r["dst"]))
+        for r in edge_rows
+    ]
+    node_project_ids = projects_for_node(conn, node_id)
+    nodes_repo.hard_delete(node_id)
+    for eid, src, dst, pids in edge_fan:
+        publish_edge_delete(conn, eid, src=src, dst=dst, project_ids=pids)
+    publish_node_delete(conn, node_id, project_ids=node_project_ids)
+    return {"deleted": True}

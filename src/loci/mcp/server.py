@@ -44,13 +44,42 @@ from loci.draft import DraftRequest
 from loci.draft import draft as run_draft
 from loci.embed.local import get_embedder
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
-from loci.graph.models import InterpretationNode, Workspace, WorkspaceKind
+from loci.graph.models import InterpretationNode, Workspace, WorkspaceKind, now_iso
 from loci.graph.workspaces import WorkspaceRepository
 from loci.jobs import enqueue
 from loci.mcp.resolve import ProjectNotFound, resolve_project_id
 from loci.retrieve import RetrievalRequest, Retriever
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# IPC bridge: publish trace_run events to the HTTP server's WS bus.
+# The MCP server is a separate process; it can't reach the in-process bus
+# directly. We fire-and-forget a POST to the HTTP server's broadcast endpoint.
+# ---------------------------------------------------------------------------
+
+_LOCI_API_URL = "http://127.0.0.1:7077"
+
+
+def _broadcast_trace_run(project_id: str, payload: dict[str, Any]) -> None:
+    """Fire-and-forget: ship the trace-run payload to the HTTP server."""
+    import threading
+    import urllib.request
+
+    def _post() -> None:
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"{_LOCI_API_URL}/projects/{project_id}/mcp/publish-trace",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)  # noqa: S310
+        except Exception:
+            pass  # best-effort; don't crash MCP on broadcast failure
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 def build_mcp_server() -> FastMCP:
@@ -110,6 +139,23 @@ def build_mcp_server() -> FastMCP:
             __record_for(project_id, query, k, hyde, trace_table=resp.trace_table),
             retrieved_node_ids=[n.node_id for n in resp.nodes],
         )
+        _broadcast_trace_run(project_id, {
+            "response_id": rid,
+            "session_id": "mcp",
+            "query": query,
+            "ts": now_iso(),
+            "k": k,
+            "routing_loci": [
+                {
+                    "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
+                    "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
+                    "source_anchor_md": ri.source_anchor_md,
+                    "angle": ri.angle, "score": ri.score,
+                }
+                for ri in resp.routing_interps
+            ],
+            "trace_table": resp.trace_table,
+        })
         # Enqueue a lightweight reflect if the project hasn't reflected recently.
         _maybe_enqueue_reflect(conn, project_id, rid)
         return {
@@ -173,6 +219,24 @@ def build_mcp_server() -> FastMCP:
             cite_density=cite_density,  # type: ignore[arg-type]
             k=k, hyde=hyde, client="mcp",
         ))
+        _routing_loci_dicts = [
+            {
+                "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
+                "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
+                "source_anchor_md": rl.source_anchor_md,
+                "angle": rl.angle, "score": rl.score,
+            }
+            for rl in result.routing_loci
+        ]
+        _broadcast_trace_run(project_id, {
+            "response_id": result.response_id,
+            "session_id": "mcp",
+            "query": instruction,
+            "ts": now_iso(),
+            "k": k,
+            "routing_loci": _routing_loci_dicts,
+            "trace_table": result.trace_table,
+        })
         return {
             "output_md": result.output_md,
             "citations": [
@@ -183,15 +247,7 @@ def build_mcp_server() -> FastMCP:
                 }
                 for c in result.citations
             ],
-            "routing_loci": [
-                {
-                    "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
-                    "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
-                    "source_anchor_md": rl.source_anchor_md,
-                    "angle": rl.angle, "score": rl.score,
-                }
-                for rl in result.routing_loci
-            ],
+            "routing_loci": _routing_loci_dicts,
             "trace_table": result.trace_table,
             "response_id": result.response_id,
         }
@@ -605,6 +661,112 @@ def build_mcp_server() -> FastMCP:
             return {"error": f"workspace not found: {workspace}"}
         ws_src = ws_repo.add_source(ws.id, Path(root_path), label=label)
         return {"source_id": ws_src.id, "workspace_id": ws.id, "root_path": root_path}
+
+    @mcp.tool(
+        name="loci_edit_locus",
+        description=(
+            "Edit a locus of thought's belief slots directly — relation_md, "
+            "overlap_md, source_anchor_md, and/or angle. The node is re-embedded "
+            "and the change is published immediately. Only provide the slots you "
+            "want to change; omitted slots are preserved."
+        ),
+    )
+    def loci_edit_locus(
+        node_id: str,
+        relation_md: str | None = None,
+        overlap_md: str | None = None,
+        source_anchor_md: str | None = None,
+        angle: str | None = None,
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        n = NodeRepository(conn).get(node_id)
+        if n is None:
+            return {"error": "node not found", "node_id": node_id}
+        if n.kind != "interpretation":
+            return {"error": "loci_edit_locus only applies to interpretation nodes"}
+        rel = relation_md if relation_md is not None else getattr(n, "relation_md", "")
+        ovl = overlap_md if overlap_md is not None else getattr(n, "overlap_md", "")
+        anc = source_anchor_md if source_anchor_md is not None else getattr(n, "source_anchor_md", "")
+        emb_text = "\n\n".join(p for p in [n.title, rel, ovl, anc] if p).strip()
+        new_emb = get_embedder().encode(emb_text) if emb_text else None
+        NodeRepository(conn).update_locus(
+            node_id,
+            relation_md=relation_md, overlap_md=overlap_md,
+            source_anchor_md=source_anchor_md, angle=angle,
+            new_embedding=new_emb,
+        )
+        from loci.api.publishers import publish_node_upsert
+        updated = NodeRepository(conn).get(node_id)
+        if updated is not None:
+            publish_node_upsert(conn, updated)
+        return {"updated": True, "node_id": node_id}
+
+    @mcp.tool(
+        name="loci_add_citation",
+        description="Add a `cites` edge from a locus of thought to a raw source node.",
+    )
+    def loci_add_citation(locus_id: str, raw_id: str) -> dict[str, Any]:
+        conn = get_connection()
+        from loci.graph.edges import EdgeError
+        from loci.api.publishers import publish_edge_upsert
+        try:
+            edge = EdgeRepository(conn).create(locus_id, raw_id, type="cites")
+        except EdgeError as exc:
+            return {"error": str(exc)}
+        publish_edge_upsert(conn, edge)
+        return {"edge_id": edge.id, "src": locus_id, "dst": raw_id}
+
+    @mcp.tool(
+        name="loci_remove_citation",
+        description="Delete a `cites` edge by edge id (remove a citation from a locus to a raw source).",
+    )
+    def loci_remove_citation(edge_id: str) -> dict[str, Any]:
+        conn = get_connection()
+        from loci.api.publishers import projects_for_edge, publish_edge_delete
+        repo = EdgeRepository(conn)
+        existing = repo.get(edge_id)
+        if existing is None:
+            return {"error": "edge not found", "edge_id": edge_id}
+        src, dst = existing.src, existing.dst
+        pids = projects_for_edge(conn, src, dst)
+        repo.delete(edge_id)
+        publish_edge_delete(conn, edge_id, src=src, dst=dst, project_ids=pids)
+        return {"deleted": True, "edge_id": edge_id}
+
+    @mcp.tool(
+        name="loci_delete_node",
+        description=(
+            "Hard-delete an interpretation node and all its incident edges. "
+            "Permanent — cannot be undone. "
+            "Use `loci_remove_citation` to delete a single citation edge instead."
+        ),
+    )
+    def loci_delete_node(node_id: str) -> dict[str, Any]:
+        conn = get_connection()
+        from loci.api.publishers import (
+            projects_for_edge,
+            projects_for_node,
+            publish_edge_delete,
+            publish_node_delete,
+        )
+        n = NodeRepository(conn).get(node_id)
+        if n is None:
+            return {"error": "node not found", "node_id": node_id}
+        if n.kind == "raw":
+            return {"error": "raw nodes cannot be deleted via this tool"}
+        edge_rows = conn.execute(
+            "SELECT id, src, dst FROM edges WHERE src = ? OR dst = ?", (node_id, node_id)
+        ).fetchall()
+        edge_fan = [
+            (r["id"], r["src"], r["dst"], projects_for_edge(conn, r["src"], r["dst"]))
+            for r in edge_rows
+        ]
+        node_project_ids = projects_for_node(conn, node_id)
+        NodeRepository(conn).hard_delete(node_id)
+        for eid, src, dst, pids in edge_fan:
+            publish_edge_delete(conn, eid, src=src, dst=dst, project_ids=pids)
+        publish_node_delete(conn, node_id, project_ids=node_project_ids)
+        return {"deleted": True, "node_id": node_id}
 
     return mcp
 

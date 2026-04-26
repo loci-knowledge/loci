@@ -101,56 +101,60 @@ $ uv run loci project create codoc
 │ Interactive project setup       │
 ╰─────────────────────────────────╯
 
-  ┌─────────────────────────────────────────────────┐
-  │            Existing workspaces                  │
-  │  #  slug       name           kind   sources    │
-  │  1  papers-ws  My papers      papers    3       │
-  │  2  notes-ws   Working notes  notes     1       │
-  └─────────────────────────────────────────────────┘
-
-── Step 1  Project details ─────────────────────────
+── Step 1  Project name ────────────────────────────
   Project name [codoc]: Code-as-Document
   Slug [code-as-document]: codoc
-  Profile file (path to .md, or Enter to skip): /tmp/codoc-profile.md
-  ✓ Created project codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
 
-  Link a workspace to this project? [Y/n]: y
+── Step 2  Profile ─────────────────────────────────
+  Profile file (path to .md, or Enter to skip):
 
-── Step 2  Link workspace ──────────────────────────
-  1  papers-ws  My papers
-  2  notes-ws   Working notes
+── Step 3  Workspace ───────────────────────────────
+  Information workspace:
+  > Set up from a folder (recommended)
+    Link an existing workspace
+    Create a workspace manually
+    Skip for now
 
-  Enter workspace number: 1
-  Link role [primary/reference/excluded] (primary): primary
-  ✓ Linked papers-ws as primary
+  Workspace root folder: ~/Documents/codoc
 
-  Scan the workspace now? [Y/n]: y
+  Found 3 subfolders:
+  [x] papers/  (47 files)
+  [x] code/    (312 files)
+  [x] notes/   (14 files)
 
-── Step 3  Scan ────────────────────────────────────
-  ✓ Scan complete — 47 new, 0 deduped, 2 skipped
+  ✓ Created workspace codoc-ws (kind: mixed)
+  ✓ Added sources: papers, code, notes
 
-  Run kickoff to seed the interpretation graph? [Y/n]: y
+── Step 4  Review ──────────────────────────────────
+  Apply, or change something?
+  > Apply — create project and scan
+    Change name / slug
+    Change profile
+    Change workspace
+    Cancel
 
-── Step 4  Kickoff ─────────────────────────────────
-  ✓ Kickoff done
+── Applying ────────────────────────────────────────
+  ✓ Project codoc created
+  ✓ Workspace codoc-ws linked (primary)
+  ✓ Scan: 373 new, 0 deduped, 5 skipped
+  ✓ Kickoff: 6 observations written
 
-╭────────── Setup complete ─────────────╮
-│ ✓ Project codoc created               │
-│ ✓ Workspace papers-ws linked          │
-│ ✓ Sources scanned                     │
-│ ✓ Interpretation graph seeded         │
-│                                       │
-│ Next steps:                           │
-│   loci draft codoc "your question"    │
-│   loci server  # open VSCode ext      │
-╰───────────────────────────────────────╯
+Next: loci server  →  then open Loki Town in VSCode
 ```
 
+The fastest path to a working project: just supply your project folder as the
+workspace root and the wizard will add each subfolder as a labeled source.
+
+Other wizard entry points:
+- **Resume / edit** a project: `loci project create codoc` if `codoc` is
+  taken offers to edit instead.
+- **Manage all projects**: `loci project manage` — arrow-key menu to
+  create, edit, or delete any project.
+
 The wizard adapts to what you've already set up:
-- If no workspaces exist yet, it skips the link/scan steps and shows the
-  commands to run afterward.
-- If you choose not to link a workspace, scan and kickoff steps are skipped.
-- If you choose not to scan, kickoff is skipped (no raws to interpret yet).
+- If you choose not to set up a workspace, scan and kickoff steps are skipped.
+- If kickoff is skipped (no raws yet), it prints the command to re-run after
+  scanning.
 
 ### Non-interactive (scripted) setup
 
@@ -361,15 +365,34 @@ For Claude Code MCP integration:
 uv run loci mcp        # stdio transport — Claude subprocesses this
 ```
 
-To let MCP tools auto-resolve the current project without passing a `project`
-argument every call, bind a project to your working directory:
+To use loci from **any project directory** in Claude Code, add a `.mcp.json`
+to that project:
+
+```json
+{
+  "mcpServers": {
+    "loci": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--project", "/path/to/loci", "loci", "mcp"]
+    }
+  }
+}
+```
+
+Then bind the project so MCP tools know which loci project to use:
 
 ```bash
+# from inside your project directory:
 loci project bind codoc   # writes .loci/project in the cwd
 ```
 
-MCP tools walk up from cwd to find this file. You can also set
-`LOCI_PROJECT=codoc` in your environment, or pass `project=` explicitly.
+MCP tools walk up the directory tree to find `.loci/project`. You can also set
+`LOCI_PROJECT=codoc` as an environment variable, or pass `project=` explicitly
+in each tool call.
+
+The loci repo itself ships `.mcp.json` and `CLAUDE.md` so Claude Code picks it
+up automatically when you open the loci directory.
 
 ## 10. Connect the VSCode extension (loki-frontend)
 
@@ -423,8 +446,6 @@ surface (the silent reflect cycle handles per-draft work):
 - forgetting candidates (no access in N days + low confidence)
 - contradiction pass (LLM-mediated; needs an API key)
 - community detection (Leiden; needs `loci[graph]` extra)
-- semantic edge refresh for co-cited interpretation pairs (step 9)
-- code dependency extraction: Python/JS/TS import analysis → `actual` edges (step 10)
 
 ## What's next
 

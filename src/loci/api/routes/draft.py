@@ -21,7 +21,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from loci.api.dependencies import db, project_by_id
-from loci.graph.models import Project
+from loci.api.publishers import publish_trace_run
+from loci.graph.models import Project, now_iso
 
 router = APIRouter(prefix="/projects", tags=["draft"])
 
@@ -90,6 +91,25 @@ def post_draft(
         client=user_agent,
     )
     result = draft(conn, req)
+    _routing_loci_dicts = [
+        {
+            "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
+            "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
+            "source_anchor_md": rl.source_anchor_md, "angle": rl.angle,
+            "score": rl.score,
+        }
+        for rl in result.routing_loci
+    ]
+    publish_trace_run(
+        project.id,
+        response_id=result.response_id,
+        session_id=body.session_id,
+        query=body.instruction,
+        ts=now_iso(),
+        routing_loci=_routing_loci_dicts,
+        trace_table=result.trace_table,
+        k=body.k,
+    )
     return DraftResponseBody(
         output_md=result.output_md,
         citations=[
@@ -131,6 +151,25 @@ async def post_draft_stream(
         hyde=body.hyde, k=body.k, client=user_agent,
     )
     result = draft(conn, req)
+    _routing_loci_dicts_s = [
+        {
+            "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
+            "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
+            "source_anchor_md": rl.source_anchor_md, "angle": rl.angle,
+            "score": rl.score,
+        }
+        for rl in result.routing_loci
+    ]
+    publish_trace_run(
+        project.id,
+        response_id=result.response_id,
+        session_id=body.session_id,
+        query=body.instruction,
+        ts=now_iso(),
+        routing_loci=_routing_loci_dicts_s,
+        trace_table=result.trace_table,
+        k=body.k,
+    )
 
     def generate():
         words = result.output_md.split(" ")

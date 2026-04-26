@@ -22,8 +22,9 @@ from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel
 
 from loci.api.dependencies import db, project_by_id
+from loci.api.publishers import publish_trace_run
 from loci.citations import CitationTracker, ResponseRecord
-from loci.graph.models import Project
+from loci.graph.models import Project, now_iso
 from loci.retrieve import RetrievalRequest, Retriever
 
 router = APIRouter(prefix="/projects", tags=["retrieve"])
@@ -102,6 +103,24 @@ def post_retrieve(
     rid = CitationTracker(conn).write_response(
         record, retrieved_node_ids=[n.node_id for n in resp.nodes],
     )
+    publish_trace_run(
+        project.id,
+        response_id=rid,
+        session_id=body.session_id,
+        query=body.query,
+        ts=now_iso(),
+        routing_loci=[
+            {
+                "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
+                "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
+                "source_anchor_md": ri.source_anchor_md,
+                "angle": ri.angle, "score": ri.score,
+            }
+            for ri in resp.routing_interps
+        ],
+        trace_table=resp.trace_table,
+        k=body.k,
+    )
     return RetrieveResponseBody(
         nodes=[
             RetrieveNodeOut(
@@ -125,4 +144,39 @@ def post_retrieve(
         ],
         trace_table=resp.trace_table,
         trace_id=rid,
+    )
+
+
+class TraceRunBroadcastBody(BaseModel):
+    response_id: str
+    session_id: str | None = None
+    query: str
+    ts: str
+    k: int = 10
+    routing_loci: list[dict]
+    trace_table: list[dict]
+    truncated_rows: int = 0
+
+
+@router.post("/{project_id}/mcp/publish-trace", status_code=204)
+def post_publish_trace(
+    body: TraceRunBroadcastBody,
+    project: Project = Depends(project_by_id),
+) -> None:
+    """Accept a trace-run payload from the MCP server and publish it to the WS bus.
+
+    The MCP server runs in a separate process and cannot reach the in-process
+    pub/sub bus directly. This endpoint bridges the gap: the MCP tool calls
+    this endpoint fire-and-forget after retrieve/draft so the frontend receives
+    the structured trace for the village highlight.
+    """
+    publish_trace_run(
+        project.id,
+        response_id=body.response_id,
+        session_id=body.session_id,
+        query=body.query,
+        ts=body.ts,
+        routing_loci=body.routing_loci,
+        trace_table=body.trace_table,
+        k=body.k,
     )

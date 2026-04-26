@@ -30,7 +30,7 @@ import sqlite3
 from typing import Any
 
 from loci.api.pubsub import bus
-from loci.graph.models import Edge, Node, RawNode, now_iso
+from loci.graph.models import Edge, InterpretationNode, Node, RawNode, now_iso
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,11 @@ def node_to_wire(node: Node, *, role: str | None = None) -> dict[str, Any]:
         # parseNode optionally stores `body` on the DTO. Raw bodies tend to
         # be heavy (full PDF text), so we skip them on the wire.
         base["body"] = node.body
+        if isinstance(node, InterpretationNode):
+            base["relation_md"] = node.relation_md
+            base["overlap_md"] = node.overlap_md
+            base["source_anchor_md"] = node.source_anchor_md
+            base["angle"] = node.angle
     if role is not None:
         base["role"] = role
     return base
@@ -258,3 +263,48 @@ def publish_trace(
         bus.publish_sync(f"project:{project_id}", event)
     except Exception:  # noqa: BLE001
         log.exception("publishers: failed to publish trace for %s", project_id)
+
+
+def publish_trace_run(
+    project_id: str,
+    *,
+    response_id: str,
+    session_id: str | None,
+    query: str,
+    ts: str,
+    routing_loci: list[dict[str, Any]],
+    trace_table: list[dict[str, Any]],
+    k: int,
+) -> None:
+    """Publish a structured trace-run event with routing loci + per-raw paths.
+
+    The frontend uses this to light up the village map: dim everything except
+    the loci and raws that Claude routed through, and populate the Thought
+    Roster with the grouped derive-chain.
+    """
+    # Cap trace_table to keep payloads manageable (risk: large repos)
+    truncated_table = trace_table[:50]
+    truncated_rows = len(trace_table) - 50 if len(trace_table) > 50 else 0
+    # Cap interp_path per row to 8 hops
+    capped_table = [
+        {**row, "interp_path": row.get("interp_path", [])[:8]}
+        for row in truncated_table
+    ]
+    seq = bus.next_seq(project_id)
+    event: dict[str, Any] = {
+        "kind": "trace_run",
+        "response_id": response_id,
+        "session_id": session_id,
+        "query": query,
+        "ts": ts,
+        "k": k,
+        "routing_loci": routing_loci,
+        "trace_table": capped_table,
+        "seq": seq,
+    }
+    if truncated_rows > 0:
+        event["truncated_rows"] = truncated_rows
+    try:
+        bus.publish_sync(f"project:{project_id}", event)
+    except Exception:  # noqa: BLE001
+        log.exception("publishers: failed to publish trace_run for %s", project_id)

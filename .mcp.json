@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "loci": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "loci", "mcp"],
+      "cwd": "/Users/r4yen/repos/loci"
+    }
+  }
+}

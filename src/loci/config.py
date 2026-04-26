@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # Used by `loci draft` to synthesise output_md from retrieved candidates
     # while honouring the [Cn] citation contract. Wants strong instruction
     # following and prompt-cache friendliness.
-    rag_model: str = "openrouter:google/gemini-3-flash-preview"
+    rag_model: str = "anthropic/claude-sonnet-4.6"
 
     # Used by the contradiction 3-way classifier (raw vs interpretation).
     # Many small calls; favour cheap + fast.

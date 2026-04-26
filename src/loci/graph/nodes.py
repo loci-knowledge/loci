@@ -166,6 +166,86 @@ class NodeRepository:
                 self._write_embedding(node.id, embedding)
         return node
 
+    def update_locus(
+        self,
+        node_id: str,
+        *,
+        relation_md: str | None = None,
+        overlap_md: str | None = None,
+        source_anchor_md: str | None = None,
+        angle: str | None = None,
+        new_embedding: np.ndarray | None = None,
+        bump_dirty: bool = True,
+    ) -> None:
+        """Edit locus-specific slots on an interpretation node.
+
+        Caller should compute `new_embedding` using the updated slots so the
+        node's position in vec-space reflects the edit.
+        """
+        slots: list[str] = []
+        params: list[object] = []
+        if relation_md is not None:
+            slots.append("relation_md = ?")
+            params.append(relation_md)
+        if overlap_md is not None:
+            slots.append("overlap_md = ?")
+            params.append(overlap_md)
+        if source_anchor_md is not None:
+            slots.append("source_anchor_md = ?")
+            params.append(source_anchor_md)
+        if angle is not None:
+            slots.append("angle = ?")
+            params.append(angle)
+        if not slots and new_embedding is None:
+            return
+        with self._txn():
+            if slots:
+                params.append(node_id)
+                self.conn.execute(
+                    f"UPDATE interpretation_nodes SET {', '.join(slots)} WHERE node_id = ?",
+                    tuple(params),
+                )
+            self.conn.execute(
+                "UPDATE nodes SET updated_at = ? WHERE id = ?", (now_iso(), node_id)
+            )
+            if new_embedding is not None:
+                self._write_embedding(node_id, new_embedding, replace=True)
+            if bump_dirty:
+                self._mark_neighbors_dirty(node_id)
+
+    def hard_delete(self, node_id: str) -> None:
+        """Hard-delete an interpretation node and all incident edges.
+
+        The caller must snapshot project fan-out *before* calling this, then
+        publish edge.delete + node.delete events using those snapshots.
+        Only interpretation nodes are supported — raw nodes are managed by ingest.
+        """
+        n = self.get(node_id)
+        if n is None:
+            raise ValueError(f"node {node_id} not found")
+        if n.kind == "raw":
+            raise ValueError("hard_delete does not support raw nodes")
+        with self._txn():
+            self.conn.execute(
+                "DELETE FROM edges WHERE src = ? OR dst = ?", (node_id, node_id)
+            )
+            self.conn.execute(
+                "DELETE FROM project_membership WHERE node_id = ?", (node_id,)
+            )
+            # workspace_membership may not exist in all migration states; ignore if missing.
+            try:
+                self.conn.execute(
+                    "DELETE FROM workspace_membership WHERE node_id = ?", (node_id,)
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self.conn.execute(
+                "DELETE FROM interpretation_nodes WHERE node_id = ?", (node_id,)
+            )
+            self.conn.execute("DELETE FROM node_vec WHERE node_id = ?", (node_id,))
+            self.conn.execute("DELETE FROM node_tags WHERE node_id = ?", (node_id,))
+            self.conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+
     def set_angle(
         self,
         node_id: str,

@@ -4,16 +4,23 @@ Powered by cyclopts (>=3) for typed CLIs without ceremony.
 
 Subcommands:
     loci server [--host] [--port] [--no-worker]
-    loci mcp                              MCP stdio server
+    loci mcp                              MCP stdio server (for Claude Code)
     loci worker [--poll-interval]
-    loci project create <slug> [--name] [--profile FILE]
+    loci project create <slug>            interactive setup wizard
+    loci project manage                   edit / delete existing projects
+    loci project bind <slug>              write .loci/project in cwd
     loci project list
     loci project info <slug>
-    loci scan <project> <root>            ingest a directory
+    loci workspace create/list/info/add-source/link/unlink/scan
+    loci scan <project>                   scan all linked workspaces
     loci q <project> <query> [--k] [--hyde]
     loci draft <project> <instruction> [--style] [--cite-density]
+    loci kickoff <project> [--n]          seed the interpretation graph
+    loci reflect <project>                manual reflect cycle
     loci absorb <project>
     loci graph export <project> [--output FILE]
+    loci rebuild <project>
+    loci reset
     loci status [project]
 """
 
@@ -655,11 +662,11 @@ def graph_export(
 
 @app.command
 def kickoff(project: str, n: int = 8) -> None:
-    """Generate the first set of question proposals for a project.
+    """Seed the interpretation graph with relationship observations.
 
-    Runs synchronously (CLI-blocking). Uses `interpretation_model`. After
-    completion, see proposals via `loci status <project>` or the REST
-    endpoint `GET /projects/:id/proposals`.
+    Reads the project profile + a sample of the workspace's raws and writes
+    5–8 live interpretation nodes (relevance, philosophy, decision) at
+    confidence 0.5. Runs synchronously (CLI-blocking).
     """
     from loci.db import migrate
     from loci.db.connection import connect
