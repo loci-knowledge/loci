@@ -47,33 +47,56 @@ def test_dedup_by_content_hash(conn):
     assert found is not None and found.id == node.id
 
 
-def test_symmetric_edge_creates_reciprocal(conn):
+def test_derives_from_is_directed(conn):
+    """derives_from is a directed edge — no reciprocal is created."""
     repo_n = NodeRepository(conn)
     repo_e = EdgeRepository(conn)
     a = InterpretationNode(subkind="decision", title="A", body="a", origin="user_explicit_create")
     b = InterpretationNode(subkind="decision", title="B", body="b", origin="user_explicit_create")
     repo_n.create_interpretation(a)
     repo_n.create_interpretation(b)
-    edges = repo_e.create(a.id, b.id, type="semantic")
-    assert len(edges) == 2
-    src_dst = {(e.src, e.dst) for e in edges}
-    assert (a.id, b.id) in src_dst and (b.id, a.id) in src_dst
-
-
-def test_semantic_creates_reciprocal(conn):
-    repo_n = NodeRepository(conn)
-    repo_e = EdgeRepository(conn)
-    a = InterpretationNode(subkind="decision", title="A", body="a", origin="user_explicit_create")
-    b = InterpretationNode(subkind="decision", title="B", body="b", origin="user_explicit_create")
-    repo_n.create_interpretation(a)
-    repo_n.create_interpretation(b)
-    repo_e.create(a.id, b.id, type="semantic")
-    edges = conn.execute(
-        "SELECT src, dst, type FROM edges WHERE src IN (?,?) AND dst IN (?,?)",
+    edge = repo_e.create(a.id, b.id, type="derives_from")
+    assert edge.src == a.id and edge.dst == b.id
+    rows = conn.execute(
+        "SELECT src, dst FROM edges WHERE src IN (?,?) AND dst IN (?,?)",
         (a.id, b.id, a.id, b.id),
     ).fetchall()
-    assert len(edges) == 2
-    assert all(e["type"] == "semantic" for e in edges)
+    assert len(rows) == 1
+
+
+def test_derives_from_cycle_rejected(conn):
+    from loci.graph.edges import EdgeError
+    repo_n = NodeRepository(conn)
+    repo_e = EdgeRepository(conn)
+    a = InterpretationNode(subkind="decision", title="A", body="a", origin="user_explicit_create")
+    b = InterpretationNode(subkind="decision", title="B", body="b", origin="user_explicit_create")
+    c = InterpretationNode(subkind="decision", title="C", body="c", origin="user_explicit_create")
+    for n in (a, b, c):
+        repo_n.create_interpretation(n)
+    repo_e.create(a.id, b.id, type="derives_from")
+    repo_e.create(b.id, c.id, type="derives_from")
+    # Closing the cycle c → a must be rejected.
+    with pytest.raises(EdgeError):
+        repo_e.create(c.id, a.id, type="derives_from")
+
+
+def test_cites_direction_enforced(conn):
+    from loci.graph.edges import EdgeError
+    repo_n = NodeRepository(conn)
+    repo_e = EdgeRepository(conn)
+    a = InterpretationNode(subkind="decision", title="A", body="a", origin="user_explicit_create")
+    raw = RawNode(
+        subkind="md", title="R", body="r",
+        content_hash="cccccccccccccccc", canonical_path="/tmp/r.md",
+        mime="text/markdown", size_bytes=1,
+    )
+    repo_n.create_interpretation(a)
+    repo_n.create_raw(raw)
+    # Valid direction: interp → raw.
+    repo_e.create(a.id, raw.id, type="cites")
+    # Invalid: raw → interp.
+    with pytest.raises(EdgeError):
+        repo_e.create(raw.id, a.id, type="cites")
 
 
 def test_edge_create_idempotent(conn):
@@ -83,10 +106,10 @@ def test_edge_create_idempotent(conn):
     b = InterpretationNode(subkind="decision", title="B", body="b", origin="user_explicit_create")
     repo_n.create_interpretation(a)
     repo_n.create_interpretation(b)
-    repo_e.create(a.id, b.id, type="semantic")
-    repo_e.create(a.id, b.id, type="semantic")
+    repo_e.create(a.id, b.id, type="derives_from")
+    repo_e.create(a.id, b.id, type="derives_from")
     n_edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-    assert n_edges == 2  # 1 forward + 1 reciprocal, no duplicates
+    assert n_edges == 1
 
 
 def test_dirty_propagates_one_hop(conn):
@@ -96,7 +119,7 @@ def test_dirty_propagates_one_hop(conn):
     b = InterpretationNode(subkind="decision", title="B", body="b", origin="user_explicit_create")
     repo_n.create_interpretation(a)
     repo_n.create_interpretation(b)
-    repo_e.create(a.id, b.id, type="semantic")
+    repo_e.create(a.id, b.id, type="derives_from")
     repo_n.update_body(a.id, body="updated body")
     b_status = conn.execute("SELECT status FROM nodes WHERE id=?", (b.id,)).fetchone()["status"]
     assert b_status == "dirty"

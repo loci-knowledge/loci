@@ -16,27 +16,22 @@ dependencies = [
     "websockets>=13",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",
-
     # Storage
     # sqlite-vec ships a loadable extension we attach at connection time. See
     # `loci/db/connection.py`. The Python wheel bundles the .dylib/.so/.dll.
     "sqlite-vec>=0.1.6",
-
     # Embeddings (local). sentence-transformers handles model loading + batching.
     # Default model is BAAI/bge-small-en-v1.5 (384-dim) for footprint; configurable.
     "sentence-transformers>=3,<5",
-
     # Document extraction
     # pymupdf is AGPL — we ship as optional to keep the core MIT-clean. PDFs without
     # it fall through to pypdf. See `loci/ingest/extractors.py`.
     "pypdf>=5,<6",
     "beautifulsoup4>=4.12,<5",
     "markdown-it-py>=3,<4",
-
     # Graph / numerics
     "numpy>=1.26,<3",
     "scipy>=1.13,<2",
-
     # LLM. pydantic-ai is provider-neutral (Anthropic, OpenAI, OpenRouter, …).
     # We build per-task Agent instances; each task's model is configured by
     # spec string, e.g. "anthropic:claude-opus-4-7" or "openrouter:google/gemini-2.0-flash-exp".
@@ -44,17 +39,15 @@ dependencies = [
     # with — the meta `pydantic-ai` package pulls `huggingface-hub>=1.3.4`,
     # which conflicts with sentence-transformers' `<1` pin.
     "pydantic-ai-slim[anthropic,openai]>=1.87,<2",
-
     # CLI. cyclopts (>=3) is type-hint-driven, supports Union/Literal/docstring
     # help cleanly. Chosen over typer because typer can't surface Literal/Union
     # in --help and forces a `Annotated[X, typer.Option(...)]` ceremony for
     # things cyclopts derives from the type hint. See research note in commit log.
     "cyclopts>=3,<5",
-    "rich>=13,<14",
-
+    "rich>=13",
+    "textual>=0.80",
     # MCP (Model Context Protocol)
     "mcp>=1.2,<2",
-
     # IDs + utilities
     "ulid-py>=1.1,<2",
     "httpx>=0.27,<1",

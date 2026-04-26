@@ -25,7 +25,13 @@ from typing import Literal
 
 from loci.graph.models import new_id, now_iso
 
-TraceKind = Literal["retrieved", "cited", "edited", "accepted", "rejected", "pinned"]
+TraceKind = Literal[
+    "retrieved", "cited", "edited", "accepted", "rejected", "pinned",
+    "cited_kept", "cited_dropped", "cited_replaced", "requery",
+    "agent_synthesised", "agent_reinforced", "agent_softened",
+    "agent_updated_angle",
+    "routed_via", "route_target",
+]
 
 
 @dataclass
@@ -35,6 +41,9 @@ class ResponseRecord:
     request: dict
     output: str
     cited_node_ids: list[str]
+    # Per-raw provenance: list of {raw_id, raw_title, interp_path: [{id, edge, to}]}.
+    # Empty for retrieve calls; populated by draft/q.
+    trace_table: list[dict] = field(default_factory=list)
     client: str = "unknown"
     id: str = field(default_factory=new_id)
     ts: str = field(default_factory=now_iso)
@@ -81,14 +90,16 @@ class CitationTracker:
             self.conn.execute(
                 """
                 INSERT INTO responses(id, project_id, session_id, request,
-                                       output, cited_node_ids, ts, client)
-                VALUES (?,?,?,?,?,?,?,?)
+                                       output, cited_node_ids, trace_table,
+                                       ts, client)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.id, record.project_id, record.session_id,
                     json.dumps(record.request),
                     record.output,
                     json.dumps(record.cited_node_ids),
+                    json.dumps(record.trace_table),
                     record.ts, record.client,
                 ),
             )
@@ -199,6 +210,7 @@ class CitationTracker:
         ).fetchone()
         if row is None:
             return None
+        keys = row.keys()
         return {
             "id": row["id"],
             "project_id": row["project_id"],
@@ -206,6 +218,10 @@ class CitationTracker:
             "request": json.loads(row["request"]),
             "output": row["output"],
             "cited_node_ids": json.loads(row["cited_node_ids"]),
+            "trace_table": (
+                json.loads(row["trace_table"]) if "trace_table" in keys
+                and row["trace_table"] else []
+            ),
             "ts": row["ts"],
             "client": row["client"],
         }

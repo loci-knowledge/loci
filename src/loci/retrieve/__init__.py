@@ -1,20 +1,40 @@
-"""Retrieval pipeline — lex + vec + HyDE + Personalized PageRank.
+"""Retrieval pipeline — interpretation-routed.
 
-The composition is:
+The new model:
 
-    1. Lexical search       (FTS5 BM25 against nodes_fts)
-    2. Vector search        (sqlite-vec ANN against node_vec)
-    3. HyDE search          (LLM-generated hypothetical answer → embed → vec ANN)
-    4. Anchor selection     (caller-provided OR project pinned + top-k vec)
-    5. Personalised PageRank (sparse, seeded by anchors, over the interp graph)
-    6. Reciprocal-rank fusion of (lex, vec, hyde, PPR) → final ranking
-    7. Project membership + status filter
-    8. `why` string assembly from the matching channels
+    Interpretations are LOCI OF THOUGHT (routers), not retrieval targets.
+    A query reaches raws via the loci that point at them.
 
-Each step is its own module so the orchestration in `pipeline.py` reads as a
-recipe. The shape of the result is documented in `pipeline.RetrievedNode`.
+Stages (see `pipeline.Retriever.retrieve` for the recipe):
+
+    1. INTERP STAGE   — lex + vec + (HyDE) + PPR over the derives_from DAG,
+                         RRF-fused → top-K_interp routing loci.
+    2. ROUTE STAGE    — walk cites and derives_from·cites from the top loci
+                         to raws, accumulating a per-raw provenance trace.
+    3. DIRECT STAGE   — also score raws directly so we don't miss raws that
+                         match the query without a routing locus.
+    4. MERGE          — direct score + routed bonus (capped) → final raws.
+    5. RESPONSE       — `nodes` (raws), `routing_interps` (the loci used as
+                         routers), `trace_table` (per-raw interp path).
+
+The shape of the result is documented in `pipeline.RetrievedNode` and
+`pipeline.RetrievalResponse`.
 """
 
-from loci.retrieve.pipeline import RetrievalRequest, RetrievedNode, Retriever
+from loci.retrieve.pipeline import (
+    RetrievalRequest,
+    RetrievalResponse,
+    RetrievedNode,
+    Retriever,
+    RouteHop,
+    RoutingInterp,
+)
 
-__all__ = ["RetrievalRequest", "RetrievedNode", "Retriever"]
+__all__ = [
+    "RetrievalRequest",
+    "RetrievalResponse",
+    "RetrievedNode",
+    "Retriever",
+    "RouteHop",
+    "RoutingInterp",
+]

@@ -47,8 +47,6 @@ app = App(
 )
 project_app = App(name="project", help="Project commands.")
 app.command(project_app)
-source_app = App(name="source", help="Manage scan roots for a project.")
-app.command(source_app)
 workspace_app = App(name="workspace", help="Information workspace commands.")
 app.command(workspace_app)
 graph_app = App(name="graph", help="Export graph visualizations.")
@@ -110,19 +108,44 @@ def project_create(
     slug: str,
     name: str | None = None,
     profile: Path | None = None,
+    yes: bool = False,
 ) -> None:
-    """Create a project. Reads the profile markdown from FILE if provided."""
+    """Create a project.
+
+    Launches the interactive TUI wizard when stdin is a terminal. Pass
+    --yes (or pipe input) to skip the wizard and create non-interactively.
+    """
+    import sys
+
     from loci.db import migrate
     from loci.db.connection import connect
-    from loci.graph import Project, ProjectRepository
 
     migrate()
     conn = connect()
-    profile_md = profile.read_text() if profile else ""
-    proj = ProjectRepository(conn).create(Project(
-        slug=slug, name=name or slug, profile_md=profile_md,
-    ))
-    console.print(f"[green]created[/green] [bold]{proj.slug}[/bold] ({proj.id})")
+
+    if sys.stdin.isatty() and not yes:
+        from loci.tui import run_wizard
+        run_wizard(conn, slug_hint=slug)
+    else:
+        from loci.graph import Project, ProjectRepository
+        profile_md = profile.read_text() if profile else ""
+        proj = ProjectRepository(conn).create(Project(
+            slug=slug, name=name or slug, profile_md=profile_md,
+        ))
+        conn.commit()
+        console.print(f"[green]created[/green] [bold]{proj.slug}[/bold] ({proj.id})")
+
+
+@project_app.command(name="manage")
+def project_manage() -> None:
+    """Open the interactive TUI project manager (list, edit, delete, create)."""
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.tui import run_wizard
+
+    migrate()
+    conn = connect()
+    run_wizard(conn)
 
 
 @project_app.command(name="bind")
@@ -178,37 +201,20 @@ def project_info(slug: str) -> None:
 
 
 @app.command
-def scan(project: str, root: Path | None = None) -> None:
-    """Walk a directory and ingest every supported file into a project.
-
-    If `root` is omitted, walks every registered source for the project
-    (see `loci source add`).
-    """
+def scan(project: str) -> None:
+    """Scan every workspace linked to a project (workspaces own source roots)."""
     from loci.db import migrate
     from loci.db.connection import connect
-    from loci.graph import ProjectRepository
-    from loci.ingest import scan_path, scan_registered_sources
+    from loci.ingest.pipeline import scan_project
 
     migrate()
     conn = connect()
-    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
-    if proj is None:
-        console.print(f"[red]no such project:[/red] {project}")
-        raise SystemExit(1)
-    res = (
-        scan_path(conn, proj.id, root)
-        if root is not None
-        else scan_registered_sources(conn, proj.id)
-    )
+    proj = _resolve_project(conn, project)
+    res = scan_project(conn, proj.id)
     console.print({"scanned": res.scanned, "new_raw": res.new_raw,
                     "deduped": res.deduped, "skipped": res.skipped,
                     "members_added": res.members_added,
                     "errors": res.errors[:5]})
-
-
-# ---------------------------------------------------------------------------
-# Source-root commands
-# ---------------------------------------------------------------------------
 
 
 def _resolve_project(conn, project_str: str):
@@ -219,54 +225,6 @@ def _resolve_project(conn, project_str: str):
         console.print(f"[red]no such project:[/red] {project_str}")
         raise SystemExit(1)
     return proj
-
-
-@source_app.command(name="add")
-def source_add(project: str, root: Path, label: str | None = None) -> None:
-    """Register a directory as a scan root for the project."""
-    from loci.db import migrate
-    from loci.db.connection import connect
-    from loci.graph import SourceRepository
-
-    migrate()
-    conn = connect()
-    proj = _resolve_project(conn, project)
-    src = SourceRepository(conn).add(proj.id, root, label=label)
-    console.print(f"[green]registered[/green] {src.root_path} (id={src.id})")
-
-
-@source_app.command(name="list")
-def source_list(project: str) -> None:
-    """List registered scan roots for a project."""
-    from loci.db import migrate
-    from loci.db.connection import connect
-    from loci.graph import SourceRepository
-
-    migrate()
-    conn = connect()
-    proj = _resolve_project(conn, project)
-    srcs = SourceRepository(conn).list(proj.id)
-    if not srcs:
-        console.print("[dim]no sources registered[/dim]")
-        return
-    table = Table("id", "root_path", "label", "last_scanned_at")
-    for s in srcs:
-        table.add_row(s.id, s.root_path, s.label or "", s.last_scanned_at or "—")
-    console.print(table)
-
-
-@source_app.command(name="remove")
-def source_remove(project: str, source: str) -> None:
-    """Remove a scan root by id or path."""
-    from loci.db import migrate
-    from loci.db.connection import connect
-    from loci.graph import SourceRepository
-
-    migrate()
-    conn = connect()
-    proj = _resolve_project(conn, project)
-    ok = SourceRepository(conn).remove(proj.id, source)
-    console.print("[green]removed[/green]" if ok else "[red]not found[/red]")
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +397,38 @@ def query(
     resp = Retriever(conn).retrieve(RetrievalRequest(
         project_id=proj.id, query=query, k=k, hyde=hyde,
     ))
+    # Top-line: the raws this query landed on.
     table = Table("kind", "subkind", "title", "score", "why", show_lines=False)
     for n in resp.nodes:
         table.add_row(n.kind, n.subkind, n.title, f"{n.score:.4f}", n.why)
     console.print(table)
+
+    # Routing loci side panel — the loci of thought used to reach those raws.
+    if resp.routing_interps:
+        console.rule("routing loci of thought")
+        rl_table = Table("subkind", "title", "angle", "score", show_lines=False)
+        for ri in resp.routing_interps[:10]:
+            rl_table.add_row(
+                ri.subkind, ri.title, ri.angle or "—", f"{ri.score:.4f}",
+            )
+        console.print(rl_table)
+
+    # Trace table — for each raw, the interp path that routed to it.
+    if resp.trace_table:
+        console.rule("trace (raw ← locus path)")
+        tr_table = Table("raw", "interp path", show_lines=False)
+        nodes_by_id = {ri.node_id: ri for ri in resp.routing_interps}
+        for row in resp.trace_table[:k]:
+            path_strs = []
+            seen: set[str] = set()
+            for hop in row["interp_path"]:
+                for iid in (hop["id"], hop["to"] if hop["edge"] == "derives_from" else None):
+                    if iid and iid not in seen:
+                        seen.add(iid)
+                        ri = nodes_by_id.get(iid)
+                        path_strs.append(f"[{ri.subkind if ri else '?'}] {ri.title if ri else iid[:8]}")
+            tr_table.add_row(row["raw_title"][:60], " → ".join(path_strs) or "—")
+        console.print(tr_table)
 
 
 @app.command
@@ -474,9 +460,24 @@ def draft(
     ))
     console.rule("draft")
     console.print(res.output_md)
-    console.rule("citations")
+    console.rule("citations (raws)")
+    nodes_by_id = {rl.node_id: rl for rl in res.routing_loci}
     for c in res.citations:
-        console.print(f"  [{c.kind}/{c.subkind}] {c.title!r} — {c.why_cited}")
+        line = f"  [{c.kind}/{c.subkind}] {c.title!r} — {c.why_cited}"
+        if c.routed_by:
+            routers = []
+            for iid in c.routed_by[:3]:
+                rl = nodes_by_id.get(iid)
+                routers.append(f"{rl.subkind}:{rl.title}" if rl else iid[:8])
+            line += f"\n    routed_via: {' → '.join(routers)}"
+        console.print(line)
+    if res.routing_loci:
+        console.rule("loci of thought (routing context)")
+        for rl in res.routing_loci[:8]:
+            console.print(
+                f"  [{rl.subkind}{f'/{rl.angle}' if rl.angle else ''}] {rl.title}\n"
+                f"    relation: {rl.relation_md[:160]}"
+            )
     console.print(f"\n[dim]response_id: {res.response_id}[/dim]")
 
 
@@ -643,6 +644,96 @@ def kickoff(project: str, n: int = 8) -> None:
     run_once(conn)
     j = get_job(conn, jid)
     console.print(j)
+
+
+@app.command
+def reset(yes: bool = False) -> None:
+    """Wipe the loci database. Destructive — drops every node, edge, project,
+    workspace, response, and job. Re-creates the schema empty.
+
+    Use this after a schema rewrite (e.g. the DAG migration) when you want a
+    clean slate. Pass --yes to skip the confirmation prompt.
+    """
+    settings = get_settings()
+    db_path = settings.db_path
+    blob_dir = settings.blob_dir
+    console.print(f"[red]This will delete:[/red]\n  • {db_path}\n  • all blobs under {blob_dir}")
+    if not yes:
+        ans = input("Type 'wipe' to confirm: ").strip().lower()
+        if ans != "wipe":
+            console.print("[yellow]aborted[/yellow]")
+            return
+    import shutil
+    if db_path.exists():
+        db_path.unlink()
+    # WAL/SHM sidecars
+    for sidecar in (db_path.with_suffix(db_path.suffix + "-wal"),
+                    db_path.with_suffix(db_path.suffix + "-shm")):
+        if sidecar.exists():
+            sidecar.unlink()
+    if blob_dir.exists():
+        shutil.rmtree(blob_dir)
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    # Re-create schema empty so the next CLI call doesn't trip the migration runner.
+    from loci.db import migrate
+    migrate()
+    console.print("[green]reset complete[/green] — run `loci workspace create`, "
+                  "`loci workspace add-source`, `loci workspace scan`, "
+                  "`loci project create`, `loci workspace link`, `loci kickoff`.")
+
+
+@app.command
+def rebuild(project: str, n: int = 6) -> None:
+    """Re-link, re-scan, and re-interpret a project from scratch.
+
+    Drops every interpretation node currently in this project, re-scans every
+    workspace linked to it, then runs kickoff to regenerate the loci-of-thought
+    layer. Raw nodes and workspace memberships are preserved (the user's
+    sources are the source of truth). Use this after the DAG migration to
+    regenerate loci with the new prompt + schema.
+    """
+    from loci.db import migrate
+    from loci.db.connection import connect, transaction
+    from loci.graph.workspaces import WorkspaceRepository
+    from loci.ingest.pipeline import scan_workspace
+    from loci.jobs import enqueue
+    from loci.jobs.queue import get_job
+    from loci.jobs.worker import run_once
+
+    migrate()
+    conn = connect()
+    proj = _resolve_project(conn, project)
+
+    # Drop interpretation nodes that belong to this project. Edge FKs cascade.
+    with transaction(conn):
+        conn.execute(
+            """
+            DELETE FROM nodes WHERE id IN (
+                SELECT n.id FROM nodes n
+                JOIN project_membership pm ON pm.node_id = n.id
+                WHERE pm.project_id = ? AND n.kind = 'interpretation'
+            )
+            """,
+            (proj.id,),
+        )
+    interp_dropped = conn.total_changes
+    console.print(f"[yellow]dropped {interp_dropped} interpretation node(s)[/yellow]")
+
+    # Re-scan every linked workspace (raws are content-addressed — re-scan is idempotent).
+    ws_repo = WorkspaceRepository(conn)
+    links = ws_repo.linked_workspaces(proj.id)
+    for ws, link in links:
+        if link.role == "excluded":
+            continue
+        res = scan_workspace(conn, ws.id)
+        console.print(f"[green]rescanned[/green] {ws.slug}: "
+                      f"new_raw={res.new_raw} deduped={res.deduped} skipped={res.skipped}")
+
+    # Kick off the loci-of-thought generation.
+    jid = enqueue(conn, kind="kickoff", project_id=proj.id, payload={"n": n})
+    console.print(f"[dim]enqueued kickoff {jid}; running...[/dim]")
+    run_once(conn)
+    console.print(get_job(conn, jid))
 
 
 @app.command

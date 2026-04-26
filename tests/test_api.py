@@ -62,14 +62,14 @@ def test_create_interp_and_edge(loci_dir, fake_embedder, tmp_path):
             "project_id": pid, "subkind": "decision", "title": "T2", "body": "b2",
             "origin": "user_explicit_create",
         }).json()["node_id"]
-        r = c.post("/edges", json={"src": n1, "dst": n2, "type": "semantic"})
+        r = c.post("/edges", json={"src": n1, "dst": n2, "type": "derives_from"})
         assert r.status_code == 201
-        assert len(r.json()["edges"]) == 2  # symmetric → reciprocal
+        assert len(r.json()["edges"]) == 1  # directed, no reciprocal
 
         r = c.get(f"/nodes/{n1}")
         assert r.status_code == 200
         edges_out = [e["type"] for e in r.json()["edges_out"]]
-        assert "semantic" in edges_out
+        assert "derives_from" in edges_out
 
 
 def test_response_expansion(loci_dir, fake_embedder, tmp_path):

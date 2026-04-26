@@ -25,6 +25,7 @@ from loci.api.publishers import (
     publish_edge_upsert,
 )
 from loci.graph import EdgeRepository, NodeRepository
+from loci.graph.edges import EdgeError
 from loci.graph.models import EdgeType
 
 router = APIRouter(prefix="/edges", tags=["edges"])
@@ -44,10 +45,15 @@ def create_edge(
     nodes_repo = NodeRepository(conn)
     if nodes_repo.get(body.src) is None or nodes_repo.get(body.dst) is None:
         raise HTTPException(404, detail="src or dst not found")
-    edges = EdgeRepository(conn).create(body.src, body.dst, body.type, weight=body.weight)
-    for e in edges:
-        publish_edge_upsert(conn, e)
-    return {"edges": [e.model_dump() for e in edges]}
+    try:
+        edge = EdgeRepository(conn).create(
+            body.src, body.dst, body.type, weight=body.weight,
+        )
+    except EdgeError as exc:
+        # Direction violation, self-loop, or DAG cycle.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    publish_edge_upsert(conn, edge)
+    return {"edges": [edge.model_dump()]}
 
 
 @router.delete("/{edge_id}")

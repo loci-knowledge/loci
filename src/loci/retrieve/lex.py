@@ -44,12 +44,18 @@ def search(
     *,
     k: int = 20,
     include_status: tuple[str, ...] = ("live", "dirty"),
+    kind: str | None = None,
 ) -> list[LexHit]:
-    """Run a BM25 search filtered to project + status. Returns ranked LexHits."""
+    """Run a BM25 search filtered to project + status (+ optional kind).
+
+    `kind` may be 'raw' or 'interpretation' to restrict to one layer of the
+    DAG; None for both.
+    """
     fts_query = _sanitise_fts5_query(query)
     if not fts_query:
         return []
     status_placeholders = ",".join("?" * len(include_status))
+    kind_clause = "AND n.kind = ?" if kind else ""
     sql = f"""
         SELECT
             f.node_id        AS node_id,
@@ -61,10 +67,15 @@ def search(
         WHERE nodes_fts MATCH ?
           AND pm.project_id = ?
           AND n.status IN ({status_placeholders})
+          {kind_clause}
         ORDER BY bm25
         LIMIT ?
     """
-    rows = conn.execute(sql, (fts_query, project_id, *include_status, k)).fetchall()
+    params: tuple = (fts_query, project_id, *include_status)
+    if kind:
+        params = (*params, kind)
+    params = (*params, k)
+    rows = conn.execute(sql, params).fetchall()
     matched_terms = _terms(query)
     return [
         LexHit(

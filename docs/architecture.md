@@ -60,20 +60,34 @@ Projects no longer own source roots directly; source roots belong to
 workspaces. One workspace can serve N projects; a raw node scanned into a
 workspace becomes available to all linked projects without re-embedding.
 
-### 2. Interpretation graph — `InterpretationNode`s + `Edge`s
+### 2. Interpretation DAG — loci of thought
 
-Your distillations. Four subkinds:
+The interpretation layer is a strict directed acyclic graph. Each
+interpretation is a *locus of thought* — a pointer that says "the part of
+THIS source over here meets the part of THIS project over there, in this
+specific way." Loci do not summarise sources; they route retrieval to the
+parts of sources that matter.
 
-- `philosophy` — first-principle belief that grounds the project's direction
-- `tension` — open question or unresolved conflict (kickoff writes these; they assert nothing and invite reasoning; confidence 0.5)
-- `decision` — concrete choice with named trade-offs
-- `relevance` — typed bridge between workspace(s) and the project's intent; always multi-source (cites ≥2 raws), requires `angle`
+Every locus has three required slots:
+- `relation_md` — how the source(s) relate to *this project*
+- `overlap_md` — the concrete intersection (where they meet)
+- `source_anchor_md` — which part of which source carries the weight (quote, section, function, line range)
 
-Edges are typed: `cites` (interp→raw, grounds interpretations in sources),
-`semantic` (interp↔interp, symmetric — meaning-based relationships created by
-the reflect cycle and absorb passes), `actual` (raw↔raw, explicit dependencies
-like code imports or paper citations). `cites` edges are what become the
-`raw_supports[]` block in citations.
+Subkinds (the framing):
+- `philosophy` — first-principle belief the sources reveal the project should hold
+- `tension` — unresolved conflict between sources and project, or between two values the project must reconcile
+- `decision` — a concrete choice with explicit trade-offs
+- `relevance` — typed bridge across distinct sources; requires `angle` from a closed vocabulary; cite ≥2 raws
+
+Edge types (only two; both directed):
+- `cites` (interp → raw) — the locus points at the source it anchors. Raws
+  are leaves — they have no outgoing edges.
+- `derives_from` (interp → interp) — this locus builds on / specialises /
+  inherits routing from an upstream locus. Cycles are rejected at insert.
+
+There are **no symmetric edges**, no inverses, and no raw→raw edges. The
+absorb co-citation pass and the code-dependency extractor are gone — both
+violated either acyclicity or the raw-leaf rule.
 
 A node moves through a small state machine:
 
@@ -120,30 +134,52 @@ backup/`. Moving to a new machine is `rsync ~/.loci/`.
 
 ## Request flow
 
-### A retrieve call
+### A retrieve call (interpretation-routed)
 
 ```
 POST /projects/:id/retrieve { query, k, anchors?, hyde? }
    │
    ▼
-loci.retrieve.Retriever
-   ├─ lex.search()          BM25 over nodes_fts
-   ├─ vec.search_text()     embed(query) → ANN over node_vec
-   ├─ hyde.hypothesize()    LLM(query) → embed → ANN  (only if hyde=True)
-   ├─ ppr.run(anchors)      sparse PPR over interp graph
-   │      anchors = caller-supplied OR pinned ∪ top-k vec hits
-   └─ RRF fusion (k=60)     reciprocal rank fusion of all four channels
+loci.retrieve.Retriever  ── 5-stage interpretation-routed pipeline
+   │
+   ├─ STAGE 1: score loci of thought
+   │     lex.search(kind=interpretation)         BM25 over locus titles + slots
+   │     vec.search_text(kind=interpretation)    ANN over locus embeddings
+   │     hyde.hypothesize() → vec  (optional)
+   │     ppr.run(anchors)   sparse PPR over the derives_from DAG
+   │           anchors = caller ∪ pinned ∪ top-vec interp hits
+   │     RRF-fuse → top-K_interp routing loci
+   │
+   ├─ STAGE 2: route from loci to raws
+   │     for each top locus L (score s):
+   │       for each cites L→R:                   raw R += s · GAIN
+   │       for each derives_from L→U:            (depth 2)
+   │         for each cites U→R:                 raw R += s · DECAY · GAIN
+   │     trace[R] += hops along the way
+   │
+   ├─ STAGE 3: score raws directly
+   │     lex.search(kind=raw) + vec.search_text(kind=raw) + hyde
+   │     RRF-fuse → direct raw scores
+   │
+   ├─ STAGE 4: merge
+   │     final[R] = direct[R] + min(BONUS_CAP, routed[R])
+   │
+   └─ STAGE 5: filter (default include=raw) + materialise
    │
    ▼
-materialise nodes (incl. snippets) →
 update access_count, last_accessed_at →
-write Response + per-node Trace rows →
+write Response (with trace_table JSON) + per-node Trace rows →
 enqueue lightweight reflect (if MCP, with 5-min cooldown) →
-return { nodes[], citations[], trace_id }
+return {
+  nodes[]:           ranked raws (each with per-node trace)
+  routing_loci[]:    the loci used as routers (UI side panel)
+  trace_table[]:     per-raw interp path (for the user-visible provenance)
+  trace_id
+}
 ```
 
-`why` strings are derived per-node from the channels that matched —
-no extra LLM call.
+Loci are not citable content. They are returned alongside raws as routing
+context, never as the answer.
 
 ### Awareness endpoints
 
@@ -168,26 +204,40 @@ what the agent has been adding or modifying.
 POST /projects/:id/draft { instruction, context_md?, style, cite_density }
    │
    ▼
-Retriever.retrieve()             # same pipeline as above, k=12 by default
+Retriever.retrieve()             # interpretation-routed pipeline, k=12 default
    │
    ▼
-build candidate block:
-    [C1] kind=interpretation/pattern title="…" why-retrieved="…"
+build candidate block — RAWS ONLY:
+    [C1] kind=raw/pdf title="…" why-retrieved="matched the query directly"
          <= 800 chars body
+    ROUTING-CONTEXT (loci that point at this raw — DO NOT CITE):
+      - [philosophy] CLI bridges loki-frontend and loci-backend (angle=…)
+        relation: …
+        anchor:   …
     [C2] kind=raw/md title="…" …
     …
    │
    ▼
 pydantic-ai Agent (Settings.rag_model, instructions=SYSTEM_PROMPT cached)
-   │  user msg: instruction + context_md? + candidate block + style/density hints
-   │  output: markdown with [Cn] inline citations
+   │  user msg: instruction + context_md? + candidate block + style/density
+   │  output: markdown with [Cn] markers — citations land on RAWS only
    ▼
 parse [Cn] markers → drop unknown handles (anti-fabrication) →
-look up `cites→raw` for each cited interpretation (raw_supports[]) →
-write Response + Traces (cited + retrieved) →
+build citations[] (raws + their routed_by interp ids) +
+       routing_loci[] (deduped loci side panel) +
+       trace_table[] (per-raw interp path) →
+write Response (with trace_table JSON) + traces:
+       cited (per cited raw)
+       retrieved (per surfaced raw)
+       routed_via (per locus that served a cited raw)
+       route_target (per cited raw, for absorb statistics) →
 ENQUEUE reflect job (non-blocking — see "Reflection cycle" below) →
-return { output_md, citations[], response_id }
+return { output_md, citations[], routing_loci[], trace_table[], response_id }
 ```
+
+A draft never cites a locus. Loci are routing context only — the LLM sees
+them so it understands *why* a raw is the right anchor, but the citation
+lands on the raw because the raw is the actual evidence.
 
 ### Reflection cycle (silent, agentic, after every draft)
 
@@ -270,11 +320,14 @@ worker thread picks it up and runs jobs.absorb.run():
    5. detect_aliases       : cosine > 0.92 between interps → 'alias' proposals
    6. detect_forgetting    : low conf + no access N days → dismiss proposals
    7. contradiction_pass   : (LLM) for each new raw, classify against top-3 interps; tensions / reinforces
-   8. communities          : (igraph) Leiden over the interp graph
-   9. co_citation_edges    : find pairs of interpretation nodes that both cite the same raw
-                             (via existing `cites` edges); create `co_occurs` edges between them.
-                             Safe to re-run — idempotent. Also runs in kickoff as a post-write step.
+   8. communities          : (igraph) Leiden over the derives_from interp DAG
 ```
+
+The old co-citation pass (semantic edges) and code-dependency extractor
+(actual edges) are removed: they violated the DAG topology. Shared evidence
+between loci is now expressed by overlapping `cites` fan-outs, and any
+locus-to-locus relationship goes through `derives_from` (added by the
+interpreter agent or the user, not by post-hoc co-citation).
 
 The proposals from absorb are the *only* surface where the user is asked
 to make explicit decisions: file moves, near-duplicate merges, stale

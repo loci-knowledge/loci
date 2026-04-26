@@ -4,9 +4,15 @@ loci's interpretation layer is built and maintained by an **agent that runs
 silently after every draft**, not by a proposal queue. There is no "Accept /
 Reject / Edit" review surface for new interpretations. The agent observes
 what you cite, what you drop, and what you search for, then writes its
-conclusions directly into the live graph at conservative confidence. Over
-time those interpretations are reinforced or softened by your continued
-usage, without any explicit gesture from you.
+conclusions — *loci of thought*, never summaries — directly into the live
+DAG at conservative confidence. Over time those loci are reinforced or
+softened by your continued usage, without any explicit gesture from you.
+
+A locus has three required slots — `relation_md`, `overlap_md`,
+`source_anchor_md` — and either a `relevance` angle (closed vocabulary) or
+a `philosophy`/`tension`/`decision` framing. The agent never paraphrases a
+source; it identifies which part of which source matters for *this project*
+and why.
 
 ## When the agent fires
 
@@ -31,11 +37,11 @@ action is one of five kinds:
 
 | kind           | effect                                                            |
 |----------------|-------------------------------------------------------------------|
-| `create`       | Write a new interpretation node (`tension`, `decision`, `philosophy`, or `relevance` — see "Workspace context") at confidence 0.40, `origin=agent_synthesis`. Optionally link it into the existing graph. |
-| `reinforce`    | Bump an existing node's confidence by +0.05.                      |
-| `soften`       | Drop an existing node's confidence by −0.05.                      |
-| `link`         | Add a typed edge between two existing nodes (or between a newly-created node and an existing one). Valid types: `cites` (interp → raw), `semantic` (interp ↔ interp), `actual` (raw ↔ raw). |
-| `update_angle` | Retarget an existing `relevance` node's `angle` field and `rationale_md` without recreating the node. This is the RLHF refinement path for workspace-level relevance claims. |
+| `create`       | Write a new locus of thought (`tension`, `decision`, `philosophy`, or `relevance`) at confidence 0.40, `origin=agent_synthesis`. Every `create` populates the three slots: `relation_md`, `overlap_md`, `source_anchor_md`. Optionally links the new locus into the DAG. |
+| `reinforce`    | Bump an existing locus's confidence by +0.05.                     |
+| `soften`       | Drop an existing locus's confidence by −0.05.                     |
+| `link`         | Add a directed edge between two existing nodes (or between a newly-created locus and an existing one). Valid types: `cites` (interp → raw) and `derives_from` (interp → interp). The edge repository rejects direction violations and `derives_from` cycles. |
+| `update_angle` | Retarget an existing `relevance` locus's `angle` field without recreating the node. This is the refinement path for relevance routing.|
 
 ## Two-stage LLM pipeline
 

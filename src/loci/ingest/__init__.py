@@ -14,7 +14,6 @@ from loci.ingest.pipeline import (
     IngestResult,
     scan_path,
     scan_project,
-    scan_registered_sources,
     scan_workspace,
 )
 
@@ -23,6 +22,5 @@ __all__ = [
     "IngestResult",
     "scan_path",
     "scan_project",
-    "scan_registered_sources",
     "scan_workspace",
 ]

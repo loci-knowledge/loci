@@ -1,11 +1,18 @@
 """FastMCP server exposing the curated loci tools.
 
+The graph is now a directed acyclic graph: raws are leaves, interpretations
+("loci of thought") are inner nodes connected by `derives_from`, and `cites`
+edges run from a locus to the raw it points at. Retrieval routes the query
+through loci to surface raws + a per-raw trace; drafts cite the raws (never
+the loci) and ship a routing-locus side panel for the user to inspect.
+
 Tools:
     loci_retrieve(query, project?, k?, anchors?, hyde?)
     loci_draft(instruction, project?, context_md?, style?, cite_density?, k?)
     loci_expand_citation(response_id)
     loci_expand_node(node_id)
-    loci_propose_node(subkind, title, body, project?, cites?, related?)
+    loci_propose_node(subkind, title, relation_md, overlap_md, source_anchor_md,
+                      angle?, body?, project?, cites?, derives_from?)
     loci_accept_proposal(proposal_id)
     loci_absorb(project?)
     loci_feedback(response_id, edited_markdown)
@@ -15,6 +22,7 @@ Tools:
     loci_workspace_unlink(workspace, project?)
     loci_workspace_add_source(workspace, root_path, label?)
     loci_current_project()
+    loci_context(project?, hours?)
 
 All tools accept an optional `project` argument. When omitted, the project is
 auto-resolved via: LOCI_PROJECT env → .loci/project file walk-up from cwd.
@@ -55,23 +63,30 @@ def build_mcp_server() -> FastMCP:
     mcp = FastMCP(
         name="loci",
         instructions=(
-            "loci is a personal memory graph. Use `retrieve` to find prior "
-            "interpretations + raw sources for a topic, `draft` to write text "
-            "with cited evidence from the user's graph, `expand_citation` to "
-            "look up a previous response, and `propose_node` / "
-            "`accept_proposal` for graph mutation. Always prefer a draft over "
-            "raw retrieval when the user wants writing — drafts include the "
-            "citation block they need."
+            "loci is a personal memory DAG. Raws are leaves (the user's actual "
+            "sources); interpretations are 'loci of thought' — pointers that "
+            "say which part of which source matters and why. Use `retrieve` to "
+            "route a query through loci to the raws they point at; the "
+            "response includes raws, the loci that routed to them, and a "
+            "trace_table. Use `draft` to write text — citations land on raws "
+            "only (never on loci), with a routing_loci side panel for the user "
+            "to inspect the path. Use `expand_citation` to recover a past "
+            "response, `propose_node` to add a locus, and `accept_proposal` to "
+            "promote it. Prefer `draft` when the user wants writing — it "
+            "includes the trace and citation block they need."
         ),
     )
 
     @mcp.tool(
         name="loci_retrieve",
         description=(
-            "Search a loci project for relevant interpretations and raw "
-            "sources. Returns a ranked list of nodes with `why` strings "
-            "explaining how they matched. `project` is optional when "
-            "LOCI_PROJECT is set or a .loci/project file exists."
+            "Route a query through the user's loci-of-thought graph and "
+            "return the raw sources those loci point at. The response has: "
+            "`nodes` (ranked raws with per-node trace), `routing_loci` (the "
+            "loci that routed retrieval, with relation/overlap/source_anchor — "
+            "for context, NOT for citing), and `trace_table` (per-raw interp "
+            "path). `project` is optional when LOCI_PROJECT is set or a "
+            ".loci/project file exists."
         ),
     )
     def loci_retrieve(
@@ -92,7 +107,7 @@ def build_mcp_server() -> FastMCP:
             anchors=anchors or [], hyde=hyde,
         ))
         rid = CitationTracker(conn).write_response(
-            __record_for(project_id, query, k, hyde),
+            __record_for(project_id, query, k, hyde, trace_table=resp.trace_table),
             retrieved_node_ids=[n.node_id for n in resp.nodes],
         )
         # Enqueue a lightweight reflect if the project hasn't reflected recently.
@@ -103,19 +118,36 @@ def build_mcp_server() -> FastMCP:
                     "id": n.node_id, "kind": n.kind, "subkind": n.subkind,
                     "title": n.title, "snippet": n.snippet, "score": n.score,
                     "why": n.why,
+                    "trace": [
+                        {"id": h.src, "edge": h.edge_type, "to": h.dst}
+                        for h in n.trace
+                    ],
                 }
                 for n in resp.nodes
             ],
+            "routing_loci": [
+                {
+                    "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
+                    "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
+                    "source_anchor_md": ri.source_anchor_md,
+                    "angle": ri.angle, "score": ri.score,
+                }
+                for ri in resp.routing_interps
+            ],
+            "trace_table": resp.trace_table,
             "trace_id": rid,
         }
 
     @mcp.tool(
         name="loci_draft",
         description=(
-            "Write a markdown draft for a project, citing nodes from the "
-            "graph. Returns `output_md` plus a structured citations[] array. "
-            "Pass `context_md` if the user has draft text already. "
-            "`project` is optional when auto-resolution is configured."
+            "Write a markdown draft for a project. Citations land on RAW "
+            "sources only — loci of thought are surfaced separately as "
+            "routing context, not as citable content. Returns `output_md`, "
+            "`citations` (raws with their routing trace), `routing_loci` "
+            "(loci that pointed at the cited raws), and `trace_table` "
+            "(per-raw interp path). Pass `context_md` if the user has draft "
+            "text already."
         ),
     )
     def loci_draft(
@@ -143,7 +175,24 @@ def build_mcp_server() -> FastMCP:
         ))
         return {
             "output_md": result.output_md,
-            "citations": [c.__dict__ for c in result.citations],
+            "citations": [
+                {
+                    "node_id": c.node_id, "kind": c.kind, "subkind": c.subkind,
+                    "title": c.title, "why_cited": c.why_cited,
+                    "routed_by": c.routed_by,
+                }
+                for c in result.citations
+            ],
+            "routing_loci": [
+                {
+                    "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
+                    "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
+                    "source_anchor_md": rl.source_anchor_md,
+                    "angle": rl.angle, "score": rl.score,
+                }
+                for rl in result.routing_loci
+            ],
+            "trace_table": result.trace_table,
             "response_id": result.response_id,
         }
 
@@ -176,44 +225,71 @@ def build_mcp_server() -> FastMCP:
     @mcp.tool(
         name="loci_propose_node",
         description=(
-            "Propose a new interpretation node for the user's graph. The node "
-            "lands as `proposed` and surfaces in the proposal queue until the "
-            "user accepts or dismisses it. `subkind` must be one of: "
-            "tension, decision, philosophy, relevance."
+            "Propose a new locus of thought (interpretation node) for the "
+            "user's graph. A locus must have the three slots: relation_md "
+            "(how the source(s) relate to the project), overlap_md (the "
+            "concrete intersection), source_anchor_md (which part of which "
+            "source carries the weight). The locus lands as `proposed` until "
+            "the user accepts or dismisses it. `subkind` ∈ {tension, "
+            "decision, philosophy, relevance}; for `relevance` set `angle` "
+            "from the closed vocabulary. `cites` lists raw node ids the "
+            "locus points at; `derives_from` lists upstream loci this one "
+            "builds on."
         ),
     )
     def loci_propose_node(
         subkind: str,
         title: str,
-        body: str,
+        relation_md: str,
+        overlap_md: str,
+        source_anchor_md: str,
+        body: str = "",
+        angle: str | None = None,
         project: str | None = None,
         cites: list[str] | None = None,
-        related: dict[str, list[str]] | None = None,
+        derives_from: list[str] | None = None,
     ) -> dict[str, Any]:
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
             return {"error": str(e)}
+        from loci.graph.edges import EdgeError
+
         nodes_repo = NodeRepository(conn)
         edges_repo = EdgeRepository(conn)
         node = InterpretationNode(
             subkind=subkind,  # type: ignore[arg-type]
             title=title, body=body,
+            relation_md=relation_md, overlap_md=overlap_md,
+            source_anchor_md=source_anchor_md,
+            angle=angle,  # type: ignore[arg-type]
             origin="proposal_accepted",
             status="proposed",
             confidence=0.5,
         )
-        emb_text = f"{title}\n\n{body}".strip()
+        emb_text = "\n\n".join(p for p in [
+            title, relation_md, overlap_md, source_anchor_md,
+        ] if p).strip()
         emb = get_embedder().encode(emb_text) if emb_text else None
         nodes_repo.create_interpretation(node, embedding=emb)
         ProjectRepository(conn).add_member(project_id, node.id, role="included")
+
+        edge_errors: list[str] = []
         for raw_id in (cites or []):
-            edges_repo.create(node.id, raw_id, type="cites")
-        for typ, dst_ids in (related or {}).items():
-            for dst in dst_ids:
-                edges_repo.create(node.id, dst, type=typ)  # type: ignore[arg-type]
-        return {"node_id": node.id, "status": "proposed"}
+            try:
+                edges_repo.create(node.id, raw_id, type="cites")
+            except EdgeError as exc:
+                edge_errors.append(f"cites→{raw_id}: {exc}")
+        for upstream in (derives_from or []):
+            try:
+                edges_repo.create(node.id, upstream, type="derives_from")
+            except EdgeError as exc:
+                edge_errors.append(f"derives_from→{upstream}: {exc}")
+        result = {"node_id": node.id, "status": "proposed"}
+        if edge_errors:
+            result["edge_errors"] = edge_errors
+        return result
 
     @mcp.tool(
         name="loci_accept_proposal",
@@ -533,13 +609,18 @@ def build_mcp_server() -> FastMCP:
     return mcp
 
 
-def __record_for(project_id: str, query: str, k: int, hyde: bool):
+def __record_for(
+    project_id: str, query: str, k: int, hyde: bool,
+    *, trace_table: list[dict] | None = None,
+):
     """Build a ResponseRecord for a retrieve-only call (no output)."""
     from loci.citations import ResponseRecord
     return ResponseRecord(
         project_id=project_id, session_id="mcp",
         request={"query": query, "k": k, "hyde": hyde},
-        output="", cited_node_ids=[], client="mcp",
+        output="", cited_node_ids=[],
+        trace_table=trace_table or [],
+        client="mcp",
     )
 
 

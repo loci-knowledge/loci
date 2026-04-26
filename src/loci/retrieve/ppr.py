@@ -1,14 +1,13 @@
-"""Personalised PageRank over the interpretation graph.
+"""Personalised PageRank over the interpretation DAG.
 
-Reference: HippoRAG 2 (arXiv 2502.14802) for the dual-node + PPR pattern. We
-implement only the PPR step here; the dual-node split is encoded in the schema
-(raw vs interpretation nodes) and the orchestrator decides what to feed in.
+Reference: HippoRAG 2 (arXiv 2502.14802) for the dual-node + PPR pattern. The
+dual-node split (raw vs interpretation) is encoded in the schema — raws are
+leaves, interpretations form the inner DAG. PPR runs over the interp DAG only.
 
-The graph: nodes are *interpretation* node ids (raw nodes are leaves and don't
-participate in PPR). Edges are weighted; we use the `semantic` interp↔interp
-edge type. Direction matters — PPR walks the directed graph as-is. Symmetric
-edge types already have reciprocal rows in the table (see `loci/graph/edges.py`),
-so the random walk can move both ways.
+The graph: nodes are *interpretation* node ids. Edges are `derives_from`
+(directed, acyclic). PPR walks the DAG forward — a locus's PageRank flows to
+the loci that derive from it. We do not symmetrise; provenance is intentionally
+one-way in the new model.
 
 Math:
 
@@ -36,9 +35,9 @@ from scipy.sparse import csr_matrix
 
 from loci.config import get_settings
 
-# Edge types that participate in the random walk. `cites` and `actual` are
-# excluded because PPR runs over interpretation nodes only.
-PPR_EDGE_TYPES: tuple[str, ...] = ("semantic",)
+# Edge types that participate in the random walk. `cites` is excluded because
+# PPR runs over interpretation nodes only — `derives_from` is interp→interp.
+PPR_EDGE_TYPES: tuple[str, ...] = ("derives_from",)
 
 
 @dataclass

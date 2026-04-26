@@ -66,7 +66,6 @@ def create_app() -> FastAPI:
         proposals,
         responses,
         retrieve,
-        sources,
         workspaces,
     )
 
@@ -74,7 +73,6 @@ def create_app() -> FastAPI:
     app.include_router(anchors.router)
     app.include_router(context.router)
     app.include_router(workspaces.router)
-    app.include_router(sources.router)
     app.include_router(retrieve.router)
     app.include_router(draft.router)
     app.include_router(feedback.router)

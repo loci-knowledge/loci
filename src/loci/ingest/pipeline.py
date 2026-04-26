@@ -279,13 +279,3 @@ def scan_project(
         combined.errors.extend(partial.errors)
     return combined
 
-
-# Legacy alias so tests that haven't been updated yet keep working.
-# Deprecated: use scan_workspace() or scan_project() instead.
-def scan_registered_sources(
-    conn: sqlite3.Connection,
-    project_id: str,
-    *,
-    embedder: Embedder | None = None,
-) -> IngestResult:
-    return scan_project(conn, project_id, embedder=embedder)

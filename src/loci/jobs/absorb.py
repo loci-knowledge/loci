@@ -1,12 +1,6 @@
 """Absorb job — the checkpoint pipeline.
 
-PLAN.md §Background jobs: "Absorb runs the contradiction pass, rebuilds the
-proposal queue, replays traces into access_count / last_accessed_at /
-confidence, runs the orphan/broken-support/bloat audits, and re-runs
-community detection. It's expensive (multiple LLM calls); clients enqueue and
-don't block."
-
-We run the steps in dependency order:
+Steps run in dependency order:
 
     1. validate filesystem (raw source_of_truth audit)
     2. replay traces → access_count, confidence, last_accessed_at
@@ -17,6 +11,11 @@ We run the steps in dependency order:
     7. contradiction_pass (LLM-mediated; gated on Anthropic key)
     8. communities (igraph/leidenalg; gated on optional dep)
 
+Co-citation and code-dependency passes are gone with the DAG migration:
+co-citation produced symmetric semantic edges (cycles), and code-deps produced
+raw→raw `actual` edges (broke the raw-leaf rule). The DAG model expresses these
+relationships as overlapping `cites` fan-outs from interpretation nodes.
+
 Each step returns a summary dict; we collate them all into the job result.
 """
 
@@ -26,7 +25,6 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from loci.ingest.dependencies import extract_and_write as _extract_deps
 from loci.jobs import audits, communities, contradiction, proposals
 
 log = logging.getLogger(__name__)
@@ -65,50 +63,11 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     # 7. Contradiction pass (LLM-gated)
     summary["steps"]["contradiction"] = contradiction.run_pass(conn, project_id)
 
-    # 8. Communities (igraph-gated)
+    # 8. Communities (igraph-gated) — over the derives_from interp graph
     summary["steps"]["communities"] = communities.run(conn, project_id)
-
-    # 9. Co-citation edges — interp pairs that share a cited raw get semantic
-    summary["steps"]["co_citation"] = _update_co_citations(conn, project_id)
-
-    # 10. Code dependency edges — actual edges from import analysis
-    summary["steps"]["code_deps"] = _extract_deps(conn, project_id)
 
     log.info("absorb: done for project=%s", project_id)
     return summary
-
-
-def _update_co_citations(conn: sqlite3.Connection, project_id: str) -> dict:
-    """Add semantic edges between interpretation nodes that cite the same raw.
-
-    Safe to re-run: skips pairs that already have a co_occurs edge.
-    """
-    from loci.graph.models import new_id
-
-    pairs = conn.execute("""
-        SELECT DISTINCT e1.src AS a, e2.src AS b
-        FROM edges e1 JOIN edges e2 ON e1.dst = e2.dst AND e1.src < e2.src
-        WHERE e1.type = 'cites' AND e2.type = 'cites'
-          AND e1.src IN (SELECT node_id FROM interpretation_nodes)
-          AND e2.src IN (SELECT node_id FROM interpretation_nodes)
-          AND e1.src IN (SELECT node_id FROM project_effective_members WHERE project_id = ?)
-    """, (project_id,)).fetchall()
-
-    added = 0
-    for pair in pairs:
-        a, b = pair[0], pair[1]
-        if not conn.execute(
-            "SELECT 1 FROM edges WHERE src=? AND dst=? AND type='semantic'", (a, b)
-        ).fetchone():
-            conn.execute(
-                "INSERT INTO edges(id, src, dst, type, weight, created_by, created_at)"
-                " VALUES (?,?,?,?,?,?,datetime('now'))",
-                (new_id(), a, b, "semantic", 1.0, "system"),
-            )
-            added += 1
-    if added:
-        conn.commit()
-    return {"added": added}
 
 
 def _fs_audit(conn: sqlite3.Connection, project_id: str) -> dict:

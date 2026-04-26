@@ -214,8 +214,19 @@ svg { width: 100%; height: 100vh; }
   <div id="panel-inner">
     <div class="p-kind"  id="p-kind"></div>
     <div class="p-title" id="p-title"></div>
-    <div class="p-section">Interpretation</div>
-    <div class="p-body"  id="p-body"></div>
+    <div id="p-locus-wrap" style="display:none">
+      <div class="p-section">Relation</div>
+      <div class="p-body" id="p-relation"></div>
+      <div class="p-section">Overlap</div>
+      <div class="p-body" id="p-overlap"></div>
+      <div class="p-section">Source anchor</div>
+      <div class="p-body" id="p-anchor"></div>
+      <div id="p-angle-row" class="p-conn" style="display:none">angle: <span id="p-angle"></span></div>
+    </div>
+    <div id="p-body-wrap" style="display:none">
+      <div class="p-section">Body</div>
+      <div class="p-body" id="p-body"></div>
+    </div>
     <div id="p-sources-wrap" style="display:none">
       <div class="p-section">Cited Sources</div>
       <div id="p-sources"></div>
@@ -242,10 +253,9 @@ svg { width: 100%; height: 100vh; }
   <div class="lg-row"><div class="lg-dot" style="background:#a855f7"></div>philosophy</div>
   <div class="lg-row"><div class="lg-dot" style="background:#22d3ee"></div>relevance</div>
   <div class="lg-row"><div class="lg-dot" style="background:#6b7280"></div>raw</div>
-  <div style="color:#555;font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin:8px 0 4px">Edges</div>
-  <div class="lg-row"><div class="lg-line" style="background:#4b5563;border-top:2px dashed #4b5563;background:transparent"></div>cites</div>
-  <div class="lg-row"><div class="lg-line" style="background:#3b82f6"></div>semantic</div>
-  <div class="lg-row"><div class="lg-line" style="background:#818cf8"></div>actual</div>
+  <div style="color:#555;font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin:8px 0 4px">Edges (DAG)</div>
+  <div class="lg-row"><div class="lg-line" style="background:#4b5563;border-top:2px dashed #4b5563;background:transparent"></div>cites &nbsp;<span style="color:#444">interp→raw</span></div>
+  <div class="lg-row"><div class="lg-line" style="background:#a855f7"></div>derives_from &nbsp;<span style="color:#444">interp→interp</span></div>
 </div>
 <script>
 const DATA = __DATA_JSON__;
@@ -258,16 +268,8 @@ function nodeRadius(d) {
 const nodeById = {};
 for (const n of DATA.nodes) nodeById[n.id] = n;
 
-// Deduplicate symmetric edge types
-const seen = new Set(), links = [];
-for (const e of DATA.edges) {
-  const key = (e.type==='semantic'||e.type==='actual')
-    ? [e.source,e.target].sort().join('|')+'|'+e.type
-    : e.source+'|'+e.target+'|'+e.type;
-  if (seen.has(key)) continue;
-  seen.add(key);
-  links.push({...e});
-}
+// All edges are directed in the DAG; no symmetric dedup needed.
+const links = DATA.edges.map(e=>({...e}));
 const nodes = DATA.nodes.map(n=>({...n}));
 
 const W = window.innerWidth, H = window.innerHeight;
@@ -277,15 +279,17 @@ svg.call(d3.zoom().scaleExtent([0.15,8]).on('zoom',ev=>g.attr('transform',ev.tra
 
 const sim = d3.forceSimulation(nodes)
   .force('link', d3.forceLink(links).id(d=>d.id)
-    .distance(e=>e.type==='semantic'?90:e.type==='cites'?80:60).strength(0.45))
+    .distance(e=>e.type==='derives_from'?100:80).strength(0.45))
   .force('charge', d3.forceManyBody().strength(d=>d.kind==='raw'?-60:-200))
   .force('center', d3.forceCenter(W/2,H/2))
   .force('collide', d3.forceCollide(d=>nodeRadius(d)+5));
 
+// derives_from edges (interp→interp) are solid purple. cites edges (interp→raw)
+// are dashed grey, signalling that they exit the locus layer toward a leaf raw.
 const link = g.append('g').selectAll('line').data(links).join('line')
-  .attr('stroke', e=>e.type==='semantic'?'#3b82f6':e.type==='actual'?'#818cf8':'#4b5563')
+  .attr('stroke', e=>e.type==='derives_from'?'#a855f7':'#4b5563')
   .attr('stroke-width', e=>e.type==='cites'?1:1.4)
-  .attr('stroke-opacity', e=>e.type==='cites'?0.4:0.65)
+  .attr('stroke-opacity', e=>e.type==='cites'?0.4:0.7)
   .attr('stroke-dasharray', e=>e.type==='cites'?'4 3':null);
 
 const node = g.append('g').selectAll('circle').data(nodes).join('circle')
@@ -345,7 +349,29 @@ node.on('click',(ev,d)=>{
   document.getElementById('p-kind').textContent='['+d.kind+(d.subkind?':'+d.subkind:'')+']';
   document.getElementById('p-kind').style.color=c;
   document.getElementById('p-title').textContent=d.title||'(untitled)';
-  document.getElementById('p-body').textContent=(d.body||'').trim()||'—';
+
+  // Locus slots — only meaningful for interpretation nodes.
+  const lw=document.getElementById('p-locus-wrap');
+  if (d.kind==='interpretation') {
+    lw.style.display='block';
+    document.getElementById('p-relation').textContent=(d.relation_md||'').trim()||'—';
+    document.getElementById('p-overlap').textContent=(d.overlap_md||'').trim()||'—';
+    document.getElementById('p-anchor').textContent=(d.source_anchor_md||'').trim()||'—';
+    const ar=document.getElementById('p-angle-row');
+    if (d.angle) {
+      ar.style.display='block';
+      document.getElementById('p-angle').textContent=d.angle;
+    } else { ar.style.display='none'; }
+  } else { lw.style.display='none'; }
+
+  // Free-form body (for raws and the rare interp body).
+  const bw=document.getElementById('p-body-wrap');
+  const body=(d.body||'').trim();
+  if (body) {
+    bw.style.display='block';
+    document.getElementById('p-body').textContent=body;
+  } else { bw.style.display='none'; }
+
   const srcs=d.cited_raws||[];
   const sw=document.getElementById('p-sources-wrap');
   if(srcs.length){

@@ -40,10 +40,14 @@ def get_graph(
     # A node may appear under multiple sources ('workspace' + 'pinned') when it
     # is both in a linked workspace and explicitly pinned. Aggregate to the
     # highest-priority source: pinned > override > workspace.
+    # Pull the locus slots (relation/overlap/anchor + angle) alongside the
+    # base shape so the visualizer can render them on click without a
+    # follow-up call.
     rows = conn.execute(
         f"""
         SELECT n.id, n.kind, n.subkind, n.title, n.body, n.confidence, n.status,
                n.access_count, n.last_accessed_at,
+               i.relation_md, i.overlap_md, i.source_anchor_md, i.angle,
                CASE
                  WHEN SUM(CASE pm.source WHEN 'pinned'   THEN 1 ELSE 0 END) > 0 THEN 'pinned'
                  WHEN SUM(CASE pm.source WHEN 'override' THEN 1 ELSE 0 END) > 0 THEN 'override'
@@ -51,6 +55,7 @@ def get_graph(
                END AS role
         FROM nodes n
         JOIN project_effective_members pm ON pm.node_id = n.id
+        LEFT JOIN interpretation_nodes i ON i.node_id = n.id
         WHERE pm.project_id = ?
           AND n.status IN ({placeholders})
           {kind_clause}
@@ -90,6 +95,10 @@ def get_graph(
             {
                 "id": r["id"], "kind": r["kind"], "subkind": r["subkind"],
                 "title": r["title"], "body": r["body"] or "",
+                "relation_md": r["relation_md"] or "",
+                "overlap_md": r["overlap_md"] or "",
+                "source_anchor_md": r["source_anchor_md"] or "",
+                "angle": r["angle"],
                 "confidence": r["confidence"],
                 "status": r["status"], "access_count": r["access_count"],
                 "last_accessed_at": r["last_accessed_at"],

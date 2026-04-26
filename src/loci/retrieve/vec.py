@@ -39,12 +39,16 @@ def search_text(
     k: int = 20,
     include_status: tuple[str, ...] = ("live", "dirty"),
     embedder: Embedder | None = None,
+    kind: str | None = None,
 ) -> list[VecHit]:
     embedder = embedder or get_embedder()
     if not query.strip():
         return []
     vec = embedder.encode(query)
-    return search_vec(conn, project_id, vec, k=k, include_status=include_status)
+    return search_vec(
+        conn, project_id, vec,
+        k=k, include_status=include_status, kind=kind,
+    )
 
 
 def search_vec(
@@ -54,10 +58,12 @@ def search_vec(
     *,
     k: int = 20,
     include_status: tuple[str, ...] = ("live", "dirty"),
+    kind: str | None = None,
 ) -> list[VecHit]:
-    """ANN search with project + status filtering."""
+    """ANN search with project + status (+ optional kind) filtering."""
     blob = vec_to_blob(vec)
     status_placeholders = ",".join("?" * len(include_status))
+    kind_clause = "AND n.kind = ?" if kind else ""
     # sqlite-vec requires `embedding MATCH ?` and `k = ?` together. We then
     # compose with regular WHERE clauses via JOIN; the optimizer pushes the
     # JOINs after the MATCH (which is fine — vec0 returns at most `k` rows).
@@ -69,7 +75,11 @@ def search_vec(
         WHERE v.embedding MATCH ? AND k = ?
           AND pm.project_id = ?
           AND n.status IN ({status_placeholders})
+          {kind_clause}
         ORDER BY v.distance
     """
-    rows = conn.execute(sql, (blob, k, project_id, *include_status)).fetchall()
+    params: tuple = (blob, k, project_id, *include_status)
+    if kind:
+        params = (*params, kind)
+    rows = conn.execute(sql, params).fetchall()
     return [VecHit(node_id=r["node_id"], distance=r["distance"]) for r in rows]

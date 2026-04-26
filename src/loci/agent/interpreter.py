@@ -3,28 +3,24 @@
 Two-stage LLM pipeline:
 
     1. SYNTHESISE — given the user's task + retrieved candidates + citation
-       feedback (if any) + the project's pinned interps as voice anchor, the
-       agent proposes a list of `Action`s: create / reinforce / soften / link.
+       feedback + the project's pinned loci as voice anchor, the agent proposes
+       Actions: create / reinforce / soften / link / update_angle.
 
-    2. SELF-CRITIQUE — the same model takes the proposed actions and rejects
-       the ones that don't match the user's voice (compared against pinned
-       interps), are too generic, or duplicate something already live. Only
-       surviving actions are applied.
+    2. SELF-CRITIQUE — same model rejects actions that don't match voice,
+       duplicate live loci, or paraphrase a candidate. Only survivors apply.
 
-Then we apply: new interpretations land at confidence 0.4 with
-`origin=agent_synthesis`; reinforces +0.05 confidence on existing nodes;
-softens -0.05; links create typed edges (subject to the symmetric/inverse
-rules in `EdgeRepository.create`).
+A LOCUS OF THOUGHT is a routing pointer, not a summary. Every `create` action
+must produce a locus with three populated slots:
+    relation_md       (how source relates to project)
+    overlap_md        (the concrete intersection)
+    source_anchor_md  (which part of which source carries the weight)
+And edges:
+    cites         interp → raw   (the anchored source)
+    derives_from  interp → interp (this locus builds on that one)
+There are no symmetric edges; cycles in derives_from are rejected at insert.
 
-Everything is logged to `agent_reflections` — the user can read the agent's
-deliberation post-hoc.
-
-Failure modes:
-- No LLM key  → reflect logs a `skipped` reflection row and returns; safe.
-- LLM error   → caught, logged with deliberation_md='ERROR: …'; surfaces in
-                the job's `error` field.
-- Bad output  → pydantic-ai's structured-output schema rejects it; we treat
-                that as an LLM error.
+Failure modes: missing LLM key → skipped row; LLM error → deliberation_md
+records ERROR; bad output → pydantic-ai schema reject treated as LLM error.
 """
 
 from __future__ import annotations
@@ -81,21 +77,23 @@ class _Link(BaseModel):
 class Action(BaseModel):
     """One thing the agent wants to do to the graph."""
     action: ActionKind
-    # When action == "create"
+    # When action == "create": every locus needs the three slots.
     subkind: InterpretationSubkind | None = None
     title: Annotated[str | None, Field(max_length=200)] = None
-    body: str | None = None
-    # For relevance subkind: typed angle + bridge rationale.
+    body: str | None = None  # optional free-form context, ≤300 chars
+    relation_md: str | None = None
+    overlap_md: str | None = None
+    source_anchor_md: str | None = None
+    # For relevance subkind: typed angle.
     angle: RelevanceAngle | None = None
-    rationale_md: str | None = None
-    # When action ∈ {reinforce, soften, link, update_angle}: the existing node
-    # handle from the candidate block we showed the LLM ([N1]..[Nk]).
+    # When action ∈ {reinforce, soften, link, update_angle}: handle of an
+    # existing node from the candidate block ([N1]..[Nk]).
     target_handle: str | None = None
-    # Reason — the agent's one-line justification (for the reflection log).
+    # One-line justification (for the reflection log).
     reason: Annotated[str, Field(max_length=400)] = ""
-    # Optional links to add when this action's subject is created/already exists.
-    # Each handle resolves to an existing node (an [Nxx]) OR the literal
-    # 'NEW' meaning the just-created node.
+    # Optional links to add. Each handle resolves to an existing [Nxx] or the
+    # literal 'NEW' meaning the just-created node. Edge type ∈
+    # {cites, derives_from} — and direction must be valid for the type.
     links: list[_Link] = Field(default_factory=list)
 
 
@@ -472,8 +470,11 @@ def _apply_actions(
                     subkind=a.subkind or "decision",
                     title=a.title or "(untitled)",
                     body=a.body or "",
+                    relation_md=(a.relation_md or "").strip(),
+                    overlap_md=(a.overlap_md or "").strip(),
+                    source_anchor_md=(a.source_anchor_md or "").strip(),
                     angle=a.angle,
-                    rationale_md=a.rationale_md or "",
+                    rationale_md="",
                     origin="agent_synthesis",
                     origin_response_id=response_id,
                     confidence=AGENT_BASE_CONF,
@@ -515,7 +516,7 @@ def _apply_actions(
             if target_id is None:
                 continue
             try:
-                nodes_repo.set_angle(target_id, a.angle, a.rationale_md or "")
+                nodes_repo.set_angle(target_id, a.angle, "")
                 tracker.append_trace(project_id, target_id, "agent_updated_angle",
                                        response_id=response_id, client="agent")
                 applied += 1
@@ -604,86 +605,79 @@ def _log_and_return(
 
 
 _SYNTH_INSTRUCTIONS = """\
-You are loci's interpreter agent. Your job is to extend the user's personal \
-interpretation graph based on what they're working on right now.
+You are loci's interpreter agent. You maintain the user's personal LOCI-OF-THOUGHT
+graph — a directed acyclic graph in which every interpretation node is a
+*pointer* into source space, not a summary of any source.
+
+THE LOCUS PRINCIPLE
+A locus says: "the part of THIS source over here meets the part of THIS project
+over there, in this specific way, and that is why this region of source-space
+matters." Loci are how retrieval finds its way back to the right paragraph of
+the right source. The body of a locus is never the answer; the cited raw is the
+answer, and the locus tells you which part to read and why.
 
 INPUT YOU RECEIVE:
 - PROJECT PROFILE: the user's stated goal for this project.
 - USER'S CURRENT TASK: what they just asked loci to help with.
-- PINNED INTERPRETATIONS: the user's voice — these are the nodes they have \
-  explicitly elevated. Match this *style and level of specificity*. Avoid \
-  language that the user wouldn't use.
-- WORKSPACE CONTEXT: the information workspaces linked to this project, with \
-  their kind (papers/codebase/notes/…) and a sample of recent source titles. \
-  Use this to understand *what kind of material* the user is drawing from and \
-  to name the bridge between workspaces when relevant.
-- CANDIDATES: nodes that loci surfaced for this task, with [Nxx] handles. \
-  Some are marked '(cited in draft)' — those were used in the user's output.
-- CITATION FEEDBACK: if the user has reviewed earlier drafts, signals like \
-  cited_kept / cited_dropped / cited_replaced / requery are listed. Take \
-  these seriously: cited_dropped means the user explicitly removed that \
-  citation from their edit, so the node *did not serve them well*.
+- PINNED INTERPRETATIONS: the user's voice. Match style and specificity.
+- WORKSPACE CONTEXT: workspaces linked to this project, kinds, and recent
+  source titles — use this to ground source_anchor_md.
+- CANDIDATES: nodes that retrieval surfaced for this task with [Nxx] handles.
+  Some are marked '(cited in draft)' — those served the user's output.
+- CITATION FEEDBACK: cited_kept / cited_dropped / cited_replaced / requery
+  signals from past drafts. cited_dropped = the locus failed to route the
+  user; consider softening or rewriting.
 
-YOUR JOB:
-Decide what new interpretations would help the user *next time* on a similar \
-task, and what existing interpretations should be reinforced or softened.
+YOUR JOB
+Decide which new loci would route the user better next time, and which
+existing loci to reinforce or soften.
 
-Choose subkind based on what you actually observe in the candidates:
-- `tension`: an open question, unresolved conflict, or two values pulling against \
-  each other. Start here for the first interpretations of a new topic.
-- `decision`: a concrete choice the project made (or should make) with explicit trade-offs.
-- `philosophy`: a first-principle belief or grounding axiom that shapes the project's direction.
-- `relevance`: use ONLY when the workspace context shows material from a \
-  clearly distinct external source (codebase, paper set, etc.) and the \
-  candidates reveal a specific *angle* by which that source serves the \
-  project's intent. A relevance node names the bridge — it does NOT summarise \
-  the source. Cite ≥2 raws when possible. Requires `angle` from the closed \
-  vocabulary.
+EVERY `create` ACTION MUST POPULATE THE THREE SLOTS:
+  relation_md       — 1–3 sentences. How does this source RELATE to this
+                      project? Concrete bridge, not a paraphrase.
+  overlap_md        — 1–2 sentences. WHERE do they intersect? Be specific.
+  source_anchor_md  — Which PART of which source carries the weight? Quote a
+                      phrase, name a section, point at a function/file/line,
+                      identify a definition. NOT a whole-document summary.
+                      If multiple sources, anchor each one separately.
 
-Do NOT default to `relevance` for every observation. Use the most specific \
-subkind that fits. Prefer `tension` when something is unresolved, `decision` \
-when a concrete trade-off has been made, `philosophy` for grounding beliefs.
+Subkinds (pick what fits — do NOT default to relevance):
+  - `relevance` — typed bridge across distinct sources. REQUIRES angle from
+    {applicable_pattern, experimental_setup, borrowed_concept, counterexample,
+     prior_attempt, vocabulary_source, methodological_neighbor,
+     contrast_baseline}. cite ≥2 raws when possible.
+  - `philosophy` — first-principle belief the sources reveal the project
+    should hold. relation_md says how it shows up; source_anchor_md points at
+    where it is stated/embodied.
+  - `tension` — an unresolved conflict between sources and project, or
+    between two values in the project itself. source_anchor_md points at
+    where each side is visible.
+  - `decision` — a concrete choice with explicit trade-offs. source_anchor_md
+    cites the evidence on each side.
 
-Output a Reflection with:
-- deliberation: 2-6 sentences in your voice. What tension did you see? What \
-  would help next time?
-- actions: a list of Actions. Possible kinds:
-    - create: a new interpretation node. Required: subkind, title, body. \
-      Subkind is one of {tension, decision, philosophy, relevance}. \
-      For subkind=relevance, also set `angle` (required) and `rationale_md` \
-      (1–3 sentences: the "because" — what exactly makes these sources \
-      relevant at this angle). Angle must be one of: \
-      applicable_pattern, experimental_setup, borrowed_concept, \
-      counterexample, prior_attempt, vocabulary_source, \
-      methodological_neighbor, contrast_baseline.
-    - reinforce: existing node deserves more weight. Required: target_handle (Nxx).
-    - soften: existing node was misaligned with the user's task. \
-      Required: target_handle.
-    - link: add an edge between two existing nodes. Use action="link" with \
-      a single entry in `links` (src_handle, dst_handle, type).
-    - update_angle: refine the angle/rationale on an existing relevance node \
-      in response to user edits or new evidence. Required: target_handle, \
-      angle, rationale_md.
-    Edge types: cites (interp→raw), semantic (interp↔interp meaning link), \
-    actual (raw↔raw dependency).
+ACTIONS
+  create        — a new locus. Required: subkind, title, three slots.
+                  Strongly encouraged: a `cites` link to ≥1 raw candidate
+                  (src='NEW', dst=[Nxx], type='cites'). For relevance, ≥2.
+                  Optional: derives_from links to existing loci this locus
+                  builds on (src='NEW', dst=[Nxx], type='derives_from').
+  reinforce     — existing locus deserves more weight (target_handle).
+  soften        — existing locus mis-routed the user (target_handle).
+  link          — add a single edge between two existing handles.
+  update_angle  — refine angle on an existing relevance locus.
 
-  When you create a node, you MAY include `links` whose src_handle is "NEW" \
-  to immediately connect the new node into the graph (e.g., a tension node \
-  linking to a related philosophy). For relevance nodes, add `cites` links \
-  to the raw candidates ([Nxx]) that justify the angle.
+EDGE TYPES (only these two; both directed; no symmetric edges):
+  cites          interp → raw    (the anchored source)
+  derives_from   interp → interp (this locus builds on that locus)
+The graph must remain acyclic — derives_from edges that close a cycle are
+rejected. Raws are leaves; never write a link with src=a raw handle.
 
 RULES:
-- Be conservative. Better to create 1 high-quality interpretation than 5 \
-  generic ones.
-- Match the user's voice. If their pinned interps say "position lives in the \
-  projection," do not write "positional encoding mechanisms can be \
-  categorized into…" — that's not their voice.
-- Never copy a candidate's body verbatim. An interpretation is a distillation, \
-  not a quote.
-- Never create a question that's already answered by an existing node.
-- For relevance nodes: do NOT summarise what the sources say — name the bridge \
-  (e.g. "these codebases show how to expose a server as CLI, which is exactly \
-  what this project is building" not "these codebases contain CLI code").
+- Be conservative. One high-signal locus beats five generic ones.
+- Match the user's voice. Mirror the specificity of their pinned loci.
+- Never paraphrase a candidate; a locus is a pointer, not a quote.
+- Never write a title ending in a question mark.
+- Never duplicate a live locus's bridge in spirit.
 - If nothing meaningful needs to change, return actions=[].
 """
 
@@ -693,21 +687,25 @@ You are critiquing your own previous output. You will see:
 - The user's current task and pinned interpretations.
 - A numbered list of Actions the synthesis stage proposed.
 
-Your job: decide which actions to KEEP and which to DROP.
+A LOCUS OF THOUGHT is a routing pointer, not a summary. Critique each create
+action against this standard.
 
 DROP if any of:
-- The action's title or body is generic ("This is important", "Position \
-  matters in transformers") — not the user's voice.
-- The action duplicates one of the user's existing pinned interps in spirit.
-- A `create` action is just a paraphrase of a candidate.
-- A `reinforce`/`soften`/`link` targets a handle that doesn't make sense \
-  for this task.
-- The action would add noise rather than signal.
+- The locus paraphrases a source instead of pointing at a specific part of it.
+  source_anchor_md must name a section / function / quote / line range — not
+  describe the document as a whole.
+- relation_md or overlap_md is generic ("This is important", "Both deal with
+  graphs"). The bridge must be concrete and project-specific.
+- The locus duplicates a pinned locus's bridge in spirit.
+- The links are wrong: a raw appears as src; a derives_from would close a
+  cycle; a cites edge points interp→interp; a derives_from points to a raw.
+- A reinforce/soften/link targets a handle that doesn't fit this task.
+- The action adds noise rather than routing signal.
 
-KEEP if the action genuinely captures something specific the user would \
-recognise as their own thinking, and that's not already in the graph.
+KEEP if the locus genuinely points at *which part* of the source matters and
+*why* for this project, in language the user would recognise as their own.
 
-Output keep[] and drop[] as integer indices into the actions list, plus a \
+Output keep[] and drop[] as integer indices into the actions list, plus a
 one-line `notes` summary of why.
 """
 
@@ -728,15 +726,20 @@ def _render_action(i: int, a: Action) -> str:
     head = f"[{i}] action={a.action}"
     if a.action == "create":
         angle_str = f" angle={a.angle}" if a.angle else ""
+        link_str = ", ".join(
+            f"{lk.src_handle}--{lk.type}-->{lk.dst_handle}" for lk in a.links
+        ) or "(none)"
         return (
             f"{head} subkind={a.subkind}{angle_str} title={a.title!r}\n"
-            f"      body={(a.body or '')[:300]!r}\n"
-            f"      rationale={(a.rationale_md or '')[:200]!r}\n"
+            f"      relation={(a.relation_md or '')[:240]!r}\n"
+            f"      overlap={(a.overlap_md or '')[:240]!r}\n"
+            f"      source_anchor={(a.source_anchor_md or '')[:240]!r}\n"
+            f"      links=[{link_str}]\n"
             f"      reason={a.reason!r}"
         )
     head += f" target_handle={a.target_handle}"
     if a.action == "update_angle":
-        head += f" angle={a.angle} rationale={(a.rationale_md or '')[:100]!r}"
+        head += f" angle={a.angle}"
     if a.links:
         link_str = ", ".join(f"{lk.src_handle}--{lk.type}-->{lk.dst_handle}" for lk in a.links)
         head += f" links=[{link_str}]"

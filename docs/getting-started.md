@@ -88,6 +88,82 @@ A project is a *view* over the global graph: a profile, the set of nodes
 included, and the agent's voice anchor. One PDF can participate in many
 projects without duplication.
 
+### Interactive wizard (recommended)
+
+When you run `loci project create <name>` from a terminal it launches a
+`create-next-app`-style setup wizard that walks you through every step:
+
+```
+$ uv run loci project create codoc
+
+╭─────────────────────────────────╮
+│ loci — personal memory graph    │
+│ Interactive project setup       │
+╰─────────────────────────────────╯
+
+  ┌─────────────────────────────────────────────────┐
+  │            Existing workspaces                  │
+  │  #  slug       name           kind   sources    │
+  │  1  papers-ws  My papers      papers    3       │
+  │  2  notes-ws   Working notes  notes     1       │
+  └─────────────────────────────────────────────────┘
+
+── Step 1  Project details ─────────────────────────
+  Project name [codoc]: Code-as-Document
+  Slug [code-as-document]: codoc
+  Profile file (path to .md, or Enter to skip): /tmp/codoc-profile.md
+  ✓ Created project codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
+
+  Link a workspace to this project? [Y/n]: y
+
+── Step 2  Link workspace ──────────────────────────
+  1  papers-ws  My papers
+  2  notes-ws   Working notes
+
+  Enter workspace number: 1
+  Link role [primary/reference/excluded] (primary): primary
+  ✓ Linked papers-ws as primary
+
+  Scan the workspace now? [Y/n]: y
+
+── Step 3  Scan ────────────────────────────────────
+  ✓ Scan complete — 47 new, 0 deduped, 2 skipped
+
+  Run kickoff to seed the interpretation graph? [Y/n]: y
+
+── Step 4  Kickoff ─────────────────────────────────
+  ✓ Kickoff done
+
+╭────────── Setup complete ─────────────╮
+│ ✓ Project codoc created               │
+│ ✓ Workspace papers-ws linked          │
+│ ✓ Sources scanned                     │
+│ ✓ Interpretation graph seeded         │
+│                                       │
+│ Next steps:                           │
+│   loci draft codoc "your question"    │
+│   loci server  # open VSCode ext      │
+╰───────────────────────────────────────╯
+```
+
+The wizard adapts to what you've already set up:
+- If no workspaces exist yet, it skips the link/scan steps and shows the
+  commands to run afterward.
+- If you choose not to link a workspace, scan and kickoff steps are skipped.
+- If you choose not to scan, kickoff is skipped (no raws to interpret yet).
+
+### Non-interactive (scripted) setup
+
+Pass `--yes` to bypass the wizard and create the project directly:
+
+```bash
+uv run loci project create codoc \
+  --name "Code-as-Document" \
+  --profile /tmp/codoc-profile.md \
+  --yes
+# → created codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
+```
+
 The profile is the seed for kickoff and the agent's "what are we doing
 here?" prompt. Keep it 50–300 words and write it from the user's
 perspective — what you want from loci, not a description of the files.
@@ -117,17 +193,16 @@ What I want from loci:
 Style: concise, technical. Prefer interpretations as short claims with
 evidence pointers, not prose blurbs.
 EOF
-
-uv run loci project create codoc \
-  --name "Code-as-Document" \
-  --profile /tmp/codoc-profile.md
-# → created codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
 ```
 
-Save that ULID — the frontend uses it. (You can always look it up later
-with `uv run loci project list`.)
+Save the ULID from `project create` — the frontend uses it. (You can always
+look it up later with `uv run loci project list`.)
 
 ## 3. Create a workspace and add sources
+
+> **If you used the wizard** (step 2) and linked an existing workspace, you
+> can skip this step — your workspace is already linked and scanned. Come
+> back here if you want to add more source roots or link a second workspace.
 
 A **workspace** is a named collection of source roots. It sits between your
 filesystem and a project, so the same scanned files can serve multiple

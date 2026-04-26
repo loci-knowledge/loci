@@ -29,9 +29,13 @@ import sqlite_vec
 
 from loci.config import Settings, get_settings
 
-# One connection per thread. sqlite3.Connection is *not* safe to share across
-# threads with default settings; rather than enable check_same_thread=False and
-# manage locking ourselves, give each thread its own handle.
+# One connection per thread. We keep a thread-local cache as a perf optimization
+# (background workers reuse their handle), but we also pass check_same_thread=False
+# so a connection can cross threads within a single FastAPI request — sub-dependencies
+# and the endpoint each run in separate threadpool workers, and FastAPI caches the
+# Depends() result, so the connection created in worker A may be used in worker B.
+# Concurrency within a request is serialized by `await`; across requests, SQLite's
+# own busy_timeout + WAL journal handle contention.
 _local = threading.local()
 
 
@@ -51,12 +55,16 @@ def connect(db_path: Path | None = None, *, read_only: bool = False) -> sqlite3.
     if read_only:
         # URI form is the only way to get mode=ro on a stock connection.
         uri = f"file:{path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
+        conn = sqlite3.connect(
+            uri, uri=True, isolation_level=None, timeout=30.0, check_same_thread=False,
+        )
     else:
         # isolation_level=None gives us autocommit; we do explicit BEGIN/COMMIT
         # in repositories where transactions matter. This avoids surprise with
         # implicit BEGIN's that block other writers.
-        conn = sqlite3.connect(path, isolation_level=None, timeout=30.0)
+        conn = sqlite3.connect(
+            path, isolation_level=None, timeout=30.0, check_same_thread=False,
+        )
 
     _configure(conn, read_only=read_only)
     _attach_vec(conn)

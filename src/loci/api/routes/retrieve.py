@@ -1,10 +1,17 @@
 """Retrieve endpoint.
 
-PLAN.md §API §Retrieval:
-
     POST /projects/:id/retrieve
       body: { query, k, anchors?, include?, hyde? }
-      returns: { nodes, citations, trace_id }
+      returns:
+        {
+          nodes:           [...]   # ranked raws (default) or filtered set
+          routing_loci:    [...]   # the loci that routed to those raws
+          trace_table:     [...]   # per-raw interp path
+          trace_id:        str
+        }
+
+The default `include` is raws only. To surface loci themselves (e.g. for graph
+inspection or debugging), pass include=["interpretation"] explicitly.
 """
 
 from __future__ import annotations
@@ -25,10 +32,6 @@ router = APIRouter(prefix="/projects", tags=["retrieve"])
 class RetrieveBody(BaseModel):
     query: str
     k: int = 10
-    # `anchors` is intentionally Optional so we can distinguish "not provided"
-    # (None → fall back to the project's active-anchor set, if any) from
-    # "explicitly empty" ([] → caller wants no anchors at all). This matches
-    # PLAN.md §Retrieval semantics.
     anchors: list[str] | None = None
     include: list[str] | None = None
     hyde: bool = False
@@ -43,18 +46,26 @@ class RetrieveNodeOut(BaseModel):
     snippet: str
     score: float
     why: str
+    # Per-node interp trace: list of {id, edge, to} hops.
+    trace: list[dict] = []
 
 
-class CitationOut(BaseModel):
-    node_id: str
-    contributing_score: float
-    edges_traversed: list[str]
+class RoutingLocusOut(BaseModel):
+    id: str
+    subkind: str
+    title: str
+    relation_md: str
+    overlap_md: str
+    source_anchor_md: str
+    angle: str | None
+    score: float
 
 
 class RetrieveResponseBody(BaseModel):
     nodes: list[RetrieveNodeOut]
-    citations: list[CitationOut]
-    trace_id: str  # = response_id; named per PLAN.md
+    routing_loci: list[RoutingLocusOut]
+    trace_table: list[dict]
+    trace_id: str
 
 
 @router.post("/{project_id}/retrieve")
@@ -64,9 +75,6 @@ def post_retrieve(
     conn: sqlite3.Connection = Depends(db),
     user_agent: str = Header("unknown"),
 ) -> RetrieveResponseBody:
-    # Anchor fallback: if the client didn't pass `anchors` at all, consult
-    # the project's active-anchor set (frontend's "Pin for Claude Code"). An
-    # explicit empty list is preserved verbatim — the caller wants none.
     from loci.api.routes.anchors import get_active_anchors
 
     anchors = (
@@ -83,13 +91,12 @@ def post_retrieve(
         hyde=body.hyde,
     )
     resp = Retriever(conn).retrieve(req)
-    # Persist a Response (with no output text — retrieve has no synthesised
-    # output) and traces for everything we surfaced.
     record = ResponseRecord(
         project_id=project.id, session_id=body.session_id,
         request=body.model_dump(),
         output="",
-        cited_node_ids=[],  # nothing was *cited*; just retrieved
+        cited_node_ids=[],
+        trace_table=resp.trace_table,
         client=user_agent,
     )
     rid = CitationTracker(conn).write_response(
@@ -100,15 +107,22 @@ def post_retrieve(
             RetrieveNodeOut(
                 id=n.node_id, kind=n.kind, subkind=n.subkind, title=n.title,
                 snippet=n.snippet, score=n.score, why=n.why,
+                trace=[
+                    {"id": h.src, "edge": h.edge_type, "to": h.dst}
+                    for h in n.trace
+                ],
             )
             for n in resp.nodes
         ],
-        citations=[
-            CitationOut(
-                node_id=c.node_id, contributing_score=c.contributing_score,
-                edges_traversed=c.edges_traversed,
+        routing_loci=[
+            RoutingLocusOut(
+                id=ri.node_id, subkind=ri.subkind, title=ri.title,
+                relation_md=ri.relation_md, overlap_md=ri.overlap_md,
+                source_anchor_md=ri.source_anchor_md, angle=ri.angle,
+                score=ri.score,
             )
-            for c in resp.citations
+            for ri in resp.routing_interps
         ],
+        trace_table=resp.trace_table,
         trace_id=rid,
     )

@@ -1,11 +1,11 @@
-"""Leiden community detection (optional — gated on igraph).
+"""Leiden community detection over the derives_from interpretation graph.
 
-PLAN.md §Inspiration: GraphRAG-style hierarchical communities. We compute one
-snapshot per absorb run when the user has installed `loci[graph]` (igraph +
-leidenalg). Without those packages we no-op gracefully.
+GraphRAG-style hierarchical clustering. Optional — gated on `loci[graph]`
+(igraph + leidenalg); no-ops gracefully when missing.
 
-The communities feed back into retrieval via `semantic` edges (nodes in the
-same community as a high-PPR node get higher PPR mass).
+Communities are computed over `derives_from` interp→interp edges only. They
+feed back into retrieval as a clustering signal — interpretations in the same
+community as a high-PPR locus get a small bump.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def run(conn: sqlite3.Connection, project_id: str) -> dict:
         """
         SELECT src, dst, weight
         FROM edges
-        WHERE type = 'semantic'
+        WHERE type = 'derives_from'
           AND src IN ({0}) AND dst IN ({0})
         """.format(",".join("?" * len(node_ids))),
         (*node_ids, *node_ids),

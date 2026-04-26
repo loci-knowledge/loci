@@ -56,10 +56,29 @@ class ProjectRepository:
         )
         return project
 
+    def update(
+        self, project_id: str, slug: str, name: str, profile_md: str,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE projects SET slug=?, name=?, profile_md=?, last_active_at=? WHERE id=?",
+            (slug, name, profile_md, now_iso(), project_id),
+        )
+
     def update_profile(self, project_id: str, profile_md: str) -> None:
         self.conn.execute(
             "UPDATE projects SET profile_md = ?, last_active_at = ? WHERE id = ?",
             (profile_md, now_iso(), project_id),
+        )
+
+    def delete(self, project_id: str) -> None:
+        self.conn.execute(
+            "DELETE FROM project_membership WHERE project_id = ?", (project_id,)
+        )
+        self.conn.execute(
+            "DELETE FROM project_workspaces WHERE project_id = ?", (project_id,)
+        )
+        self.conn.execute(
+            "DELETE FROM projects WHERE id = ?", (project_id,)
         )
 
     def touch(self, project_id: str) -> None:

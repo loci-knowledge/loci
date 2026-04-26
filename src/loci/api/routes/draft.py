@@ -1,8 +1,14 @@
-"""Draft endpoint stub — implementation lives in `loci.draft`.
+"""Draft endpoint — raws-only citations + locus-routed trace table.
 
-PLAN.md §API §Drafting is the operation Claude Code will hit most. The full
-LLM orchestration is in Phase 8 (`loci.draft`). This route just adapts request
-shape and forwards.
+Response shape:
+    {
+      output_md:     "...",
+      citations:     [{ node_id, kind=raw, subkind, title, why_cited, routed_by[] }, ...],
+      routing_loci:  [{ id, subkind, title, relation_md, overlap_md,
+                        source_anchor_md, angle, score }, ...],
+      trace_table:   [{ raw_id, raw_title, interp_path: [{id, edge, to}, ...] }, ...],
+      response_id:   str,
+    }
 """
 
 from __future__ import annotations
@@ -21,12 +27,9 @@ router = APIRouter(prefix="/projects", tags=["draft"])
 class DraftBody(BaseModel):
     instruction: str
     context_md: str | None = None
-    # `anchors` is Optional so we can distinguish "not provided" (None →
-    # fall back to active anchors) from "explicitly empty" ([] → caller
-    # wants no anchors). See `post_draft` for the resolution.
     anchors: list[str] | None = None
-    style: str = "prose"  # prose | outline | code-comments | bibtex
-    cite_density: str = "normal"  # low | normal | high
+    style: str = "prose"
+    cite_density: str = "normal"
     session_id: str = "default"
     hyde: bool = False
     k: int = 12
@@ -38,12 +41,25 @@ class DraftCitationOut(BaseModel):
     subkind: str
     title: str
     why_cited: str
-    raw_supports: list[str]
+    routed_by: list[str]
+
+
+class RoutingLocusOut(BaseModel):
+    id: str
+    subkind: str
+    title: str
+    relation_md: str
+    overlap_md: str
+    source_anchor_md: str
+    angle: str | None
+    score: float
 
 
 class DraftResponseBody(BaseModel):
     output_md: str
     citations: list[DraftCitationOut]
+    routing_loci: list[RoutingLocusOut]
+    trace_table: list[dict]
     response_id: str
 
 
@@ -54,13 +70,9 @@ def post_draft(
     conn: sqlite3.Connection = Depends(db),
     user_agent: str = Header("unknown"),
 ) -> DraftResponseBody:
-    # Imported lazily so a request hitting the route exercises the LLM stack
-    # only when needed; tests of other routes don't pay for it.
     from loci.api.routes.anchors import get_active_anchors
     from loci.draft import DraftRequest, draft
 
-    # Anchor fallback: distinguish "not provided" (None → use active anchors)
-    # from "explicitly empty" ([] → caller wants none).
     anchors = list(body.anchors) if body.anchors is not None else get_active_anchors(project.id)
 
     req = DraftRequest(
@@ -79,7 +91,21 @@ def post_draft(
     return DraftResponseBody(
         output_md=result.output_md,
         citations=[
-            DraftCitationOut(**c.__dict__) for c in result.citations
+            DraftCitationOut(
+                node_id=c.node_id, kind=c.kind, subkind=c.subkind,
+                title=c.title, why_cited=c.why_cited, routed_by=c.routed_by,
+            )
+            for c in result.citations
         ],
+        routing_loci=[
+            RoutingLocusOut(
+                id=rl.node_id, subkind=rl.subkind, title=rl.title,
+                relation_md=rl.relation_md, overlap_md=rl.overlap_md,
+                source_anchor_md=rl.source_anchor_md, angle=rl.angle,
+                score=rl.score,
+            )
+            for rl in result.routing_loci
+        ],
+        trace_table=result.trace_table,
         response_id=result.response_id,
     )

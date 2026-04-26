@@ -43,9 +43,8 @@ InterpretationOrigin = Literal[
 ]
 
 EdgeType = Literal[
-    "cites",     # interp → raw: interpretation draws on this source as evidence
-    "semantic",  # interp ↔ interp: meaning-based relationship (replaces co_occurs/reinforces/extends/…)
-    "actual",    # raw ↔ raw: explicit dependency (code import, paper citation, markdown file link)
+    "cites",         # interp → raw: this locus points at this source
+    "derives_from",  # interp → interp: this locus builds on / extends that locus
 ]
 
 EdgeCreator = Literal["user", "system", "proposal_accepted"]
@@ -71,14 +70,14 @@ RelevanceAngle = Literal[
     "contrast_baseline",        # source is the baseline to compare against
 ]
 
-# Edge type metadata. Two questions any caller may ask:
-#   - is this type symmetric? (then we auto-create the reciprocal)
-#   - what's the inverse? (only `specializes` ↔ `generalizes`)
-SYMMETRIC_EDGE_TYPES: frozenset[EdgeType] = frozenset({
-    "semantic",  # meaning relationships are bidirectional
-    "actual",    # dependency/citation relationships are stored once, traversed both ways
-})
-EDGE_INVERSES: dict[EdgeType, EdgeType] = {}  # no asymmetric inverses in the simplified vocabulary
+# DAG topology. The new edge model is strictly directed and acyclic — no
+# symmetric edges, no inverses. Direction rules:
+#   cites         interp → raw    (raw is a leaf; never has outgoing edges)
+#   derives_from  interp → interp (acyclic; cycles rejected at insert time)
+EDGE_DIRECTION: dict[EdgeType, tuple[NodeKind, NodeKind]] = {
+    "cites": ("interpretation", "raw"),
+    "derives_from": ("interpretation", "interpretation"),
+}
 
 
 def new_id() -> str:
@@ -146,7 +145,14 @@ class InterpretationNode(Node):
     origin_response_id: str | None = None
     # Set on subkind='relevance' nodes; NULL for all other subkinds.
     angle: RelevanceAngle | None = None
-    # The "because-clause": why these sources matter to the project.
+    # The three locus slots — these are how an interpretation acts as a "locus
+    # of thought." They describe *where* the source meets the project, not
+    # *what* the source says.
+    relation_md: str = ""        # how the source(s) relate to the project (1–3 sentences)
+    overlap_md: str = ""         # the concrete intersection — what they share
+    source_anchor_md: str = ""   # which part(s) of which source(s) carry the weight
+    # Legacy/free-form rationale — used by proposal flow + back-compat with
+    # earlier relevance interps. Optional.
     rationale_md: str = ""
 
 
@@ -163,10 +169,11 @@ class Edge(BaseModel):
     weight: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
     created_at: str = Field(default_factory=now_iso)
     created_by: EdgeCreator = "user"
-    symmetric: bool = False  # filled by the repo from SYMMETRIC_EDGE_TYPES
-    # Per-citation rationale: for cites edges in relevance interps, explains
-    # this specific raw's contribution. angle mirrors the interp-level angle.
+    # Per-edge rationale. For cites: the snippet/quote/why-this-section that
+    # makes this raw the right anchor for the locus. For derives_from: the
+    # inheritance reason ("decision X follows from philosophy Y because…").
     rationale: str | None = None
+    # Denormalised angle for cites edges in relevance interps; NULL otherwise.
     angle: RelevanceAngle | None = None
 
     @field_validator("src", "dst")

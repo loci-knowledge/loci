@@ -1,33 +1,42 @@
-# The interpretation graph
+# The loci-of-thought DAG
 
-This document explains what the graph is, what each node and edge type means,
-how they come into existence, and how to read and manipulate the graph over
-time.
+This document explains the graph: what it is, what each node and edge type
+means, how nodes come into existence, and how to read the graph over time.
 
-## Overview
+## The mental model
 
-Every loci project owns a three-level structure:
+A loci graph is a **directed acyclic graph** in which:
+
+- **Raw nodes are leaves.** They hold the actual content — PDFs, code files,
+  notes, transcripts. Raws never have outgoing edges.
+- **Interpretation nodes are inner nodes.** Each interpretation is a *locus
+  of thought*: a pointer that says "the part of THIS source over here meets
+  the part of THIS project over there, in this specific way." Loci are how
+  retrieval finds its way back to the right paragraph of the right source.
+- **Edges flow downward and inward**, never sideways or back. Two types:
+
+  | type           | direction        | meaning                                                                  |
+  |----------------|------------------|--------------------------------------------------------------------------|
+  | `cites`        | interp → raw     | This locus points at this source. The grounding hop.                     |
+  | `derives_from` | interp → interp  | This locus builds on / specialises / inherits routing from another locus. |
+
+Both edge types are directed. There are no symmetric edges, no inverses, and
+no raw→raw edges. `derives_from` insertions are rejected if they would close
+a cycle.
 
 ```
-raw nodes  (files)
-    ↓  cites
-interpretation nodes  (distillations)
-    ↓  semantic
-interpretation nodes  (meta-level)
+                  ┌── derives_from ──┐
+       interp A ─────────────────────┴──▶ interp B ─── derives_from ──▶ interp C
+          │                                  │                                │
+        cites                              cites                            cites
+          ▼                                  ▼                                ▼
+        raw R₁                             raw R₂                           raw R₃
 ```
 
-The **raw layer** is your source material — PDFs, code files, notes,
-transcripts. Each file is one raw node. The raw layer is read-only from the
-agent's perspective; only ingestion (scan) writes here.
-
-The **interpretation layer** is the agent's (and your) thinking about that
-material. It is the living, evolvable part of the graph. Interpretation nodes
-start conservative (confidence 0.40) and get reinforced, softened, linked, and
-occasionally dismissed as you work.
-
-The two layers are connected by `cites` edges — an interpretation node that
-draws on a raw source as evidence points to it. This is how the graph stays
-grounded.
+A locus never holds the answer; the cited raw does. The locus tells you
+which part of the raw matters and why for this project. Retrieval routes a
+query through loci to surface the raws they point at — see
+[architecture.md](architecture.md) for the algorithm.
 
 ---
 
@@ -35,448 +44,204 @@ grounded.
 
 ### Raw nodes
 
-| field          | meaning                                                   |
-|----------------|-----------------------------------------------------------|
-| `kind`         | always `"raw"`                                            |
-| `subkind`      | `pdf \| md \| code \| html \| transcript \| txt \| image` |
-| `title`        | filename without extension (or extracted heading for PDFs) |
-| `body`         | extracted plain text — what FTS5 and the embedder see     |
-| `content_hash` | sha256[:16] of file bytes — the deduplication key         |
-| `canonical_path` | absolute path on disk at ingest time                    |
-| `source_of_truth` | `false` if the file has since moved or been deleted    |
-| `confidence`   | always 0.5 — not used for ranking raw nodes               |
-| `status`       | `live` normally; `dirty` if file is missing               |
+| field             | meaning                                                  |
+|-------------------|----------------------------------------------------------|
+| `kind`            | always `"raw"`                                           |
+| `subkind`         | `pdf | md | code | html | transcript | txt | image`     |
+| `title`           | filename (or extracted heading for PDFs)                 |
+| `body`            | extracted plain text — what FTS5 and the embedder see    |
+| `content_hash`    | sha256[:16] — the deduplication key                      |
+| `canonical_path`  | absolute path on disk at ingest time                     |
+| `source_of_truth` | `false` if the file has since moved or been deleted      |
+| `confidence`      | always 1.0; not used for ranking raws                    |
+| `status`          | `live` normally; `dirty` if file is missing              |
 
-Raw nodes are **content-addressed**: the same PDF scanned from two workspaces
-gets one raw node (one embedding, one FTS row) with two workspace membership
-entries. Editing the file on disk does not change the raw node until you
-re-scan — the existing hash still matches the old bytes.
+Raws are content-addressed: the same PDF in two workspaces gets one raw node
+with two `workspace_membership` rows. Editing the file on disk does not
+change the raw until you re-scan.
 
-**How a raw node is created:** `loci workspace scan <ws>` walks each
-registered source root. For each file: sha256 hash → look up in `raw_nodes`
-by content hash. If absent: extract text, batch-embed, write `nodes` +
-`raw_nodes` + `node_vec` + FTS row + `workspace_membership`. If present: write
-`workspace_membership` only (dedup — no re-embedding).
+### Interpretation nodes — the three slots
 
----
+Every interpretation has three required content slots that distinguish a
+locus from a summary:
 
-### Interpretation nodes
+| slot               | meaning                                                                                |
+|--------------------|----------------------------------------------------------------------------------------|
+| `relation_md`      | 1–3 sentences. How does the source(s) relate to *this project*? Concrete bridge.       |
+| `overlap_md`       | 1–2 sentences. WHERE do they intersect? Specific.                                      |
+| `source_anchor_md` | Which PART of which source carries the weight? Quote, section, function, line range.  |
 
-Every interpretation node has:
+The legacy `body` field is optional and only used for additional free-form
+context. The three slots are what retrieval and the LLM read to understand
+why a locus routes to a raw.
 
-| field          | meaning                                                   |
-|----------------|-----------------------------------------------------------|
-| `kind`         | always `"interpretation"`                                 |
-| `subkind`      | one of the 4 types below                                  |
-| `title`        | ≤80 chars — the claim or question in brief                |
-| `body`         | 1–4 sentences — the full statement                        |
-| `confidence`   | 0.0–1.0 — how established the interpretation is           |
-| `status`       | `live → dirty → stale → dismissed`                       |
-| `origin`       | `agent_synthesis \| user_explicit_create`                 |
-| `angle`        | (relevance only) see below                                |
-| `rationale_md` | (relevance only) the "because" clause                     |
+Interpretations also carry:
 
-#### Subkinds
+| field                | meaning                                                  |
+|----------------------|----------------------------------------------------------|
+| `subkind`            | one of `philosophy | tension | decision | relevance`     |
+| `title`              | ≤80 chars — the locus name (NEVER ends in `?`)           |
+| `confidence`         | 0.0–1.0 — how established this locus is                 |
+| `status`             | `live → dirty → stale → dismissed`                      |
+| `origin`             | `agent_synthesis | user_explicit_create | proposal_accepted | …` |
+| `angle`              | (relevance only) closed vocabulary — see below           |
 
-**`tension`** — An open question or conflict the project must grapple with,
-not yet resolved. Kickoff produces these. They seed retrieval immediately and
-invite reasoning rather than assert conclusions. Low confidence by default
-(0.5). A tension is honest about the competing pressures; it doesn't pretend
-there's a clean answer.
+#### Subkinds (the framing of a locus)
 
-*Example:* "transparency should be there, but not in the way — provenance
-on-demand, not by default."
-
-*Created by:* kickoff job + reflect cycle (when cited candidates embody
-competing commitments). Also from absorb's `detect_broken_supports` (a
-citation chain breaks, signalling instability in an assumed resolution).
-
----
-
-**`decision`** — A concrete choice the project has made (or must make), with
-the trade-offs named. Decisions are useful precisely because they record *why*
-a path was chosen — the alternatives that were discarded, the constraint that
-forced the choice.
-
-*Example:* "keep the repo as source of truth — DeepWiki wraps, not replaces."
-
-*Created by:* reflect cycle (when the draft grapples with a fork in approach).
+- **`relevance`** — typed bridge across distinct sources. Required `angle` from:
+  `applicable_pattern`, `experimental_setup`, `borrowed_concept`,
+  `counterexample`, `prior_attempt`, `vocabulary_source`,
+  `methodological_neighbor`, `contrast_baseline`. Cite ≥2 raws.
+- **`philosophy`** — first-principle belief the sources reveal the project
+  should hold. The `relation_md` says how it shows up; the `source_anchor_md`
+  points at where it is stated/embodied.
+- **`tension`** — an unresolved conflict between source(s) and project, or
+  between two values the project must reconcile. `source_anchor_md` points at
+  where each side is visible.
+- **`decision`** — a concrete choice with explicit trade-offs.
+  `source_anchor_md` cites the evidence on each side.
 
 ---
 
-**`philosophy`** — A first-principle belief that grounds the project's
-direction. The most durable and least actionable node type. A philosophy
-should be something you'd invoke to settle a dispute about priorities, not a
-description of an approach.
+## How loci are created
 
-*Example:* "navigation should start from the code's shape, then add meaning."
+| trigger                                    | what happens                                                           |
+|--------------------------------------------|------------------------------------------------------------------------|
+| `loci kickoff <project>`                   | Generate first set of loci over the project's profile + workspace samples. |
+| Reflect cycle (post-draft / -feedback)     | Synthesise + critique → create / reinforce / soften / link.            |
+| User: `POST /nodes` or `loci_propose_node` | Direct user-authored locus.                                            |
 
-*Created by:* reflect cycle (rarely — only when the agent observes a
-consistent axiom, not a pattern or decision).
+When a locus is written, its three slots are also concatenated for embedding
+(so vec retrieval scores the locus's *bridge*, not just its title). Cites
+edges to anchored raws are added in the same step. `derives_from` edges to
+upstream loci are added when the agent or user explicitly relates one locus
+to another.
 
----
-
-**`relevance`** — A typed bridge between one or more information workspaces
-and the project's intent, at a named angle. This is the multi-source
-connective tissue: it explains *how* a codebase, paper set, or notes collection
-serves what the project is building — not what the sources say, but the bridge.
-
-Required fields:
-
-- `angle` (required) — one of:
-
-  | angle                    | use when                                               |
-  |--------------------------|--------------------------------------------------------|
-  | `applicable_pattern`     | a structural approach in source X maps to what you're building |
-  | `experimental_setup`     | source X's study design is directly reusable           |
-  | `borrowed_concept`       | a term/framework from source X is being adopted        |
-  | `counterexample`         | source X shows a case that bounds or challenges your claim |
-  | `prior_attempt`          | source X tried something similar; note what worked/failed |
-  | `vocabulary_source`      | the project is adopting source X's naming              |
-  | `methodological_neighbor`| source X uses a similar method in a different domain   |
-  | `contrast_baseline`      | source X is the thing you're distinguishing yourself from |
-
-- `rationale_md` (required) — 1–3 sentences, the "because" clause. What
-  specifically makes these raws relevant at this angle? Do not summarise the
-  sources; name the bridge.
-
-A relevance node cites ≥2 raws (ideally from different workspaces). Its body
-is 2–4 sentences explaining the bridge. Think: "the reason these sources matter
-for this project is X — and the useful thing they show is Y."
-
-*Created by:* reflect cycle (when candidates span multiple workspaces and a
-clear bridge to the project profile exists) and by the `relevance` job
-(triggered on workspace link or incremental scan).
-
-*Refined by:* `update_angle` action (the agent or user refines the angle or
-rationale without recreating the node).
+If a brand-new locus has no `cites` edges (an orphan), kickoff's anchor pass
+attaches it to its top-3 nearest raws by cosine similarity so it isn't
+floating.
 
 ---
 
-## Edge types
-
-Edges are stored in the `edges` table with `src`, `dst`, `type`, `weight`.
-`semantic` edges are symmetric (auto-create their reciprocal).
-
-| type       | direction        | symmetric | meaning                                                   |
-|------------|------------------|-----------|-----------------------------------------------------------|
-| `cites`    | interp → raw     | no        | The interpretation draws on this raw as evidence. The primary structural link between layers. |
-| `semantic` | interp ↔ interp  | yes       | Two interpretations are semantically related — one supports, extends, contradicts, or co-occurs with the other. Created by reflect cycle `link` actions and by absorb's co-citation and contradiction passes. |
-| `actual`   | raw ↔ raw        | no        | An explicit dependency between raw nodes: code import, paper citation, or markdown link. Created by absorb's code dependency extraction (step 10). |
-
-### How edges are created
-
-| source                       | edge types produced                                             |
-|------------------------------|-----------------------------------------------------------------|
-| Reflect cycle                | `cites` (new interp → cited raws), `semantic` (from `link` actions) |
-| Kickoff post-write           | `cites` (anchor wiring — nearest raws by cosine), `semantic` (co-citation pairs) |
-| Absorb step 9                | `semantic` (idempotent co-citation update for interp pairs)     |
-| Absorb step 10               | `actual` (code import / paper citation / markdown link analysis) |
-| Absorb contradiction pass    | `semantic` (from LLM classifier)                                |
-| User action                  | any type via `POST /edges` or `loci link`                       |
-
-**Anchor wiring** (automatic): when a new interpretation node has no `cites`
-edge yet (isolated), kickoff computes its cosine similarity against all raw
-nodes and wires the 3 nearest with `weight = cosine_sim`. This ensures every
-interpretation is grounded from minute one.
-
-**Co-citation** (automatic): two interpretation nodes that both cite raw R get
-a `semantic` edge. This edge means "shared evidence" — they're bound by the
-same source material, even if their claims differ. No inference required, just
-shared citation.
-
-**Code dependency** (automatic): absorb step 10 parses Python imports and
-JS/TS `import`/`require` statements in raw code nodes and writes `actual`
-edges between raw nodes that import each other. Paper citations and markdown
-links produce the same edge type.
-
----
-
-## Node lifecycle
+## Lifecycle
 
 ```
-               kickoff / reflect / user_create
-                            │
-                            ▼
-                          [live]   ← confidence grows via reinforce
-                         ↙    ↘
-              [edit or         [support
-              neighbor edit]    disappears]
-                  │                │
-               [dirty]          [stale]      ← interp citing deleted raws
-                  │                │
-         re-derive at          propose
-         retrieve or absorb    broken-support
+                  kickoff / reflect / user_create
+                              │
+                              ▼
+                            [live]   ← confidence grows via reinforce
+                          ↙        ↘
+              [edit or               [support
+              neighbor edit]         disappears]
+                  │                       │
+              [dirty]                  [stale]    ← locus citing missing raws
+                  │                       │
+       re-derive at retrieve         broken-support
+       or absorb                     proposal
                   │
-               [live]
-                             explicit dismiss
-              [any] ─────────────────────────→ [dismissed]  (terminal)
+              [live]
+                              explicit dismiss
+              [any] ─────────────────────────────▶ [dismissed]  (terminal)
 ```
 
-| status      | what it means                                               |
-|-------------|-------------------------------------------------------------|
-| `live`      | visible in retrieval, drafts, the graph; confidence tracked |
-| `dirty`     | edited (own body or one-hop neighbor); re-derivation pending; shown in retrieval at reduced weight |
-| `stale`     | all cited raws are gone or flagged broken; surfaced as a housekeeping proposal |
-| `dismissed` | user removed it; permanently hidden; not deleted from DB    |
+Confidence starts at 0.40 for agent-created loci (0.50 for kickoff) and
+evolves through `reinforce`/`soften` actions and absorb's trace replay.
 
 ---
 
-## Confidence signal
+## How retrieval uses the DAG
 
-Confidence starts at 0.40 for agent-created nodes (0.50 for kickoff tensions)
-and evolves through usage:
+Retrieval is **interpretation-routed**:
 
-| event                    | Δ confidence |
-|--------------------------|-------------|
-| `reinforce` action       | +0.05       |
-| `soften` action          | −0.05       |
-| `cited_kept` trace       | +0.02 (via next reflect cycle's reinforce action) |
-| `cited_dropped` trace    | −0.03 (via next reflect cycle's soften action)   |
-| `ACCEPT_EXPLICIT`        | +0.15       |
-| `PIN`                    | role → pinned; used as PPR anchor; not a confidence delta |
+1. Score loci against the query (lex + vec + HyDE + PPR over `derives_from`).
+2. Walk `cites` and `derives_from·cites` from the top loci to raws.
+3. Also score raws directly against the query.
+4. Merge: direct raw score + (capped) routing bonus from loci.
+5. Return raws + a per-raw trace through the locus DAG.
 
-User-created nodes typically start at 0.70 (the default in `POST /nodes`).
-Pinned nodes typically sit at 1.0. Agent-written nodes take many reinforce
-cycles to climb above 0.6, which means they rank below your own work in
-retrieval until they've earned it.
-
-Forgetting: absorb flags nodes with `confidence < FORGETTING_THRESHOLD` (default
-0.20) and `last_accessed_at > FORGETTING_DAYS` (default 90) as dismissal
-candidates. They don't auto-dismiss — they surface as proposals.
-
----
-
-## How to read the graph
-
-### The hierarchy
-
-A well-developed loci graph has a natural gradient from *outer* (raw) to
-*inner* (abstract):
-
-```
-raw sources  ──cites──▶  grounded interps  ──semantic──▶  meta-interps
-(files)                   (cite 1-2 raws)                 (cite other interps)
-    ↕ actual
-(imports/citations)
-```
-
-Nodes closest to the raw layer (`cites` pointing outward) are the most
-concrete. Nodes that only connect to other interpretation nodes are the most
-abstract — they've been distilled enough that the original source material
-isn't their primary claim.
-
-The **radial layout** in the `/tmp/loci_graph.html` visualization encodes this:
-- Center: philosophy + high-degree decision/tension nodes
-- Mid-ring: tensions and relevance nodes
-- Outer ring: raw source nodes
-
-### The edge density gradient
-
-A dense `semantic` cluster around several interpretations citing the same raw
-source is your most fertile ground for synthesis. If several tension nodes
-share evidence via semantic edges, ask: is there a decision or philosophy
-that should be written explicitly to resolve them?
-
-A `semantic` chain connecting interpretations that support each other signals a
-stable belief. Semantic edges from the contradiction pass mark beliefs in
-conflict that the project hasn't resolved.
-
-### Tensions vs. decisions
-
-Tensions (confidence 0.5) are open questions and conflicts. When the reflect
-cycle or a draft produces a decision that resolves one, you can:
-- Dismiss the tension (it's been answered).
-- Reinforce the tension to keep it visible as a known-open thread.
-- Create a `semantic` edge from the decision to the tension (the decision
-  is a specific resolution of the broader conflict).
+**The raws are the answer.** The loci are the routing context — they appear
+in a side panel (`routing_loci`) and in a per-raw `trace_table`, never as
+citable content. See [architecture.md](architecture.md#retrieval) for the
+full pipeline.
 
 ---
 
 ## Querying the graph directly
 
-The SQLite database is at `loci.db` (dev) or `~/.loci/loci.sqlite` (default).
-
 ```sql
--- All live interpretation nodes, most accessed first
-SELECT n.subkind, n.title, n.confidence, i.angle
+-- All live loci by confidence (with their three slots)
+SELECT n.subkind, n.title, n.confidence,
+       i.relation_md, i.overlap_md, i.source_anchor_md, i.angle
 FROM nodes n
 JOIN interpretation_nodes i ON i.node_id = n.id
 WHERE n.status = 'live'
 ORDER BY n.confidence DESC, n.last_accessed_at DESC NULLS LAST;
 
--- Co-citation clusters: which raws anchor the most interpretation pairs
-SELECT r.node_id, n.title AS raw_title, COUNT(*) AS pairs
-FROM edges e1
-JOIN edges e2 ON e1.dst = e2.dst AND e1.src < e2.src
-JOIN nodes n ON n.id = e1.dst
-JOIN raw_nodes r ON r.node_id = e1.dst
-WHERE e1.type = 'cites' AND e2.type = 'cites'
-GROUP BY r.node_id
-ORDER BY pairs DESC;
-
--- Raw nodes linked by actual dependencies (imports, citations, links)
-SELECT n1.title AS src_title, n2.title AS dst_title
+-- Raws that are reached by the most loci (high-routing raws)
+SELECT n.title, COUNT(*) AS pointed_at_by
 FROM edges e
-JOIN nodes n1 ON n1.id = e.src
-JOIN nodes n2 ON n2.id = e.dst
-WHERE e.type = 'actual'
-ORDER BY n1.title;
+JOIN nodes n ON n.id = e.dst
+WHERE e.type = 'cites'
+GROUP BY n.id
+ORDER BY pointed_at_by DESC;
 
--- Interpretation nodes with no raw support
+-- The derives_from DAG (locus → upstream locus)
+SELECT a.title AS derived_locus, b.title AS upstream_locus
+FROM edges e
+JOIN nodes a ON a.id = e.src
+JOIN nodes b ON b.id = e.dst
+WHERE e.type = 'derives_from';
+
+-- Orphan loci — no cites edge yet
 SELECT n.id, n.subkind, n.title
-FROM nodes n JOIN interpretation_nodes i ON i.node_id = n.id
+FROM nodes n
+JOIN interpretation_nodes i ON i.node_id = n.id
 WHERE n.id NOT IN (SELECT src FROM edges WHERE type = 'cites')
-AND n.status = 'live';
+  AND n.status = 'live';
 
--- Agent's deliberation for the last 5 reflection cycles
+-- Last 5 reflection cycles
 SELECT trigger, instruction, deliberation_md
-FROM agent_reflections
-ORDER BY ts DESC LIMIT 5;
-
--- What the agent did in the last cycle
-SELECT ar.trigger, ar.instruction,
-       json_each.value AS action
-FROM agent_reflections ar,
-     json_each(ar.actions_json)
-ORDER BY ar.ts DESC
-LIMIT 20;
+FROM agent_reflections ORDER BY ts DESC LIMIT 5;
 ```
 
 ---
 
-## Graph construction pipeline (step by step)
+## Visualisation
 
-This is the full lifecycle from file to graph structure.
+The D3 force graph at `/tmp/loci_graph.html` (run `loci graph export
+<project>`) uses:
 
-### 1. Scan → raw nodes
+- **Node colour by subkind**: tension (red), decision (yellow), philosophy
+  (purple), relevance (cyan), raw (grey).
+- **Edges**:
+  - `cites` (dashed grey) — interp → raw, the grounding pointer.
+  - `derives_from` (solid purple) — interp → interp, the inheritance.
+- **Click** any node for the side panel showing the three locus slots
+  (relation / overlap / source anchor) plus connections.
+- **Drag** to pin, **scroll** to zoom.
 
-```
-loci workspace scan codoc-ws
-  └─ walker: walk source roots, skip dotdirs / binaries / >50MB
-             skip dirs: coverage/, htmlcov/, .idea/, .vscode/, storybook-static/, .nuxt, .parcel-cache, …
-             skip files: *.min.js, *.map, *.lock, package-lock.json, yarn.lock, …
-  └─ for each path:
-       sha256[:16]  →  look up raw_nodes.content_hash
-       if exists:   write workspace_membership only  (dedup)
-       else:
-         extract_text(path)                (PDF → marker/pymupdf/pypdf)
-         batch_embed(texts, model=bge-small-en-v1.5, dim=384)
-         write nodes + raw_nodes + node_vec + FTS5 row
-         write workspace_membership
-```
-
-### 2. Kickoff → first tensions
-
-```
-loci kickoff codoc
-  └─ sample 12 raws (most recent) + project profile
-  └─ LLM: propose 8–10 open TENSIONS worth pursuing
-  └─ write InterpretationNode (subkind=tension, conf=0.5, origin=agent_synthesis)
-  └─ anchor wiring: for each new tension with no cites edge:
-       cosine(tension_emb, all_raw_embs) → top-3 nearest
-       write cites edges (weight = cosine_sim)
-  └─ co-citation: pairs of tensions that cite same raw → semantic edges
-```
-
-### 3. Draft + reflect → interpretation graph
-
-```
-loci draft codoc "..."
-  └─ Retriever: BM25 + vec ANN + PPR + RRF → top-k candidates
-  └─ LLM (rag_model): write markdown with [Cn] citations
-  └─ write Response + Trace rows
-  └─ enqueue reflect job (non-blocking)
-
-worker: reflect job
-  └─ _build_context:
-       project profile + pinned interps (voice anchor)
-       task instruction + cited_node_ids
-       retrieved-but-not-cited nodes (from traces)
-       WORKSPACE CONTEXT (linked workspace names, kinds, sample raws)
-       citation feedback (cited_kept/dropped/replaced) if any
-  └─ SYNTHESISE (interpretation_model):
-       → Action[] — create / reinforce / soften / link / update_angle
-       subkind chosen from observed candidates:
-         tension: open question or conflict worth pursuing
-         decision: a concrete choice with trade-offs
-         philosophy: a grounding axiom
-         relevance: named bridge between workspace(s) and project intent
-  └─ SELF-CRITIQUE (interpretation_model):
-       → keep[] / drop[] — filter generic, duplicates, bad handles
-  └─ APPLY surviving actions:
-       create → write InterpretationNode (conf=0.40) + cites edges
-       reinforce/soften → confidence ±0.05
-       link → EdgeRepository.create (with symmetry/inverse)
-       update_angle → set angle + rationale_md on existing relevance node
-  └─ anchor wiring + co-citation (for newly created nodes)
-```
-
-### 4. Absorb → housekeeping (10 steps)
-
-```
-loci absorb codoc  (or POST /projects/:id/absorb)
-  step 1  fs_audit            : flip source_of_truth for missing files
-  step 2  replay_traces       : roll up traces → access_count, confidence
-  step 3  detect_orphans      : 0 edges → status=dirty
-  step 4  detect_broken_supports: dead raw → broken proposals, status=stale
-  step 5  detect_aliases      : cosine > 0.92 → alias proposals
-  step 6  detect_forgetting   : low conf + no access → dismiss proposals
-  step 7  contradiction_pass  : LLM 3-way classify each new raw vs top-3 interps
-  step 8  communities         : Leiden algorithm over interp graph
-  step 9  co_citation         : refresh semantic edges for co-cited interp pairs
-  step 10 code_dependencies   : parse Python/JS/TS imports → actual edges between raw nodes
-```
-
-### 5. Workspace link → relevance pass
-
-```
-loci workspace link codoc-ws codoc (or POST /projects/:pid/workspaces/:wid)
-  └─ insert project_workspaces row (sync)
-  └─ enqueue relevance job (async)
-
-worker: relevance job
-  └─ sample workspace raws + project profile
-  └─ focused single-pass synthesis (no critique stage)
-  └─ write relevance InterpretationNode(s) with angle + rationale_md
-  └─ write cites edges to supporting raws
-  └─ update workspace_sources.last_scanned_at
-```
+The graph has no cycles. The deepest interpretations sit furthest from raws
+(several `derives_from` hops up); the most concrete loci sit one `cites`
+edge above their raws.
 
 ---
 
-## Visualization
+## Resetting
 
-The D3.js force graph at `/tmp/loci_graph.html` uses:
-
-- **Radial force** — philosophy/high-degree nodes center, questions mid-ring,
-  raws outer ring. This encodes the abstraction hierarchy spatially.
-- **Node size** — proportional to degree + base size by subkind. High-degree
-  nodes (heavily connected interpretations) appear larger.
-- **Node color** by subkind:
-  - tension: red
-  - decision: yellow
-  - philosophy: purple
-  - relevance: cyan
-  - raw: grey
-- **Edge style**:
-  - `cites`: dashed grey (grounding link — interp draws on this raw)
-  - `semantic`: solid blue (meaning relationship between interpretations)
-  - `actual`: solid indigo (explicit raw→raw dependency like code imports)
-- **Click** any node for the side panel: full body, angle (if relevance),
-  and the connection list.
-- **Drag** nodes to re-pin them. **Scroll/pinch** to zoom. **Background click** closes the panel.
-
-To regenerate the graph from the current DB state, use the CLI exporter:
+When the schema or prompts change, the cleanest path is a wipe:
 
 ```bash
-uv run loci graph export codoc --output /tmp/loci_graph.html
+loci reset                 # confirms, then drops loci.db + blobs
+loci workspace create …    # set up sources
+loci workspace add-source …
+loci workspace scan <ws>
+loci project create <slug>
+loci workspace link <ws> <project>
+loci kickoff <project>
 ```
 
-That command reads the local loci database and writes a standalone HTML
-snapshot. If your friend clones the repo, they will only see a graph after
-they create or open a project with data and run the export command.
+Or to rebuild a single project's loci layer (raws preserved):
 
-The `semantic` edges are shown at very low opacity so they don't obscure the
-structural `cites` edges. If you want to hide them entirely,
-add `type != 'semantic'` to the edge export query.
+```bash
+loci rebuild <project>
+```

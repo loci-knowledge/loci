@@ -152,10 +152,13 @@ class NodeRepository:
                 INSERT INTO interpretation_nodes(node_id, origin,
                                                   origin_session_id,
                                                   origin_response_id,
+                                                  relation_md, overlap_md,
+                                                  source_anchor_md,
                                                   angle, rationale_md)
-                VALUES (?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (node.id, node.origin, node.origin_session_id, node.origin_response_id,
+                 node.relation_md, node.overlap_md, node.source_anchor_md,
                  node.angle, node.rationale_md),
             )
             self._write_tags(node.id, node.tags)
@@ -281,17 +284,19 @@ class NodeRepository:
         )
 
     def _mark_neighbors_dirty(self, node_id: str) -> None:
-        # PLAN.md §Edge cases: dirty propagates one hop on cites and semantic edges.
+        # Dirty propagates one hop along cites (interp→raw) and derives_from
+        # (interp→interp). When a locus changes, the loci that derive from it
+        # and the raws it points at may need re-derivation.
         self.conn.execute(
             """
             UPDATE nodes
             SET status = 'dirty', updated_at = ?
             WHERE status = 'live' AND id IN (
                 SELECT dst FROM edges
-                WHERE src = ? AND type IN ('cites','semantic')
+                WHERE src = ? AND type IN ('cites','derives_from')
                 UNION
                 SELECT src FROM edges
-                WHERE dst = ? AND type IN ('cites','semantic')
+                WHERE dst = ? AND type IN ('cites','derives_from')
             )
             """,
             (now_iso(), node_id, node_id),
@@ -330,6 +335,9 @@ class NodeRepository:
             status=row["status"], tags=self._tags_for(row["id"]),
             origin=row["origin"], origin_session_id=row.get("origin_session_id"),
             origin_response_id=row.get("origin_response_id"),
+            relation_md=row.get("relation_md") or "",
+            overlap_md=row.get("overlap_md") or "",
+            source_anchor_md=row.get("source_anchor_md") or "",
             angle=row.get("angle"),
             rationale_md=row.get("rationale_md") or "",
         )

@@ -44,34 +44,55 @@ def test_retrieval_excludes_other_projects(conn, fake_embedder, corpus_dir):
     assert r.nodes == []
 
 
-def test_anchored_ppr_boosts_anchor_neighbours(conn, fake_embedder, project, workspace, corpus_dir):
+def test_routing_interps_surface_in_response(conn, fake_embedder, project, workspace, corpus_dir):
+    """A locus that derives from an anchor and cites a raw routes that raw to
+    the user, and the locus appears in the routing_interps side panel."""
     _seed_basic(conn, fake_embedder, project, workspace, corpus_dir)
     nodes_repo = NodeRepository(conn)
     edges_repo = EdgeRepository(conn)
-    # Two interps; one connects to the rotary raw, one is unrelated.
-    iA = InterpretationNode(subkind="decision", title="A pattern",
-                              body="anchored interp body",
-                              origin="user_explicit_create")
-    iB = InterpretationNode(subkind="decision", title="B pattern",
-                              body="unrelated body",
-                              origin="user_explicit_create")
-    nodes_repo.create_interpretation(iA, embedding=fake_embedder.encode(iA.body))
-    nodes_repo.create_interpretation(iB, embedding=fake_embedder.encode(iB.body))
+
+    raw_id = conn.execute(
+        "SELECT id FROM nodes WHERE title='Rotary Embeddings'"
+    ).fetchone()["id"]
+
+    iA = InterpretationNode(
+        subkind="decision", title="A pattern",
+        body="",
+        relation_md="Rotary embeddings supply the position machinery for this project's encoder.",
+        overlap_md="Both projects rotate the residual stream to encode position.",
+        source_anchor_md="Section 3.2 of the paper, equation (4).",
+        origin="user_explicit_create",
+    )
+    iB = InterpretationNode(
+        subkind="decision", title="B derived",
+        body="",
+        relation_md="B builds on the rotary insight from A.",
+        overlap_md="Same rotation idea applied at attention input.",
+        source_anchor_md="Section 3.3 — derived corollary.",
+        origin="user_explicit_create",
+    )
+    nodes_repo.create_interpretation(iA, embedding=fake_embedder.encode("rotary position"))
+    nodes_repo.create_interpretation(iB, embedding=fake_embedder.encode("derived rotation"))
     ProjectRepository(conn).add_member(project.id, iA.id, role="included")
     ProjectRepository(conn).add_member(project.id, iB.id, role="included")
-    edges_repo.create(iA.id, iB.id, type="semantic")
+    edges_repo.create(iA.id, raw_id, type="cites")
+    edges_repo.create(iB.id, iA.id, type="derives_from")
 
     r = Retriever(conn, embedder=fake_embedder).retrieve(
         RetrievalRequest(
-            project_id=project.id, query="something",
+            project_id=project.id, query="rotary embeddings position",
             anchors=[iA.id], k=4,
         ),
     )
-    ids = [n.node_id for n in r.nodes]
-    # iA and iB both reachable from anchor; both should appear above pure
-    # vec/lex hits that aren't connected.
-    assert iA.id in ids
-    assert iB.id in ids
+    # Result nodes are raws (default include).
+    raw_ids = [n.node_id for n in r.nodes]
+    assert raw_id in raw_ids
+    # The locus that routed retrieval shows up in the side panel.
+    routing_ids = [ri.node_id for ri in r.routing_interps]
+    assert iA.id in routing_ids
+    # The raw's trace records the routing hop.
+    raw_node = next(n for n in r.nodes if n.node_id == raw_id)
+    assert any(hop.src == iA.id and hop.edge_type == "cites" for hop in raw_node.trace)
 
 
 def test_status_filter_excludes_dismissed(conn, fake_embedder, project, workspace, corpus_dir):
@@ -85,11 +106,12 @@ def test_status_filter_excludes_dismissed(conn, fake_embedder, project, workspac
     assert raw_id not in {n.node_id for n in r.nodes}
 
 
-def test_why_string_mentions_lex_terms(conn, fake_embedder, project, workspace, corpus_dir):
+def test_why_string_marks_direct_match(conn, fake_embedder, project, workspace, corpus_dir):
     _seed_basic(conn, fake_embedder, project, workspace, corpus_dir)
     r = Retriever(conn, embedder=fake_embedder).retrieve(
         RetrievalRequest(project_id=project.id, query="rotary embeddings", k=3),
     )
     rotary = next((n for n in r.nodes if n.title == "Rotary Embeddings"), None)
     assert rotary is not None
-    assert "matched on" in rotary.why
+    # No interp routes for this raw, so the only route is the direct match.
+    assert "matched the query directly" in rotary.why
