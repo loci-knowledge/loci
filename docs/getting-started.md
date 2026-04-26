@@ -30,11 +30,40 @@ You always start `loci` first. The extension connects to it.
 
 ## 0. Install loci
 
-loci targets Python 3.12+. We use [uv](https://docs.astral.sh/uv/) for
-dependency management.
+loci targets Python 3.12+.
+
+### Option A — one-liner (recommended)
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/loci-knowledge/loci/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/loci-knowledge/loci/main/install.ps1 | iex
+```
+
+Both scripts prefer [uv](https://docs.astral.sh/uv/) → [pipx](https://pipx.pypa.io/) → pip,
+installing loci into an isolated environment and putting `loci` on your PATH.
+
+### Option B — install from PyPI
 
 ```bash
-git clone https://github.com/<you>/loci.git
+# with uv (isolated, recommended)
+uv tool install loci
+
+# with pipx
+pipx install loci
+
+# with pip
+pip install --user loci
+```
+
+### Option C — from source (development)
+
+```bash
+git clone https://github.com/loci-knowledge/loci.git
 cd loci
 uv sync                 # creates .venv with the runtime deps
 uv sync --extra dev     # add test/lint deps if you want to run pytest
@@ -76,8 +105,8 @@ hyde_model           = openrouter:deepseek/deepseek-v4-flash     # hypothetical-
 Override any of them in `.env`:
 
 ```bash
-LOCI_INTERPRETATION_MODEL=anthropic:claude-opus-4-7
-LOCI_RAG_MODEL=openrouter:google/gemini-3-pro
+LOCI_INTERPRETATION_MODEL=openrouter:openai/gemini-3-flash-preview
+LOCI_RAG_MODEL=openrouter:google/gpt-5.5
 ```
 
 Full guide: [model-config.md](./model-config.md).

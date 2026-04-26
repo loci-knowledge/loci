@@ -74,12 +74,13 @@ class Settings(BaseSettings):
     # Used by the absorb pipeline's contradiction pass and the kickoff job.
     # Maintains/regenerates interpretation nodes; sees the project profile
     # plus a sample of raw nodes. Wants strong reasoning + long context.
-    interpretation_model: str = "openrouter:google/gemini-3-flash-preview"
+    # interpretation_model: str = "openrouter:google/gemini-3-flash-preview"
+    interpretation_model: str = "openrouter:openai/gpt-5.5"
 
     # Used by `loci draft` to synthesise output_md from retrieved candidates
     # while honouring the [Cn] citation contract. Wants strong instruction
     # following and prompt-cache friendliness.
-    rag_model: str = "anthropic/claude-sonnet-4.6"
+    rag_model: str = "openrouter:anthropic/claude-sonnet-4.6"
 
     # Used by the contradiction 3-way classifier (raw vs interpretation).
     # Many small calls; favour cheap + fast.
