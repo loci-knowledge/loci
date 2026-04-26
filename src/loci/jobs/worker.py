@@ -41,12 +41,14 @@ def _handlers() -> dict[str, HandlerFn]:
     """Resolve handlers lazily so importing the worker doesn't pull in absorb
     (which imports the embedder, which imports torch...)."""
     from loci.jobs.absorb import run as run_absorb
+    from loci.jobs.autoresearch import run as run_autoresearch
     from loci.jobs.kickoff import run as run_kickoff
     from loci.jobs.reflect import run as run_reflect
     from loci.jobs.relevance import run as run_relevance
     from loci.jobs.sweep_orphans import run as run_sweep_orphans
     return {
         "absorb": run_absorb,
+        "autoresearch": run_autoresearch,
         "kickoff": run_kickoff,
         "reflect": run_reflect,
         "relevance": run_relevance,
@@ -66,7 +68,11 @@ def run_once(conn: sqlite3.Connection) -> bool:
         mark_failed(conn, job["id"], f"no handler for kind={job['kind']}")
         return True
     try:
-        result = handler(conn, job["project_id"], job["payload"])
+        # Surface the job id to handlers that want to publish progress.
+        # Handlers that ignore the key (most of them) are unaffected.
+        payload = dict(job["payload"] or {})
+        payload.setdefault("__job_id", job["id"])
+        result = handler(conn, job["project_id"], payload)
         mark_done(conn, job["id"], result=result)
         log.info("worker: job %s done", job["id"])
     except Exception as exc:  # noqa: BLE001 — never let a job crash the worker

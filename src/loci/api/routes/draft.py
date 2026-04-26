@@ -45,6 +45,22 @@ class DraftCitationOut(BaseModel):
     title: str
     why_cited: str
     routed_by: list[str]
+    # Span-level grounding (0002_chunks): identifies which chunk inside the
+    # raw was the actual citable evidence. None for legacy un-chunked raws
+    # or raws reached only via routing.
+    chunk_id: str | None = None
+    chunk_section: str | None = None
+    # Post-draft entailment verdict ({supported, partial, unsupported,
+    # unknown}). Surfaces hallucination risk per citation.
+    verdict: str = "unknown"
+    verdict_reason: str = ""
+
+
+class VerdictOut(BaseModel):
+    handle: str
+    sentence_index: int
+    verdict: str
+    reason: str
 
 
 class RoutingLocusOut(BaseModel):
@@ -64,6 +80,7 @@ class DraftResponseBody(BaseModel):
     routing_loci: list[RoutingLocusOut]
     trace_table: list[dict]
     response_id: str
+    verdicts: list[VerdictOut] = []
 
 
 @router.post("/{project_id}/draft")
@@ -116,6 +133,8 @@ def post_draft(
             DraftCitationOut(
                 node_id=c.node_id, kind=c.kind, subkind=c.subkind,
                 title=c.title, why_cited=c.why_cited, routed_by=c.routed_by,
+                chunk_id=c.chunk_id, chunk_section=c.chunk_section,
+                verdict=c.verdict, verdict_reason=c.verdict_reason,
             )
             for c in result.citations
         ],
@@ -130,6 +149,13 @@ def post_draft(
         ],
         trace_table=result.trace_table,
         response_id=result.response_id,
+        verdicts=[
+            VerdictOut(
+                handle=v.handle, sentence_index=v.sentence_index,
+                verdict=v.verdict, reason=v.reason,
+            )
+            for v in result.verdicts
+        ],
     )
 
 
@@ -180,7 +206,9 @@ async def post_draft_stream(
             "type": "done",
             "citations": [
                 {"node_id": c.node_id, "kind": c.kind, "subkind": c.subkind,
-                 "title": c.title, "why_cited": c.why_cited, "routed_by": c.routed_by}
+                 "title": c.title, "why_cited": c.why_cited, "routed_by": c.routed_by,
+                 "chunk_id": c.chunk_id, "chunk_section": c.chunk_section,
+                 "verdict": c.verdict, "verdict_reason": c.verdict_reason}
                 for c in result.citations
             ],
             "routing_loci": [
@@ -188,6 +216,11 @@ async def post_draft_stream(
                  "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
                  "source_anchor_md": rl.source_anchor_md, "angle": rl.angle, "score": rl.score}
                 for rl in result.routing_loci
+            ],
+            "verdicts": [
+                {"handle": v.handle, "sentence_index": v.sentence_index,
+                 "verdict": v.verdict, "reason": v.reason}
+                for v in result.verdicts
             ],
             "response_id": result.response_id,
         }

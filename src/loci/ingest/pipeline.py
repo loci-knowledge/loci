@@ -31,6 +31,8 @@ from loci.embed.local import Embedder, get_embedder
 from loci.graph.models import RawNode
 from loci.graph.nodes import NodeRepository
 from loci.graph.workspaces import WorkspaceRepository
+from loci.ingest.chunker import Chunk, chunk_doc
+from loci.ingest.chunks import write_chunks
 from loci.ingest.content_hash import hash_file, store_blob
 from loci.ingest.extractors import ExtractedDoc, extract
 from loci.ingest.walker import walk
@@ -50,13 +52,14 @@ class IngestResult:
 
 @dataclass
 class _Pending:
-    """A file that's been hashed + extracted, waiting to be embedded + written."""
+    """A file that's been hashed + extracted + chunked, waiting to be embedded + written."""
     path: Path
     full_hash: str
     trunc_hash: str
     size: int
     raw_bytes: bytes
     extracted: ExtractedDoc
+    chunks: list[Chunk] = field(default_factory=list)
 
 
 class IngestPipeline:
@@ -161,35 +164,57 @@ class IngestPipeline:
         except OSError as exc:
             log.warning("read_bytes failed for %s: %s", path, exc)
             return None
+        chunks = chunk_doc(extracted.text, extracted.subkind)
+        if not chunks:
+            log.debug("chunker emitted 0 chunks for %s; skipping", path)
+            return None
         if batch_hashes is not None:
             batch_hashes.add(trunc_hash)
         return _Pending(
             path=path, full_hash=full_hash, trunc_hash=trunc_hash,
             size=size, raw_bytes=raw_bytes, extracted=extracted,
+            chunks=chunks,
         )
 
     def _flush_batch(self, batch: list[_Pending], result: IngestResult) -> None:
-        """Embed an entire batch in one model call, then write each row."""
-        texts = [self._embed_text(p) for p in batch]
+        """Embed every chunk in the batch in one model call, then write each raw + chunks.
+
+        We collect all chunks across every file in the batch, embed them in a
+        single `encode_batch()` call (the model's batched forward pass is far
+        cheaper per chunk than one call per file), then split the vector
+        matrix back per-file when writing.
+        """
+        # Flat list of every chunk text, with a per-file slice so we can split
+        # the resulting embedding matrix back.
+        all_texts: list[str] = []
+        slices: list[tuple[int, int]] = []  # (start, end) into all_texts per file
+        for p in batch:
+            start = len(all_texts)
+            all_texts.extend(self._embed_text_for_chunk(p, c) for c in p.chunks)
+            slices.append((start, len(all_texts)))
+
+        if not all_texts:
+            return
         try:
-            vectors = self.embedder.encode_batch(texts)
+            vectors = self.embedder.encode_batch(all_texts)
         except Exception as exc:  # noqa: BLE001
             log.exception("batch embedding failed")
-            result.errors.append(f"embed batch ({len(batch)} files): {exc}")
-            vectors = np.zeros((len(batch), self.embedder.dim), dtype=np.float32)
-            embed_failed = True
-        else:
-            embed_failed = False
-        for pending, vec in zip(batch, vectors, strict=True):
+            result.errors.append(
+                f"embed batch ({len(batch)} files, {len(all_texts)} chunks): {exc}",
+            )
+            vectors = None
+
+        for pending, (s, e) in zip(batch, slices, strict=True):
+            chunk_vecs = vectors[s:e] if vectors is not None else None
             try:
-                self._write_one(pending, vec if not embed_failed else None)
+                self._write_one(pending, chunk_vecs)
                 result.new_raw += 1
                 result.members_added += 1
             except Exception as exc:  # noqa: BLE001
                 log.exception("ingest write failed for %s", pending.path)
                 result.errors.append(f"{pending.path}: {exc}")
 
-    def _write_one(self, p: _Pending, vec: np.ndarray | None) -> None:
+    def _write_one(self, p: _Pending, chunk_vecs: np.ndarray | None) -> None:
         store_blob(p.full_hash, p.raw_bytes)
         title = self._derive_title(p)
         node = RawNode(
@@ -201,14 +226,23 @@ class IngestPipeline:
             mime=p.extracted.mime,
             size_bytes=p.size,
         )
-        self.nodes.create_raw(node, embedding=vec)
+        self.nodes.create_raw(node, chunks=p.chunks, chunk_embeddings=chunk_vecs)
         self.workspaces.add_member(self.workspace_id, node.id)
 
     @staticmethod
-    def _embed_text(p: _Pending) -> str:
-        text = p.extracted.text
-        prefix = f"{p.path.stem}\n\n"
-        return (prefix + text)[:8192]
+    def _embed_text_for_chunk(p: _Pending, chunk: Chunk) -> str:
+        """Build the embedding input for a chunk.
+
+        We prepend the file stem and the section heading (if any) so the
+        embedding captures "this chunk lives inside X" — useful when two
+        files share the same boilerplate and the file identity is the
+        disambiguating signal.
+        """
+        prefix_parts = [p.path.stem]
+        if chunk.section:
+            prefix_parts.append(chunk.section)
+        prefix = " :: ".join(prefix_parts) + "\n\n"
+        return (prefix + chunk.text)[:8192]
 
     @staticmethod
     def _derive_title(p: _Pending) -> str:

@@ -1,30 +1,37 @@
 """Drafting with the loci-of-thought citation contract.
 
-The new contract: a draft cites RAWS, not loci. Loci of thought are the
+The contract: a draft cites RAWS, not loci. Loci of thought are the
 *routing* layer — they explain WHY each raw is the right anchor for the
 project, but they are not quotable content. The user gets:
 
     output_md      — the answer, with [C1]…[Cn] markers pointing at raws
-    citations[]    — one entry per cited raw
+    citations[]    — one entry per cited raw (with chunk + entailment verdict)
     trace_table[]  — per cited raw, the chain of loci that routed retrieval to it
     routing_loci[] — the deduped set of loci used as routers (UI side panel)
+    verdicts[]     — per-citation entailment judgement (supported / partial / unsupported)
 
 Pipeline:
 
-    retrieve (returns raws + trace_table) →
-    build a numbered candidate block ([C1]…[Cn] mapped to raw ULIDs;
-        each candidate carries its routing-locus context as a ROUTING-CONTEXT
-        block — NOT cited material, just background) →
-    call the LLM with a system prompt that mandates raw-only citation →
+    retrieve (raws + winning chunks + trace_table) →
+    group candidates by primary routing locus, render numbered block;
+        each candidate's snippet is its CHUNK text (not a head truncation)
+        so the LLM (and the verifier) see the actual span that supports
+        retrieval; loci context is rendered as ROUTING-CONTEXT (not citable) →
+    LLM call with raw-only citation contract →
     parse [Cn] markers, drop unknown handles →
-    persist Response + Traces (cited + retrieved + routed_via) →
+    entailment verifier checks each (sentence, [Cn]) pair against the chunk →
+    persist Response + Traces (cited + retrieved + routed_via + verdicts) →
     return DraftResult.
 
-Why raws as candidates: in the loci model, raws hold the answer; loci hold the
-routing. Citing a locus would be citing a pointer instead of the thing it
-points at. The locus context still helps the LLM — it sees "this raw was
-reached via [philosophy:CLI bridges] which says <relation>" — but the
-citation lands on the raw.
+Why chunks: citing a 50-page PDF as the source of a sentence gives the user
+no way to verify the claim. Chunk-level grounding is the foundation of
+KG2RAG-style anti-hallucination — the verifier needs an actual span to
+compare the claim against.
+
+Why grouping by routing locus: KG2RAG's MST organisation packs co-routed
+chunks together so the LLM reads them as a coherent story rather than as
+isolated fragments. Loci's natural unit of "co-routed" is "share a locus
+of thought," so candidates fan out under their primary routing locus.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ from loci.graph import NodeRepository
 from loci.graph.models import NodeKind, Subkind
 from loci.llm import LLMNotConfiguredError, build_agent
 from loci.retrieve import RetrievalRequest, Retriever, RoutingInterp
+from loci.verify import CitationVerdict, verify
 
 log = logging.getLogger(__name__)
 
@@ -50,8 +58,10 @@ CiteDensity = Literal["low", "normal", "high"]
 # Maximum number of candidate raws we surface to the LLM per draft call.
 MAX_CANDIDATES = 40
 
-# Snippet budgets (chars). Raws are documents; loci context is short.
-RAW_SNIPPET_BUDGET = 800
+# Snippet budgets (chars). Chunks are bounded by the chunker so we display
+# them in full where possible; the cap here is just a hard ceiling for very
+# rare oversized chunks. Loci context is short.
+CHUNK_SNIPPET_BUDGET = 1800
 LOCUS_CONTEXT_BUDGET = 320
 
 # Citation marker regex: [C1], [c12], [C03], etc.
@@ -70,11 +80,14 @@ class DraftRequest:
     hyde: bool = False
     k: int = 12
     client: str = "unknown"
+    # Run the post-draft entailment verifier? Default on. Disable for tests
+    # or fast paths where the extra LLM call isn't worth the latency.
+    verify: bool = True
 
 
 @dataclass
 class DraftCitation:
-    """One cited raw + its routing trace."""
+    """One cited raw + its routing trace + chunk + entailment verdict."""
     node_id: str
     kind: NodeKind                 # always 'raw' in the new model
     subkind: Subkind
@@ -82,6 +95,15 @@ class DraftCitation:
     why_cited: str                 # "matched the query directly" / "routed via 2 loci"
     # Loci that routed retrieval to this raw (interp ids in walk order).
     routed_by: list[str] = field(default_factory=list)
+    # The winning chunk's id + section heading. None when the raw was reached
+    # only via routing (no direct chunk hit) or for legacy non-chunked raws.
+    chunk_id: str | None = None
+    chunk_section: str | None = None
+    # Best verdict across all (sentence, this-handle) pairs. "supported" if
+    # the chunk entails any one of the sentences citing it; "partial" /
+    # "unsupported" otherwise. "unknown" when verifier couldn't run.
+    verdict: str = "unknown"
+    verdict_reason: str = ""
 
 
 @dataclass
@@ -109,11 +131,15 @@ class DraftResult:
     response_id: str
     candidate_count: int
     retrieved_node_ids: list[str]
+    # Per-(sentence, handle) entailment verdicts from the verifier. Empty
+    # when verification was disabled or skipped.
+    verdicts: list[CitationVerdict] = field(default_factory=list)
 
 
 def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
-    """Run the full draft pipeline. Synchronous — one LLM call."""
-    # 1. Retrieve. The new pipeline returns raws + trace_table + routing_interps.
+    """Run the full draft pipeline. One LLM call for generation + one for verification."""
+    # 1. Retrieve. The new pipeline returns raws + trace_table + routing_interps,
+    # each raw carrying its winning chunk_id + chunk_text where available.
     retriever = Retriever(conn)
     query = (req.context_md.strip() + "\n\n" if req.context_md else "") + req.instruction
     retrieval = retriever.retrieve(RetrievalRequest(
@@ -129,8 +155,10 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
     trace_by_raw = {row["raw_id"]: row for row in retrieval.trace_table}
     routing_by_id = {ri.node_id: ri for ri in retrieval.routing_interps}
 
-    # 2. Build candidate block + handle map.
-    candidate_block, handle_to_id = _format_candidates(
+    # 2. Build the candidate block + handle map. Candidates are grouped by
+    # primary routing locus so the LLM reads co-routed chunks together
+    # (KG2RAG's MST + DFS organisation, adapted to loci's graph).
+    candidate_block, handle_to_id, handle_to_chunk_text = _format_candidates(
         candidates, conn, trace_by_raw=trace_by_raw, routing_by_id=routing_by_id,
     )
 
@@ -152,13 +180,36 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
             cited_ids.append(nid)
             seen.add(nid)
 
-    # 5. Build the citations[] block (only raws).
-    citations = _materialise_citations(conn, candidates, cited_ids, trace_by_raw)
+    # 5. Run the entailment verifier on (sentence, [Cn]) pairs.
+    verdicts: list[CitationVerdict] = []
+    verdict_by_handle: dict[str, CitationVerdict] = {}
+    if req.verify and cited_handles:
+        chunks_for_verifier = {
+            h: handle_to_chunk_text[h]
+            for h in cited_handles
+            if h in handle_to_chunk_text and handle_to_chunk_text[h]
+        }
+        if chunks_for_verifier:
+            vres = verify(output_md, chunks_for_verifier)
+            verdicts = vres.verdicts
+            # Best verdict per handle (supported beats partial beats unsupported beats unknown).
+            rank = {"supported": 3, "partial": 2, "unsupported": 1, "unknown": 0}
+            for v in verdicts:
+                cur = verdict_by_handle.get(v.handle)
+                if cur is None or rank[v.verdict] > rank[cur.verdict]:
+                    verdict_by_handle[v.handle] = v
 
-    # 6. Compose routing_loci side panel (deduped, scored).
+    # 6. Build the citations[] block (only raws), now annotated with chunks
+    # and best-verdict.
+    citations = _materialise_citations(
+        conn, candidates, cited_ids, trace_by_raw,
+        handle_to_id=handle_to_id, verdict_by_handle=verdict_by_handle,
+    )
+
+    # 7. Compose routing_loci side panel (deduped, scored).
     routing_loci = [_to_routing_locus(ri) for ri in retrieval.routing_interps]
 
-    # 7. Persist Response (with trace_table) + per-node traces.
+    # 8. Persist Response (with trace_table) + per-node traces.
     record = ResponseRecord(
         project_id=req.project_id, session_id=req.session_id,
         request={
@@ -166,6 +217,7 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
             "cite_density": req.cite_density, "k": req.k,
             "hyde": req.hyde, "anchors": req.anchors,
             "has_context": req.context_md is not None,
+            "verified": req.verify,
         },
         output=output_md,
         cited_node_ids=cited_ids,
@@ -176,11 +228,11 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
         record, retrieved_node_ids=[c.node_id for c in candidates],
     )
 
-    # 8. Per-locus 'routed_via' traces — record which loci served each cited raw.
+    # 9. Per-locus 'routed_via' traces — record which loci served each cited raw.
     _persist_route_traces(conn, req.project_id, req.session_id, rid,
                            cited_ids, trace_by_raw)
 
-    # 9. Enqueue a reflection job — the interpreter agent gets to learn from
+    # 10. Enqueue a reflection job — the interpreter agent gets to learn from
     # which loci routed which raws into a successful draft.
     try:
         from loci.jobs.queue import enqueue
@@ -199,6 +251,7 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
         response_id=rid,
         candidate_count=len(candidates),
         retrieved_node_ids=[c.node_id for c in candidates],
+        verdicts=verdicts,
     )
 
 
@@ -213,65 +266,123 @@ def _format_candidates(
     *,
     trace_by_raw: dict[str, dict],
     routing_by_id: dict[str, RoutingInterp],
-) -> tuple[str, dict[str, str]]:
-    """Render candidates as a numbered block.
+) -> tuple[str, dict[str, str], dict[str, str]]:
+    """Render candidates as a numbered block, grouped by primary routing locus.
 
-    Each candidate is a RAW node. Its routing context (the loci that pointed
-    at it during retrieval) is rendered as a ROUTING-CONTEXT block — *not*
-    citable content, but the LLM sees it so it understands WHY this raw is
+    Each candidate is a RAW node. Its winning CHUNK is the citable span; the
+    routing loci are rendered as a ROUTING-CONTEXT block — *not* citable
+    content, but the LLM sees them so it understands WHY this raw is
     relevant to the project.
+
+    Returns (candidate_block, handle_to_node_id, handle_to_chunk_text).
+    The chunk-text dict feeds the post-draft verifier.
     """
     nodes_repo = NodeRepository(conn)
     all_ids = [c.node_id for c in candidates]
     by_id = {n.id: n for n in nodes_repo.get_many(all_ids)}
 
-    handle_to_id: dict[str, str] = {}
-    lines: list[str] = []
-    for i, cand in enumerate(candidates, start=1):
-        handle = f"C{i}"
-        handle_to_id[handle] = cand.node_id
-        node = by_id.get(cand.node_id)
-        if node is None:
+    # Compute a primary routing locus for each candidate. Pick the highest-
+    # scoring locus from the candidate's trace; fall back to "direct" when
+    # the raw has no routing.
+    primary_locus_by_cand: dict[str, str | None] = {}
+    for cand in candidates:
+        trace = trace_by_raw.get(cand.node_id)
+        if not trace or not trace["interp_path"]:
+            primary_locus_by_cand[cand.node_id] = None
             continue
-        snippet = _truncate(node.body, RAW_SNIPPET_BUDGET)
-        block = (
-            f"[{handle}] kind={node.kind}/{node.subkind} title=\"{node.title}\"\n"
-            f"why-retrieved: {cand.why}\n"
-            f"---\n{snippet}"
-        )
-        # Routing context — loci whose cites edges point at this raw.
-        trace = trace_by_raw.get(node.id)
-        if trace and trace["interp_path"]:
-            interp_ids = []
-            for hop in trace["interp_path"]:
-                interp_ids.append(hop["id"])
-                if hop["edge"] == "derives_from":
-                    interp_ids.append(hop["to"])
-            unique_interp_ids: list[str] = []
-            seen: set[str] = set()
-            for iid in interp_ids:
-                if iid not in seen:
-                    seen.add(iid)
-                    unique_interp_ids.append(iid)
-            ctx_parts: list[str] = []
-            for iid in unique_interp_ids[:3]:  # cap at 3 routers per candidate
-                ri = routing_by_id.get(iid)
-                if ri is None:
-                    continue
-                line = (
-                    f"  - [{ri.subkind}] {ri.title}"
-                    + (f" (angle={ri.angle})" if ri.angle else "")
-                )
+        # First locus in the trace path is the strongest router (the trace is
+        # accumulated in walk order from the highest-scoring routing interp).
+        first = trace["interp_path"][0]
+        primary_locus_by_cand[cand.node_id] = first["id"]
+
+    # Group: primary_locus_id -> [candidate]. Order: groups by best score,
+    # candidates within group by their own score.
+    groups: dict[str | None, list] = {}
+    for cand in candidates:
+        groups.setdefault(primary_locus_by_cand[cand.node_id], []).append(cand)
+
+    def _group_score(locus_id: str | None) -> float:
+        if locus_id is None:
+            return -1e9  # Direct-hits group goes last
+        ri = routing_by_id.get(locus_id)
+        return ri.score if ri else 0.0
+
+    ordered_locus_ids = sorted(groups.keys(), key=lambda lid: -_group_score(lid))
+
+    handle_to_id: dict[str, str] = {}
+    handle_to_chunk_text: dict[str, str] = {}
+    blocks: list[str] = []
+    handle_n = 0
+
+    for locus_id in ordered_locus_ids:
+        group_cands = groups[locus_id]
+        # Group header
+        if locus_id is None:
+            header = (
+                "GROUP: direct hits — these raws matched the query without a "
+                "routing locus."
+            )
+        else:
+            ri = routing_by_id.get(locus_id)
+            if ri is None:
+                header = f"GROUP: locus {locus_id[:8]}…"
+            else:
+                header_lines = [
+                    f"GROUP: routed via locus [{ri.subkind}] {ri.title}"
+                    + (f" (angle={ri.angle})" if ri.angle else ""),
+                ]
                 if ri.relation_md:
-                    line += f"\n    relation: {_truncate(ri.relation_md, LOCUS_CONTEXT_BUDGET)}"
+                    header_lines.append(
+                        f"  relation: {_truncate(ri.relation_md, LOCUS_CONTEXT_BUDGET)}",
+                    )
+                if ri.overlap_md:
+                    header_lines.append(
+                        f"  overlap:  {_truncate(ri.overlap_md, LOCUS_CONTEXT_BUDGET)}",
+                    )
                 if ri.source_anchor_md:
-                    line += f"\n    anchor: {_truncate(ri.source_anchor_md, LOCUS_CONTEXT_BUDGET)}"
-                ctx_parts.append(line)
-            if ctx_parts:
-                block += "\n\nROUTING-CONTEXT (loci that point at this raw — DO NOT CITE):\n"
-                block += "\n".join(ctx_parts)
-        lines.append(block + "\n")
-    return "\n\n".join(lines), handle_to_id
+                    header_lines.append(
+                        f"  anchor:   {_truncate(ri.source_anchor_md, LOCUS_CONTEXT_BUDGET)}",
+                    )
+                header = "\n".join(header_lines)
+
+        # Sort candidates within the group by their own retrieval score.
+        group_cands.sort(key=lambda c: -c.score)
+
+        cand_blocks: list[str] = [header]
+        for cand in group_cands:
+            handle_n += 1
+            handle = f"C{handle_n}"
+            handle_to_id[handle] = cand.node_id
+            node = by_id.get(cand.node_id)
+            if node is None:
+                continue
+            # Snippet: the winning chunk text (post-chunker) is the first
+            # choice. If retrieval gave us no chunk (routing-only or legacy),
+            # fall back to the existing snippet (FTS truncation) or body head.
+            snippet = cand.chunk_text or cand.snippet or _snippet_fallback(node.body)
+            snippet = _truncate(snippet, CHUNK_SNIPPET_BUDGET)
+            handle_to_chunk_text[handle] = cand.chunk_text or snippet
+
+            section_line = ""
+            if cand.chunk_section:
+                section_line = f" section=\"{cand.chunk_section}\""
+
+            block = (
+                f"  [{handle}] kind={node.kind}/{node.subkind} "
+                f"title=\"{node.title}\"{section_line}\n"
+                f"  why-retrieved: {cand.why}\n"
+                f"  ---\n"
+                + _indent(snippet, 2)
+            )
+            cand_blocks.append(block)
+        blocks.append("\n\n".join(cand_blocks))
+
+    return "\n\n========\n\n".join(blocks), handle_to_id, handle_to_chunk_text
+
+
+def _indent(text: str, n: int) -> str:
+    pad = " " * n
+    return "\n".join(pad + line if line else line for line in text.splitlines())
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -281,16 +392,29 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + "…"
 
 
+def _snippet_fallback(body: str) -> str:
+    one_line = " ".join((body or "").split())
+    return one_line[:300] + ("…" if len(one_line) > 300 else "")
+
+
 def _materialise_citations(
     conn: sqlite3.Connection,
     candidates,
     cited_ids: list[str],
     trace_by_raw: dict[str, dict],
+    *,
+    handle_to_id: dict[str, str],
+    verdict_by_handle: dict[str, CitationVerdict],
 ) -> list[DraftCitation]:
-    """Build the citations[] block — one entry per cited raw + routing loci."""
+    """Build the citations[] block — one entry per cited raw + routing loci + verdict."""
     nodes_repo = NodeRepository(conn)
     cand_by_id = {c.node_id: c for c in candidates}
     nodes = {n.id: n for n in nodes_repo.get_many(cited_ids)}
+    # Reverse handle map so we can find the verdict for a given node.
+    id_to_handles: dict[str, list[str]] = {}
+    for h, nid in handle_to_id.items():
+        id_to_handles.setdefault(nid, []).append(h)
+
     out: list[DraftCitation] = []
     for nid in cited_ids:
         n = nodes.get(nid)
@@ -308,9 +432,21 @@ def _materialise_citations(
                     if iid and iid not in seen:
                         seen.add(iid)
                         routed_by.append(iid)
+        # Best verdict across all handles that map to this raw.
+        best_verdict = "unknown"
+        best_reason = ""
+        rank = {"supported": 3, "partial": 2, "unsupported": 1, "unknown": 0}
+        for h in id_to_handles.get(nid, []):
+            v = verdict_by_handle.get(h)
+            if v and rank[v.verdict] > rank[best_verdict]:
+                best_verdict = v.verdict
+                best_reason = v.reason
         out.append(DraftCitation(
             node_id=nid, kind=n.kind, subkind=n.subkind, title=n.title,
             why_cited=why, routed_by=routed_by,
+            chunk_id=cand.chunk_id if cand else None,
+            chunk_section=cand.chunk_section if cand else None,
+            verdict=best_verdict, verdict_reason=best_reason,
         ))
     return out
 
@@ -373,27 +509,34 @@ SYSTEM_PROMPT = """\
 You are loci's draft engine. You answer the user from RAW SOURCES they have
 collected, with help from the user's LOCI OF THOUGHT (routing context).
 
-A LOCUS OF THOUGHT is a pointer, not content. Each candidate raw arrives with
-a ROUTING-CONTEXT block listing the loci that pointed at it: those tell you
-WHY this raw matters to this project, and which part of it carries the weight.
-You may use that context to decide what to write — but you MUST NOT cite a
-locus. Citations land on raws only. The locus is the user's reasoning about
-the source; the source is the evidence.
+A LOCUS OF THOUGHT is a pointer, not content. Candidates are organised in
+GROUPS, where each group is led by the routing locus that pointed at all
+the raws inside it (relation / overlap / anchor). The locus tells you WHY
+those raws matter to this project; the raws are the evidence. You may use
+the locus context to decide what to write — but you MUST NOT cite a locus.
+Citations land on raws only.
+
+Each raw inside a group arrives as a single CHUNK — the specific span
+that retrieval matched. That chunk is the citable evidence. If the chunk
+does not say something, you may not cite the raw for it.
 
 You will be given:
 1. INSTRUCTION — what to write.
 2. (optional) CONTEXT_MD — text the user has already written.
-3. CANDIDATES — a numbered list of [C1]…[Cn] entries. Each entry is a raw
-   source. Some include a ROUTING-CONTEXT block. ROUTING-CONTEXT is for your
-   understanding only. NEVER cite it.
+3. CANDIDATES — grouped by routing locus. Each entry is one raw chunk with
+   handle [C1]…[Cn]. The GROUP header is for your understanding only; the
+   raws inside it are the evidence.
 
 Rules:
 - Write in markdown.
 - Cite using inline markers shaped exactly like [C1], [C7], etc.
 - ONLY cite candidates that appear in CANDIDATES. Never invent a handle.
   Never write [C99] if there is no C99.
-- Use ROUTING-CONTEXT to understand which part of a raw matters and why,
-  but quote/cite from the raw itself.
+- A citation [Cn] must be supported by the chunk shown for Cn. If the
+  chunk doesn't say it, don't cite Cn for it. Make a different claim or
+  cite a different chunk that does.
+- Use ROUTING headers to understand which part of a raw matters and why,
+  but quote/cite from the raw chunk itself.
 - If the candidates do not support a needed claim, write the claim WITHOUT a
   citation. Do not pad. Do not fabricate.
 - The output should read as a coherent piece of writing.

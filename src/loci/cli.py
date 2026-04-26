@@ -17,6 +17,8 @@ Subcommands:
     loci draft <project> <instruction> [--style] [--cite-density]
     loci kickoff <project> [--n]          seed the interpretation graph
     loci reflect <project>                manual reflect cycle
+    loci research <project> <workspace> <query>
+                                          autoresearch: search papers + sandbox
     loci absorb <project>
     loci graph export <project> [--output FILE]
     loci rebuild <project>
@@ -555,6 +557,60 @@ def reflect(project: str, response_id: str | None = None) -> None:
 
 
 @app.command
+def research(
+    project: str,
+    workspace: str,
+    query: str,
+    hf_owner: str | None = None,
+    hardware: str = "cpu-basic",
+    no_sandbox: bool = False,
+    max_iterations: int = 30,
+) -> None:
+    """Run an autoresearch job: search papers, optionally run code, ingest artifacts.
+
+    Saves paper notes, code, and a summary under the workspace's first source
+    root at `<root>/research/<run_id>/`, then re-scans the workspace so the
+    artifacts become raw nodes. A `relevance` locus is created that cites the
+    new raws, so subsequent `loci q`/`loci draft` can route to them.
+
+    Sandbox requires HF_TOKEN env + --hf-owner (or LOCI_RESEARCH_HF_OWNER).
+    Pass --no-sandbox to skip code execution and only do paper discovery.
+    """
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph.workspaces import WorkspaceRepository
+    from loci.jobs import enqueue
+    from loci.jobs.queue import get_job
+    from loci.jobs.worker import run_once
+
+    migrate()
+    conn = connect()
+    proj = _resolve_project(conn, project)
+    ws = _resolve_workspace(conn, workspace)
+    if not WorkspaceRepository(conn).list_sources(ws.id):
+        console.print(
+            f"[red]workspace {ws.slug!r} has no source roots.[/red] "
+            f"Add one with [cyan]loci workspace add-source {ws.slug} <path>[/cyan]",
+        )
+        raise SystemExit(1)
+    jid = enqueue(
+        conn, kind="autoresearch", project_id=proj.id,
+        payload={
+            "query": query,
+            "workspace_id": ws.id,
+            "hf_owner": hf_owner,
+            "hardware": hardware,
+            "sandbox": not no_sandbox,
+            "max_iterations": max_iterations,
+        },
+    )
+    console.print(f"[dim]enqueued autoresearch {jid}; running...[/dim]")
+    run_once(conn)
+    job = get_job(conn, jid)
+    console.print(job)
+
+
+@app.command
 def absorb(project: str) -> None:
     """Enqueue and run an absorb checkpoint synchronously (CLI-blocking)."""
     from loci.db import migrate
@@ -682,6 +738,31 @@ def kickoff(project: str, n: int = 8) -> None:
     run_once(conn)
     j = get_job(conn, jid)
     console.print(j)
+
+
+@app.command
+def backfill(project: str | None = None) -> None:
+    """Chunk + embed any raws that pre-date the chunks migration (0002).
+
+    Idempotent — raws already chunked are skipped. Pass `project` to scope
+    to one project; omit to backfill the whole DB.
+    """
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.ingest.backfill import backfill_chunks
+
+    migrate()
+    conn = connect()
+    pid: str | None = None
+    if project:
+        pid = _resolve_project(conn, project).id
+    res = backfill_chunks(conn, pid)
+    console.print({
+        "raws_processed": res.raws_processed,
+        "chunks_written": res.chunks_written,
+        "skipped_empty": res.skipped_empty,
+        "errors": res.errors[:5],
+    })
 
 
 @app.command

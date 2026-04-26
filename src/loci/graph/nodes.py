@@ -90,14 +90,30 @@ class NodeRepository:
     # Writes
     # -----------------------------------------------------------------------
 
-    def create_raw(self, node: RawNode, embedding: np.ndarray | None = None) -> RawNode:
-        """Insert a RawNode + raw_nodes row + tags + (optionally) embedding.
+    def create_raw(
+        self,
+        node: RawNode,
+        embedding: np.ndarray | None = None,
+        *,
+        chunks: list | None = None,
+        chunk_embeddings: np.ndarray | None = None,
+    ) -> RawNode:
+        """Insert a RawNode + raw_nodes row + tags + chunks + chunk embeddings.
 
-        Caller is responsible for the embedding because the embedder is heavy
-        and the ingest pipeline batches embeddings. If `embedding` is None we
-        skip the vec write — the node is searchable lex but not vec until a
-        later `set_embedding()`.
+        Two embedding paths are supported:
+
+        - `chunks` + `chunk_embeddings`: the new path. Spans land in
+          `raw_chunks` and per-chunk vectors land in `chunk_vec`. This is
+          how the ingest pipeline writes raws now.
+        - `embedding`: legacy single-vector path. Writes a whole-file vector
+          to `node_vec`. Kept for tests and backfill scenarios where the
+          chunker hasn't run yet.
+
+        Both can be supplied simultaneously (rare — only useful if you want a
+        whole-file fallback alongside chunk granularity).
         """
+        from loci.ingest.chunks import write_chunks  # local to avoid import cycle
+
         with self._txn():
             self.conn.execute(
                 """
@@ -126,6 +142,8 @@ class NodeRepository:
             self._write_tags(node.id, node.tags)
             if embedding is not None:
                 self._write_embedding(node.id, embedding)
+            if chunks:
+                write_chunks(self.conn, node.id, chunks, chunk_embeddings)
         return node
 
     def create_interpretation(

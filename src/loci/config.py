@@ -89,6 +89,28 @@ class Settings(BaseSettings):
     # Used by HyDE expansion. Throwaway hypothetical answers; favour fast.
     hyde_model: str = "openrouter:deepseek/deepseek-v4-flash"
 
+    # Used by the autoresearch sub-agent (paper crawl + sandbox tool calls).
+    # Falls back to interpretation_model if not set. Wants strong tool use +
+    # long context for digesting paper sections.
+    research_model: str = "openrouter:anthropic/claude-sonnet-4.6"
+
+    # --- Auto-research -------------------------------------------------
+    # HF account that owns sandbox Spaces created by the research agent.
+    # Read from env LOCI_RESEARCH_HF_OWNER (or fall back to HF_OWNER in the
+    # autoresearch handler). Required when sandbox=True.
+    research_hf_owner: str | None = None
+    # Default HF Spaces hardware tier for sandboxes.
+    research_sandbox_hardware: str = "cpu-basic"
+    # Template Space duplicated to bootstrap sandboxes. The agent overwrites
+    # `sandbox_server.py` + `Dockerfile` on first commit, so any duplicable
+    # Space works. ml-intern's `burtenshaw/sandbox` is a known-good default.
+    research_template_space: str = "burtenshaw/sandbox"
+    # HF API token. Read from `HF_TOKEN` (no LOCI_ prefix) so users don't
+    # have to set two variables.
+    hf_token: SecretStr | None = Field(default=None, alias="HF_TOKEN")
+    # Semantic Scholar API key (optional, raises rate limits).
+    s2_api_key: SecretStr | None = Field(default=None, alias="S2_API_KEY")
+
     # --- LLM behaviour --------------------------------------------------
     # Whether to enable Anthropic prompt caching on instructions / system
     # prompts. Free latency + cost win on Anthropic; ignored by other providers.

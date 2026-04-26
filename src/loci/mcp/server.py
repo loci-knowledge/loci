@@ -14,6 +14,8 @@ Tools:
     loci_propose_node(subkind, title, relation_md, overlap_md, source_anchor_md,
                       angle?, body?, project?, cites?, derives_from?)
     loci_accept_proposal(proposal_id)
+    loci_research(query, workspace, project?, hf_owner?, hardware?, sandbox?)
+    loci_research_status(job_id)
     loci_absorb(project?)
     loci_feedback(response_id, edited_markdown)
     loci_workspace_create(slug, name, kind?, description_md?)
@@ -244,12 +246,19 @@ def build_mcp_server() -> FastMCP:
                     "node_id": c.node_id, "kind": c.kind, "subkind": c.subkind,
                     "title": c.title, "why_cited": c.why_cited,
                     "routed_by": c.routed_by,
+                    "chunk_id": c.chunk_id, "chunk_section": c.chunk_section,
+                    "verdict": c.verdict, "verdict_reason": c.verdict_reason,
                 }
                 for c in result.citations
             ],
             "routing_loci": _routing_loci_dicts,
             "trace_table": result.trace_table,
             "response_id": result.response_id,
+            "verdicts": [
+                {"handle": v.handle, "sentence_index": v.sentence_index,
+                 "verdict": v.verdict, "reason": v.reason}
+                for v in result.verdicts
+            ],
         }
 
     @mcp.tool(
@@ -378,6 +387,80 @@ def build_mcp_server() -> FastMCP:
                     (nid,),
                 )
         return {"proposal_id": proposal_id, "status": "accepted"}
+
+    @mcp.tool(
+        name="loci_research",
+        description=(
+            "Kick off an autoresearch run for a project. Spawns a sub-agent "
+            "that searches papers (HuggingFace + Semantic Scholar + arXiv), "
+            "optionally runs code in an HF Spaces sandbox, and writes "
+            "artifacts (paper notes, code, summary) into the given workspace. "
+            "On completion the artifacts become raw nodes and a `relevance` "
+            "locus is created citing them, so future `loci_retrieve` / "
+            "`loci_draft` calls can route to them.\n\n"
+            "Returns `{job_id}`. Poll with `loci_research_status(job_id)`. "
+            "Sandbox requires HF_TOKEN env var + `hf_owner` (or "
+            "LOCI_RESEARCH_HF_OWNER setting). Pass `sandbox=False` to skip "
+            "code execution and only do paper discovery."
+        ),
+    )
+    def loci_research(
+        query: str,
+        workspace: str,
+        project: str | None = None,
+        hf_owner: str | None = None,
+        hardware: str = "cpu-basic",
+        sandbox: bool = True,
+        max_iterations: int = 30,
+    ) -> dict[str, Any]:
+        conn = get_connection()
+        try:
+            project_id = resolve_project_id(conn, project)
+        except ProjectNotFound as e:
+            return {"error": str(e)}
+        ws_repo = WorkspaceRepository(conn)
+        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
+        if ws is None:
+            return {"error": f"workspace not found: {workspace}"}
+        if not ws_repo.list_sources(ws.id):
+            return {
+                "error": (
+                    f"workspace {ws.slug!r} has no source roots. "
+                    "Add one with `loci_workspace_add_source` first."
+                ),
+            }
+        job_id = enqueue(
+            conn, kind="autoresearch", project_id=project_id,
+            payload={
+                "query": query,
+                "workspace_id": ws.id,
+                "hf_owner": hf_owner,
+                "hardware": hardware,
+                "sandbox": sandbox,
+                "max_iterations": max_iterations,
+            },
+        )
+        return {
+            "job_id": job_id, "status": "queued",
+            "workspace_id": ws.id, "project_id": project_id,
+        }
+
+    @mcp.tool(
+        name="loci_research_status",
+        description=(
+            "Poll an autoresearch (or any other) job's status by id. Returns "
+            "`{status, progress, result, error}`. When `status='done'`, "
+            "`result` carries the summary, artifact paths, and the locus id "
+            "that cites them."
+        ),
+    )
+    def loci_research_status(job_id: str) -> dict[str, Any]:
+        conn = get_connection()
+        from loci.jobs import get_job
+        job = get_job(conn, job_id)
+        if job is None:
+            return {"error": "job not found", "job_id": job_id}
+        return job
 
     @mcp.tool(
         name="loci_absorb",

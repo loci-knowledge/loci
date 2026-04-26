@@ -132,6 +132,13 @@ class RetrievedNode:
     # Trace through the interp DAG that reached this node. For a raw retrieved
     # via routing, this is the path of hops; for a directly-scored raw, empty.
     trace: list[RouteHop] = field(default_factory=list)
+    # When the raw was reached via a chunk-level hit (vec or lex on chunks_fts),
+    # these point at the winning span. None for interp hits or for raws that
+    # were only routed-via (no direct chunk match) — in that case the snippet
+    # falls back to a head truncation of the body.
+    chunk_id: str | None = None
+    chunk_text: str | None = None
+    chunk_section: str | None = None
 
 
 @dataclass
@@ -256,7 +263,21 @@ class Retriever:
         # Stage 5: materialise + filter
         # --------------------------------------------------------------
         ranked = sorted(merged.items(), key=lambda kv: -kv[1])
-        snippet_by_id = {h.node_id: h.snippet for h in raw_lex}
+
+        # Per-raw winning chunk: prefer the lex chunk hit (it has snippet
+        # markers from FTS), then fall back to the vec chunk hit. Both carry
+        # `chunk_id` + `chunk_text` only when the underlying index returned
+        # span-level rows.
+        snippet_by_id: dict[str, str] = {}
+        chunk_by_id: dict[str, tuple[str | None, str | None, str | None]] = {}
+        for h in raw_lex:
+            snippet_by_id.setdefault(h.node_id, h.snippet)
+            if h.chunk_id and h.node_id not in chunk_by_id:
+                chunk_by_id[h.node_id] = (h.chunk_id, h.chunk_text, h.chunk_section)
+        for h in raw_vec:
+            if h.chunk_id and h.node_id not in chunk_by_id:
+                chunk_by_id[h.node_id] = (h.chunk_id, h.chunk_text, h.chunk_section)
+
         node_ids_to_load = [nid for nid, _ in ranked[: req.k * 4]]
         nodes_by_id = {n.id: n for n in self.nodes_repo.get_many(node_ids_to_load)}
 
@@ -276,11 +297,21 @@ class Retriever:
                 direct=nid in direct_scores,
                 trace=per_raw_trace.get(nid, []),
             )
+            chunk_id, chunk_text, chunk_section = chunk_by_id.get(nid, (None, None, None))
+            # Snippet preference: FTS snippet (with ⟪…⟫ markers) > raw chunk
+            # text > head-truncated body fallback.
+            snippet = snippet_by_id.get(nid)
+            if not snippet and chunk_text:
+                snippet = _snippet_fallback(chunk_text)
+            if not snippet:
+                snippet = _snippet_fallback(node.body)
             materialised.append(RetrievedNode(
                 node_id=nid, kind=node.kind, subkind=node.subkind,
-                title=node.title, snippet=snippet_by_id.get(nid, _snippet_fallback(node.body)),
+                title=node.title, snippet=snippet,
                 score=score, why=why, channel_ranks={},
                 trace=per_raw_trace.get(nid, []),
+                chunk_id=chunk_id, chunk_text=chunk_text,
+                chunk_section=chunk_section,
             ))
             self.nodes_repo.bump_access(nid)
             if len(materialised) >= req.k:
