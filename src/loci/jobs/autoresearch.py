@@ -38,7 +38,7 @@ from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
 from loci.graph.models import InterpretationNode, new_id
 from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest.pipeline import scan_workspace
-from loci.jobs.queue import enqueue, set_progress
+from loci.jobs.queue import append_job_step, enqueue, set_progress
 from loci.research import run_research
 
 log = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     output_dir = base_root / "research" / run_id
 
     settings = get_settings()
-    enable_sandbox = bool(payload.get("sandbox", True))
+    enable_sandbox = bool(payload.get("sandbox", False))
     hf_owner = payload.get("hf_owner") or os.environ.get("HF_OWNER") or settings.research_hf_owner
     if enable_sandbox and not hf_owner:
         log.warning("autoresearch: no hf_owner set; sandbox disabled.")
@@ -94,6 +94,10 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
 
     if job_id:
         set_progress(conn, job_id, 0.05, message="starting research agent")
+
+    def _on_step(tool_name: str, msg: str) -> None:
+        if job_id:
+            append_job_step(conn, job_id, tool_name, msg)
 
     log.info(
         "autoresearch: project=%s workspace=%s output=%s sandbox=%s hf_owner=%s",
@@ -110,6 +114,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
         max_iterations=max_iterations,
         project_profile_md=project.profile_md or "",
         model_spec=model_spec,
+        on_step=_on_step,
     )
 
     if report.skipped:

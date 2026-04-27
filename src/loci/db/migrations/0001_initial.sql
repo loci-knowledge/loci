@@ -399,7 +399,8 @@ CREATE TABLE jobs (
     id                  TEXT PRIMARY KEY,
     kind                TEXT NOT NULL CHECK (kind IN (
         'absorb','kickoff','reembed','reindex','export',
-        'reflect','relevance','sweep_orphans','rebuild'
+        'reflect','relevance','sweep_orphans','rebuild',
+        'autoresearch'
     )),
     project_id          TEXT REFERENCES projects(id) ON DELETE CASCADE,
     payload             TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),

@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent
+from pydantic_ai.usage import UsageLimits
 
 from loci.config import get_settings
 from loci.llm.agent import LLMNotConfiguredError, build_agent
@@ -33,6 +36,51 @@ from loci.research import papers as papers_mod
 from loci.research.sandbox import Sandbox, SandboxNotConfigured
 
 log = logging.getLogger(__name__)
+
+_TOOL_ICONS: dict[str, str] = {
+    "search_papers": "🔍",
+    "trending_papers": "📈",
+    "paper_details": "📄",
+    "read_paper": "📖",
+    "citation_graph": "🕸",
+    "snippet_search": "🔎",
+    "recommend": "💡",
+    "find_datasets": "🗂",
+    "find_models": "🤖",
+    "find_collections": "📚",
+    "find_all_resources": "🔗",
+    "save_paper_note": "💾",
+    "save_note": "📝",
+    "sandbox_bash": "⚡",
+    "sandbox_read": "📂",
+    "sandbox_write": "✏",
+    "sandbox_edit": "✂",
+    "save_code": "🖥",
+}
+
+
+def _step_label(tool_name: str, args: object) -> str:
+    icon = _TOOL_ICONS.get(tool_name, "⚙")
+    d = args if isinstance(args, dict) else {}
+    if tool_name in ("search_papers", "snippet_search"):
+        q = str(d.get("query", ""))[:60]
+        return f"{icon} {tool_name.replace('_', ' ')}: {q}"
+    if tool_name in ("paper_details", "citation_graph", "recommend",
+                     "find_datasets", "find_models", "find_collections", "find_all_resources"):
+        arxiv = d.get("arxiv_id") or d.get("positive_ids") or ""
+        return f"{icon} {tool_name.replace('_', ' ')}: {str(arxiv)[:40]}"
+    if tool_name == "read_paper":
+        arxiv = d.get("arxiv_id", "")
+        sec = d.get("section", "")
+        suffix = f" §{sec}" if sec else ""
+        return f"{icon} reading {arxiv}{suffix}"
+    if tool_name in ("save_paper_note", "save_note"):
+        key = "arxiv_id" if tool_name == "save_paper_note" else "filename"
+        return f"{icon} saving: {str(d.get(key, ''))[:40]}"
+    if tool_name == "sandbox_bash":
+        cmd = str(d.get("command", ""))[:50]
+        return f"{icon} exec: {cmd}"
+    return f"{icon} {tool_name}"
 
 
 RESEARCH_SYSTEM_PROMPT = """\
@@ -170,6 +218,7 @@ def run_research(
     max_iterations: int = 30,
     project_profile_md: str = "",
     model_spec: str | None = None,
+    on_step: Callable[[str, str], None] | None = None,
 ) -> ResearchReport:
     """Run the research sub-agent. Synchronous facade over an async agent run.
 
@@ -229,12 +278,33 @@ def run_research(
         + f"MAX ITERATIONS: {max_iterations}\n"
     )
 
+    log.info(
+        "research: starting agent loop model=%s query=%r max_iter=%d sandbox=%s",
+        spec, query[:80], max_iterations, "yes" if sandbox is not None else "no",
+    )
+
+    async def _on_events(_ctx: object, event_stream: object) -> None:
+        async for event in event_stream:  # type: ignore[union-attr]
+            if isinstance(event, FunctionToolCallEvent):
+                brief = str(event.part.args)[:120]
+                log.info("research: → %s  %s", event.part.tool_name, brief)
+                if on_step is not None:
+                    label = _step_label(event.part.tool_name, event.part.args)
+                    on_step(event.part.tool_name, label)
+            elif isinstance(event, FunctionToolResultEvent):
+                body = str(getattr(event.result, "content", ""))[:80]
+                log.info("research: ←  %s", body)
+
     try:
-        result = agent.run_sync(user_msg)
+        result = agent.run_sync(
+            user_msg,
+            usage_limits=UsageLimits(request_limit=max_iterations),
+            event_stream_handler=_on_events,
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("research: agent run failed")
+        import contextlib
         if sandbox is not None:
-            import contextlib
             with contextlib.suppress(Exception):
                 sandbox.delete()
         return ResearchReport(
@@ -244,6 +314,12 @@ def run_research(
             skipped=True,
             skip_reason=str(exc),
         )
+
+    usage = result.usage()
+    log.info(
+        "research: done requests=%s tokens_in=%s tokens_out=%s artifacts=%d",
+        usage.requests, usage.input_tokens, usage.output_tokens, len(recorder.artifacts),
+    )
 
     output: ResearchOutput = result.output
 
@@ -264,7 +340,7 @@ def run_research(
         artifacts=recorder.artifacts,
         used_papers=list(output.used_papers),
         sandbox_url=sandbox_url,
-        iterations=getattr(result, "_iterations", 0) or 0,
+        iterations=usage.requests or 0,
     )
 
 

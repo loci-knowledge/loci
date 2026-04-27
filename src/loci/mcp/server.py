@@ -51,6 +51,12 @@ from loci.graph.workspaces import WorkspaceRepository
 from loci.jobs import enqueue
 from loci.mcp.resolve import ProjectNotFound, resolve_project_id
 from loci.retrieve import RetrievalRequest, Retriever
+from loci.retrieve.effects import (
+    maybe_enqueue_retrieve_reflect as _maybe_enqueue_reflect,
+)
+from loci.retrieve.effects import (
+    pending_effects_from_reflect as _pending_effects_from_reflect,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,13 +104,19 @@ def build_mcp_server() -> FastMCP:
             "sources); interpretations are 'loci of thought' — pointers that "
             "say which part of which source matters and why. Use `retrieve` to "
             "route a query through loci to the raws they point at; the "
-            "response includes raws, the loci that routed to them, and a "
-            "trace_table. Use `draft` to write text — citations land on raws "
-            "only (never on loci), with a routing_loci side panel for the user "
-            "to inspect the path. Use `expand_citation` to recover a past "
-            "response, `propose_node` to add a locus, and `accept_proposal` to "
-            "promote it. Prefer `draft` when the user wants writing — it "
-            "includes the trace and citation block they need."
+            "response includes raws, the loci that routed to them, a "
+            "`trace_table` (per-raw interp path), a `trace_narrative` "
+            "(markdown story of the routing — show this to the user), and "
+            "`pending_effects` (graph mutations the call triggered, e.g. a "
+            "reflect job). Pass `verbose=True` to also see `pruned_loci` "
+            "(loci that scored but routed nothing) and per-channel rank "
+            "breakdowns on each routing locus. Use `draft` to write text — "
+            "citations land on raws only (never on loci), with the same "
+            "routing/narrative/effects panel. Use `expand_citation` to "
+            "recover a past response, `propose_node` to add a locus, and "
+            "`accept_proposal` to promote it. Prefer `draft` when the user "
+            "wants writing — it includes the trace and citation block they "
+            "need."
         ),
     )
 
@@ -115,9 +127,14 @@ def build_mcp_server() -> FastMCP:
             "return the raw sources those loci point at. The response has: "
             "`nodes` (ranked raws with per-node trace), `routing_loci` (the "
             "loci that routed retrieval, with relation/overlap/source_anchor — "
-            "for context, NOT for citing), and `trace_table` (per-raw interp "
-            "path). `project` is optional when LOCI_PROJECT is set or a "
-            ".loci/project file exists."
+            "for context, NOT for citing), `trace_table` (per-raw interp "
+            "path), `trace_narrative` (markdown story of the routing), and "
+            "`pending_effects` (graph mutations this call triggered, e.g. a "
+            "reflect job).\n\n"
+            "Pass `verbose=True` to also receive `pruned_loci` (loci that "
+            "scored but routed nothing) and per-channel rank/score breakdown "
+            "on each `routing_loci` entry. `project` is optional when "
+            "LOCI_PROJECT is set or a .loci/project file exists."
         ),
     )
     def loci_retrieve(
@@ -126,6 +143,7 @@ def build_mcp_server() -> FastMCP:
         k: int = 10,
         anchors: list[str] | None = None,
         hyde: bool = False,
+        verbose: bool = False,
     ) -> dict[str, Any]:
         conn = get_connection()
         try:
@@ -141,26 +159,21 @@ def build_mcp_server() -> FastMCP:
             __record_for(project_id, query, k, hyde, trace_table=resp.trace_table),
             retrieved_node_ids=[n.node_id for n in resp.nodes],
         )
+        routing_loci_payload = [
+            _routing_locus_dict(ri, verbose=verbose) for ri in resp.routing_interps
+        ]
         _broadcast_trace_run(project_id, {
             "response_id": rid,
             "session_id": "mcp",
             "query": query,
             "ts": now_iso(),
             "k": k,
-            "routing_loci": [
-                {
-                    "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
-                    "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
-                    "source_anchor_md": ri.source_anchor_md,
-                    "angle": ri.angle, "score": ri.score,
-                }
-                for ri in resp.routing_interps
-            ],
+            "routing_loci": routing_loci_payload,
             "trace_table": resp.trace_table,
         })
-        # Enqueue a lightweight reflect if the project hasn't reflected recently.
-        _maybe_enqueue_reflect(conn, project_id, rid)
-        return {
+        reflect_job_id = _maybe_enqueue_reflect(conn, project_id, rid)
+        pending_effects = _pending_effects_from_reflect(reflect_job_id, trigger="retrieve")
+        out: dict[str, Any] = {
             "nodes": [
                 {
                     "id": n.node_id, "kind": n.kind, "subkind": n.subkind,
@@ -173,29 +186,37 @@ def build_mcp_server() -> FastMCP:
                 }
                 for n in resp.nodes
             ],
-            "routing_loci": [
-                {
-                    "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
-                    "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
-                    "source_anchor_md": ri.source_anchor_md,
-                    "angle": ri.angle, "score": ri.score,
-                }
-                for ri in resp.routing_interps
-            ],
+            "routing_loci": routing_loci_payload,
             "trace_table": resp.trace_table,
+            "trace_narrative": resp.trace_narrative,
+            "pending_effects": pending_effects,
             "trace_id": rid,
         }
+        if verbose:
+            out["pruned_loci"] = [
+                {
+                    "id": pl.node_id, "subkind": pl.subkind, "title": pl.title,
+                    "score": pl.score, "reason": pl.reason,
+                    "channel_ranks": pl.channel_ranks,
+                }
+                for pl in resp.pruned_loci
+            ]
+        return out
 
     @mcp.tool(
         name="loci_draft",
         description=(
             "Write a markdown draft for a project. Citations land on RAW "
             "sources only — loci of thought are surfaced separately as "
-            "routing context, not as citable content. Returns `output_md`, "
-            "`citations` (raws with their routing trace), `routing_loci` "
-            "(loci that pointed at the cited raws), and `trace_table` "
-            "(per-raw interp path). Pass `context_md` if the user has draft "
-            "text already."
+            "routing context, not as citable content.\n\n"
+            "Returns `output_md`, `citations` (raws with their routing "
+            "trace), `routing_loci` (loci that pointed at the cited raws), "
+            "`trace_table` (per-raw interp path), `trace_narrative` "
+            "(markdown story of the routing), and `pending_effects` (graph "
+            "mutations this call triggered, e.g. a reflect job).\n\n"
+            "Pass `verbose=True` to also receive `pruned_loci` and "
+            "per-channel rank/score breakdown on each `routing_loci` entry. "
+            "Pass `context_md` if the user has draft text already."
         ),
     )
     def loci_draft(
@@ -207,6 +228,7 @@ def build_mcp_server() -> FastMCP:
         cite_density: str = "normal",
         k: int = 12,
         hyde: bool = False,
+        verbose: bool = False,
     ) -> dict[str, Any]:
         conn = get_connection()
         try:
@@ -222,13 +244,7 @@ def build_mcp_server() -> FastMCP:
             k=k, hyde=hyde, client="mcp",
         ))
         _routing_loci_dicts = [
-            {
-                "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
-                "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
-                "source_anchor_md": rl.source_anchor_md,
-                "angle": rl.angle, "score": rl.score,
-            }
-            for rl in result.routing_loci
+            _routing_locus_dict(rl, verbose=verbose) for rl in result.routing_loci
         ]
         _broadcast_trace_run(project_id, {
             "response_id": result.response_id,
@@ -239,7 +255,10 @@ def build_mcp_server() -> FastMCP:
             "routing_loci": _routing_loci_dicts,
             "trace_table": result.trace_table,
         })
-        return {
+        pending_effects = _pending_effects_from_reflect(
+            result.reflect_job_id, trigger="draft",
+        )
+        out: dict[str, Any] = {
             "output_md": result.output_md,
             "citations": [
                 {
@@ -253,6 +272,8 @@ def build_mcp_server() -> FastMCP:
             ],
             "routing_loci": _routing_loci_dicts,
             "trace_table": result.trace_table,
+            "trace_narrative": result.trace_narrative,
+            "pending_effects": pending_effects,
             "response_id": result.response_id,
             "verdicts": [
                 {"handle": v.handle, "sentence_index": v.sentence_index,
@@ -260,6 +281,9 @@ def build_mcp_server() -> FastMCP:
                 for v in result.verdicts
             ],
         }
+        if verbose:
+            out["pruned_loci"] = result.pruned_loci
+        return out
 
     @mcp.tool(
         name="loci_expand_citation",
@@ -391,17 +415,21 @@ def build_mcp_server() -> FastMCP:
     @mcp.tool(
         name="loci_research",
         description=(
-            "Kick off an autoresearch run for a project. Spawns a sub-agent "
-            "that searches papers (HuggingFace + Semantic Scholar + arXiv), "
-            "optionally runs code in an HF Spaces sandbox, and writes "
-            "artifacts (paper notes, code, summary) into the given workspace. "
-            "On completion the artifacts become raw nodes and a `relevance` "
-            "locus is created citing them, so future `loci_retrieve` / "
-            "`loci_draft` calls can route to them.\n\n"
-            "Returns `{job_id}`. Poll with `loci_research_status(job_id)`. "
-            "Sandbox requires HF_TOKEN env var + `hf_owner` (or "
-            "LOCI_RESEARCH_HF_OWNER setting). Pass `sandbox=False` to skip "
-            "code execution and only do paper discovery."
+            "Start a paper-discovery research run for a loci project. "
+            "A sub-agent searches HuggingFace Papers, Semantic Scholar, and "
+            "arXiv, reads relevant sections, traces citation graphs, and saves "
+            "paper notes + a SUMMARY.md as artifacts in the workspace. On "
+            "completion the artifacts become raw nodes and a `relevance` locus "
+            "is created, so future `loci_retrieve` / `loci_draft` calls route "
+            "to them.\n\n"
+            "sandbox defaults to False (paper-only, no HF account needed). "
+            "Set sandbox=True + hf_owner to also run code in an HF Spaces "
+            "environment (requires HF_TOKEN env var).\n\n"
+            "Returns {job_id}. After calling this, poll "
+            "`loci_research_status(job_id)` every 10–15 seconds and display "
+            "the `progress_display` field to the user until status is 'done' "
+            "or 'failed'. The display shows a live progress bar and the most "
+            "recent agent steps (which papers were searched/read/saved)."
         ),
     )
     def loci_research(
@@ -410,7 +438,7 @@ def build_mcp_server() -> FastMCP:
         project: str | None = None,
         hf_owner: str | None = None,
         hardware: str = "cpu-basic",
-        sandbox: bool = True,
+        sandbox: bool = False,
         max_iterations: int = 30,
     ) -> dict[str, Any]:
         conn = get_connection()
@@ -448,10 +476,14 @@ def build_mcp_server() -> FastMCP:
     @mcp.tool(
         name="loci_research_status",
         description=(
-            "Poll an autoresearch (or any other) job's status by id. Returns "
-            "`{status, progress, result, error}`. When `status='done'`, "
-            "`result` carries the summary, artifact paths, and the locus id "
-            "that cites them."
+            "Poll a research (or any) job's status. Returns "
+            "{status, progress, progress_display, step_log, result, error}. "
+            "`progress_display` is a pre-formatted string with a progress bar "
+            "and the last 12 agent steps — show it directly to the user while "
+            "polling. `step_log` is the raw array of {t, tool, msg} entries. "
+            "When status='done', `result` has summary_md, artifact paths, "
+            "used_papers, and the summary_locus_id. "
+            "Poll every 10–15s while status is 'queued' or 'running'."
         ),
     )
     def loci_research_status(job_id: str) -> dict[str, Any]:
@@ -460,6 +492,25 @@ def build_mcp_server() -> FastMCP:
         job = get_job(conn, job_id)
         if job is None:
             return {"error": "job not found", "job_id": job_id}
+
+        step_log: list[dict] = job.get("step_log") or []
+        recent = step_log[-12:]
+        pct = int((job.get("progress") or 0.0) * 100)
+        filled = pct // 10
+        bar = "█" * filled + "░" * (10 - filled)
+        status = job.get("status", "unknown")
+        lines = [f"[{bar}] {pct}%  {status}"]
+        for entry in recent:
+            lines.append(f"  {entry.get('msg', entry.get('tool', '?'))}")
+        if status == "done":
+            result = job.get("result") or {}
+            n_artifacts = len(result.get("artifacts") or [])
+            n_papers = len(result.get("used_papers") or [])
+            lines.append(f"  ✓ done — {n_papers} papers, {n_artifacts} artifacts")
+        elif status == "failed":
+            lines.append(f"  ✗ {(job.get('error') or '')[:120]}")
+
+        job["progress_display"] = "\n".join(lines)
         return job
 
     @mcp.tool(
@@ -869,26 +920,21 @@ def __record_for(
     )
 
 
-_REFLECT_COOLDOWN_SECONDS = 300  # 5 minutes
-
-
-def _maybe_enqueue_reflect(conn, project_id: str, response_id: str) -> None:
-    """Enqueue a lightweight reflect after retrieve, with cooldown."""
-    last = conn.execute(
-        "SELECT MAX(ts) FROM agent_reflections WHERE project_id = ?",
-        (project_id,),
-    ).fetchone()[0]
-    if last:
-        from datetime import UTC, datetime
-        try:
-            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            elapsed = (datetime.now(UTC) - last_dt).total_seconds()
-            if elapsed < _REFLECT_COOLDOWN_SECONDS:
-                return
-        except Exception:  # noqa: BLE001
-            pass
-    enqueue(conn, kind="reflect", project_id=project_id,
-            payload={"response_id": response_id, "trigger": "retrieve", "lightweight": True})
+def _routing_locus_dict(ri, *, verbose: bool) -> dict[str, Any]:
+    """Serialise a routing locus (RoutingInterp or DraftRoutingLocus). When
+    `verbose=True`, also include channel_ranks / channel_scores / anchor_source
+    so the caller can see WHY a locus scored high and which channel fired."""
+    base = {
+        "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
+        "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
+        "source_anchor_md": ri.source_anchor_md,
+        "angle": ri.angle, "score": ri.score,
+    }
+    if verbose:
+        base["channel_ranks"] = getattr(ri, "channel_ranks", {}) or {}
+        base["channel_scores"] = getattr(ri, "channel_scores", {}) or {}
+        base["anchor_source"] = getattr(ri, "anchor_source", None)
+    return base
 
 
 def run_stdio() -> None:

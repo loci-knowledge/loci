@@ -152,6 +152,32 @@ class RoutingInterp:
     source_anchor_md: str
     angle: str | None
     score: float
+    # Per-channel rank (1-based) for this locus. None / missing channel = the
+    # locus did not appear in that channel's top-K. Verbose-mode field.
+    channel_ranks: dict[str, int] = field(default_factory=dict)
+    # Per-channel RRF contribution (already weighted). Sums to ≤ `score`.
+    channel_scores: dict[str, float] = field(default_factory=dict)
+    # If this locus was used as a PPR anchor, where did the anchor come from?
+    # 'caller' (passed in), 'pinned' (project pin), 'top_vec_interp' (auto).
+    # None when the locus wasn't itself an anchor.
+    anchor_source: str | None = None
+
+
+@dataclass
+class PrunedLocus:
+    """A locus that scored above zero but did NOT route any raw.
+
+    Reasons:
+      - 'below_top_k': scored but ranked below `k_interps` cutoff
+      - 'no_routing_edges': made the top-K but has neither cites nor
+                            derives_from·cites edges, so its walk yielded nothing
+    """
+    node_id: str
+    subkind: Subkind
+    title: str
+    score: float
+    reason: str
+    channel_ranks: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -160,6 +186,11 @@ class RetrievalResponse:
     routing_interps: list[RoutingInterp]
     # Compact provenance summary: one row per returned raw with interp ids.
     trace_table: list[dict] = field(default_factory=list)
+    # Loci that scored but didn't route a raw — useful for verbose UIs that
+    # want to show "we considered this but it had no path to evidence."
+    pruned_loci: list[PrunedLocus] = field(default_factory=list)
+    # Pre-rendered markdown narrative of the trace — see narrative.py.
+    trace_narrative: str = ""
 
 
 class Retriever:
@@ -191,23 +222,30 @@ class Retriever:
                 )
 
         # PPR over the derives_from DAG of interpretations.
-        anchors = self._resolve_anchors(req, interp_vec)
+        anchors_tagged = self._resolve_anchors_tagged(req, interp_vec)
+        anchor_source_by_id: dict[str, str] = {a: src for a, src in anchors_tagged}
+        anchors = [a for a, _src in anchors_tagged]
         ppr_result = ppr_mod.run(self.conn, req.project_id, anchors)
         ppr_ranked = sorted(ppr_result.scores.items(), key=lambda kv: -kv[1])
 
-        interp_scores = self._fuse(
-            channels=[
-                ("lex", [h.node_id for h in interp_lex]),
-                ("vec", [h.node_id for h in interp_vec]),
-                ("hyde", [h.node_id for h in interp_hyde]),
-                ("ppr", [nid for nid, _ in ppr_ranked]),
-            ],
-            weights=INTERP_WEIGHTS,
+        interp_scores, interp_channel_scores, interp_channel_ranks = (
+            self._fuse_with_breakdown(
+                channels=[
+                    ("lex", [h.node_id for h in interp_lex]),
+                    ("vec", [h.node_id for h in interp_vec]),
+                    ("hyde", [h.node_id for h in interp_hyde]),
+                    ("ppr", [nid for nid, _ in ppr_ranked]),
+                ],
+                weights=INTERP_WEIGHTS,
+            )
         )
-        # Top-K_interp routing loci.
-        top_interps = sorted(
+        # Full ranking — keep the tail so we can report "considered but pruned"
+        # loci to verbose callers.
+        full_interp_ranking = sorted(
             interp_scores.items(), key=lambda kv: -kv[1],
-        )[: req.k_interps]
+        )
+        top_interps = full_interp_ranking[: req.k_interps]
+        below_top_k = full_interp_ranking[req.k_interps :]
         interp_score_map = dict(top_interps)
 
         # --------------------------------------------------------------
@@ -330,6 +368,9 @@ class Retriever:
                     used_interp_ids.add(hop.dst)
         routing_interps = self._materialise_routing_interps(
             list(used_interp_ids), interp_score_map,
+            channel_scores_by_id=interp_channel_scores,
+            channel_ranks_by_id=interp_channel_ranks,
+            anchor_source_by_id=anchor_source_by_id,
         )
         trace_table = [
             {
@@ -344,10 +385,29 @@ class Retriever:
             if r.kind == "raw"
         ]
 
+        # Pruned loci: top-K loci whose walk yielded zero hops, plus the
+        # top scorers immediately below the K_interp cutoff. Verbose-mode
+        # output — the renderer trims to the highest-scoring slice.
+        pruned_loci = self._materialise_pruned_loci(
+            top_interps=top_interps,
+            below_top_k=below_top_k,
+            used_interp_ids=used_interp_ids,
+            interp_channel_ranks=interp_channel_ranks,
+        )
+
+        # Build a per-raw markdown narrative once so both retrieve and draft
+        # ship the same human-readable trace.
+        from loci.retrieve.narrative import render_trace_narrative
+        narrative = render_trace_narrative(
+            nodes=materialised, routing_interps=routing_interps,
+        )
+
         return RetrievalResponse(
             nodes=materialised,
             routing_interps=routing_interps,
             trace_table=trace_table,
+            pruned_loci=pruned_loci,
+            trace_narrative=narrative,
         )
 
     # -----------------------------------------------------------------------
@@ -357,17 +417,29 @@ class Retriever:
     def _resolve_anchors(
         self, req: RetrievalRequest, interp_vec: list[vec_mod.VecHit],
     ) -> list[str]:
-        """Caller anchors ∪ project pinned ∪ top-vec interp hits."""
-        anchors = list(req.anchors)
-        if not anchors:
-            pinned = self.projects_repo.members(req.project_id, roles=["pinned"])
-            top_vec_anchors = [h.node_id for h in interp_vec[:5]]
-            seen: set[str] = set()
-            for a in pinned + top_vec_anchors:
-                if a not in seen:
-                    anchors.append(a)
-                    seen.add(a)
-        return anchors
+        return [a for a, _src in self._resolve_anchors_tagged(req, interp_vec)]
+
+    def _resolve_anchors_tagged(
+        self, req: RetrievalRequest, interp_vec: list[vec_mod.VecHit],
+    ) -> list[tuple[str, str]]:
+        """Caller anchors ∪ project pinned ∪ top-vec interp hits, tagged with
+        the source of each anchor so verbose mode can show 'why this locus
+        seeded the PPR pass'."""
+        if req.anchors:
+            return [(a, "caller") for a in req.anchors]
+        pinned = self.projects_repo.members(req.project_id, roles=["pinned"])
+        top_vec_anchors = [h.node_id for h in interp_vec[:5]]
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for a in pinned:
+            if a not in seen:
+                out.append((a, "pinned"))
+                seen.add(a)
+        for a in top_vec_anchors:
+            if a not in seen:
+                out.append((a, "top_vec_interp"))
+                seen.add(a)
+        return out
 
     def _walk_routes(
         self,
@@ -419,13 +491,27 @@ class Retriever:
         channels: list[tuple[str, list[str]]],
         weights: dict[str, float],
     ) -> dict[str, float]:
-        scores: dict[str, float] = {}
+        return self._fuse_with_breakdown(channels, weights)[0]
+
+    def _fuse_with_breakdown(
+        self,
+        channels: list[tuple[str, list[str]]],
+        weights: dict[str, float],
+    ) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, dict[str, int]]]:
+        """Same fusion as `_fuse`, also returning per-node-per-channel rank
+        and weighted contribution. The breakdown is what the verbose MCP
+        flag surfaces as `channel_scores` / `channel_ranks` on each locus."""
+        totals: dict[str, float] = {}
+        per_channel_scores: dict[str, dict[str, float]] = {}
+        per_channel_ranks: dict[str, dict[str, int]] = {}
         for channel, ranked_ids in channels:
             w = weights.get(channel, 1.0)
             for rank, nid in enumerate(ranked_ids, start=1):
                 contrib = w / (RRF_K + rank)
-                scores[nid] = scores.get(nid, 0.0) + contrib
-        return scores
+                totals[nid] = totals.get(nid, 0.0) + contrib
+                per_channel_scores.setdefault(nid, {})[channel] = contrib
+                per_channel_ranks.setdefault(nid, {})[channel] = rank
+        return totals, per_channel_scores, per_channel_ranks
 
     def _why(
         self, *, node, routed: bool, direct: bool, trace: list[RouteHop],
@@ -439,10 +525,19 @@ class Retriever:
         return "; ".join(parts) if parts else "in the project"
 
     def _materialise_routing_interps(
-        self, interp_ids: list[str], score_map: dict[str, float],
+        self,
+        interp_ids: list[str],
+        score_map: dict[str, float],
+        *,
+        channel_scores_by_id: dict[str, dict[str, float]] | None = None,
+        channel_ranks_by_id: dict[str, dict[str, int]] | None = None,
+        anchor_source_by_id: dict[str, str] | None = None,
     ) -> list[RoutingInterp]:
         if not interp_ids:
             return []
+        cs = channel_scores_by_id or {}
+        cr = channel_ranks_by_id or {}
+        anchors = anchor_source_by_id or {}
         placeholders = ",".join("?" * len(interp_ids))
         rows = self.conn.execute(
             f"""
@@ -462,11 +557,71 @@ class Retriever:
                 source_anchor_md=r["source_anchor_md"] or "",
                 angle=r["angle"],
                 score=score_map.get(r["id"], 0.0),
+                channel_scores=cs.get(r["id"], {}),
+                channel_ranks=cr.get(r["id"], {}),
+                anchor_source=anchors.get(r["id"]),
             )
             for r in rows
         ]
         # Sort by score descending so the UI shows the strongest router first.
         out.sort(key=lambda x: -x.score)
+        return out
+
+    def _materialise_pruned_loci(
+        self,
+        *,
+        top_interps: list[tuple[str, float]],
+        below_top_k: list[tuple[str, float]],
+        used_interp_ids: set[str],
+        interp_channel_ranks: dict[str, dict[str, int]],
+        max_below_k: int = 5,
+        max_no_edges: int = 5,
+    ) -> list[PrunedLocus]:
+        """Top-K loci that routed zero raws → 'no_routing_edges'.
+        Top scorers below K → 'below_top_k'. Capped — we only show the most
+        relevant pruned candidates, since the long tail is noise."""
+        no_edge_ids = [
+            (nid, score) for nid, score in top_interps
+            if nid not in used_interp_ids
+        ][:max_no_edges]
+        below_ids = below_top_k[:max_below_k]
+
+        wanted = list(no_edge_ids) + list(below_ids)
+        if not wanted:
+            return []
+
+        ids = [nid for nid, _ in wanted]
+        placeholders = ",".join("?" * len(ids))
+        rows = {
+            r["id"]: r for r in self.conn.execute(
+                f"""
+                SELECT n.id, n.subkind, n.title
+                FROM nodes n
+                WHERE n.id IN ({placeholders})
+                """,
+                tuple(ids),
+            ).fetchall()
+        }
+
+        out: list[PrunedLocus] = []
+        for nid, score in no_edge_ids:
+            r = rows.get(nid)
+            if r is None:
+                continue
+            out.append(PrunedLocus(
+                node_id=nid, subkind=r["subkind"], title=r["title"],
+                score=score, reason="no_routing_edges",
+                channel_ranks=interp_channel_ranks.get(nid, {}),
+            ))
+        for nid, score in below_ids:
+            r = rows.get(nid)
+            if r is None:
+                continue
+            out.append(PrunedLocus(
+                node_id=nid, subkind=r["subkind"], title=r["title"],
+                score=score, reason="below_top_k",
+                channel_ranks=interp_channel_ranks.get(nid, {}),
+            ))
         return out
 
 

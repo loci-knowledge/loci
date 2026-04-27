@@ -2,13 +2,19 @@
 
 Response shape:
     {
-      output_md:     "...",
-      citations:     [{ node_id, kind=raw, subkind, title, why_cited, routed_by[] }, ...],
-      routing_loci:  [{ id, subkind, title, relation_md, overlap_md,
-                        source_anchor_md, angle, score }, ...],
-      trace_table:   [{ raw_id, raw_title, interp_path: [{id, edge, to}, ...] }, ...],
-      response_id:   str,
+      output_md:        "...",
+      citations:        [{ node_id, kind=raw, subkind, title, why_cited, routed_by[] }, ...],
+      routing_loci:     [{ id, subkind, title, relation_md, overlap_md,
+                           source_anchor_md, angle, score }, ...],
+      trace_table:      [{ raw_id, raw_title, interp_path: [{id, edge, to}, ...] }, ...],
+      trace_narrative:  str,             # markdown story of the routing
+      pending_effects:  [...],           # graph mutations the call triggered
+      pruned_loci:      [...],           # verbose-only
+      response_id:      str,
     }
+
+Pass `verbose=true` to also receive `pruned_loci` and per-channel rank/score
+breakdown on each routing locus.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ class DraftBody(BaseModel):
     session_id: str = "default"
     hyde: bool = False
     k: int = 12
+    verbose: bool = False
 
 
 class DraftCitationOut(BaseModel):
@@ -72,6 +79,26 @@ class RoutingLocusOut(BaseModel):
     source_anchor_md: str
     angle: str | None
     score: float
+    # Verbose-only fields propagated from the retrieval layer.
+    channel_ranks: dict[str, int] = {}
+    channel_scores: dict[str, float] = {}
+    anchor_source: str | None = None
+
+
+class PendingEffectOut(BaseModel):
+    kind: str
+    job_id: str
+    trigger: str
+    purpose: str
+
+
+class PrunedLocusOut(BaseModel):
+    id: str
+    subkind: str
+    title: str
+    score: float
+    reason: str
+    channel_ranks: dict[str, int] = {}
 
 
 class DraftResponseBody(BaseModel):
@@ -79,6 +106,9 @@ class DraftResponseBody(BaseModel):
     citations: list[DraftCitationOut]
     routing_loci: list[RoutingLocusOut]
     trace_table: list[dict]
+    trace_narrative: str = ""
+    pending_effects: list[PendingEffectOut] = []
+    pruned_loci: list[PrunedLocusOut] = []
     response_id: str
     verdicts: list[VerdictOut] = []
 
@@ -108,13 +138,16 @@ def post_draft(
         client=user_agent,
     )
     result = draft(conn, req)
-    _routing_loci_dicts = [
-        {
-            "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
-            "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
-            "source_anchor_md": rl.source_anchor_md, "angle": rl.angle,
-            "score": rl.score,
-        }
+    routing_loci_out = [
+        RoutingLocusOut(
+            id=rl.node_id, subkind=rl.subkind, title=rl.title,
+            relation_md=rl.relation_md, overlap_md=rl.overlap_md,
+            source_anchor_md=rl.source_anchor_md, angle=rl.angle,
+            score=rl.score,
+            channel_ranks=rl.channel_ranks if body.verbose else {},
+            channel_scores=rl.channel_scores if body.verbose else {},
+            anchor_source=rl.anchor_source if body.verbose else None,
+        )
         for rl in result.routing_loci
     ]
     publish_trace_run(
@@ -123,10 +156,15 @@ def post_draft(
         session_id=body.session_id,
         query=body.instruction,
         ts=now_iso(),
-        routing_loci=_routing_loci_dicts,
+        routing_loci=[loc.model_dump() for loc in routing_loci_out],
         trace_table=result.trace_table,
         k=body.k,
     )
+    from loci.retrieve.effects import pending_effects_from_reflect
+    pending = [
+        PendingEffectOut(**e)
+        for e in pending_effects_from_reflect(result.reflect_job_id, trigger="draft")
+    ]
     return DraftResponseBody(
         output_md=result.output_md,
         citations=[
@@ -138,16 +176,14 @@ def post_draft(
             )
             for c in result.citations
         ],
-        routing_loci=[
-            RoutingLocusOut(
-                id=rl.node_id, subkind=rl.subkind, title=rl.title,
-                relation_md=rl.relation_md, overlap_md=rl.overlap_md,
-                source_anchor_md=rl.source_anchor_md, angle=rl.angle,
-                score=rl.score,
-            )
-            for rl in result.routing_loci
-        ],
+        routing_loci=routing_loci_out,
         trace_table=result.trace_table,
+        trace_narrative=result.trace_narrative,
+        pending_effects=pending,
+        pruned_loci=(
+            [PrunedLocusOut(**pl) for pl in result.pruned_loci]
+            if body.verbose else []
+        ),
         response_id=result.response_id,
         verdicts=[
             VerdictOut(
@@ -183,6 +219,14 @@ async def post_draft_stream(
             "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
             "source_anchor_md": rl.source_anchor_md, "angle": rl.angle,
             "score": rl.score,
+            **(
+                {
+                    "channel_ranks": rl.channel_ranks,
+                    "channel_scores": rl.channel_scores,
+                    "anchor_source": rl.anchor_source,
+                }
+                if body.verbose else {}
+            ),
         }
         for rl in result.routing_loci
     ]
@@ -195,6 +239,10 @@ async def post_draft_stream(
         routing_loci=_routing_loci_dicts_s,
         trace_table=result.trace_table,
         k=body.k,
+    )
+    from loci.retrieve.effects import pending_effects_from_reflect
+    pending_dicts = pending_effects_from_reflect(
+        result.reflect_job_id, trigger="draft",
     )
 
     def generate():
@@ -211,12 +259,11 @@ async def post_draft_stream(
                  "verdict": c.verdict, "verdict_reason": c.verdict_reason}
                 for c in result.citations
             ],
-            "routing_loci": [
-                {"id": rl.node_id, "subkind": rl.subkind, "title": rl.title,
-                 "relation_md": rl.relation_md, "overlap_md": rl.overlap_md,
-                 "source_anchor_md": rl.source_anchor_md, "angle": rl.angle, "score": rl.score}
-                for rl in result.routing_loci
-            ],
+            "routing_loci": _routing_loci_dicts_s,
+            "trace_table": result.trace_table,
+            "trace_narrative": result.trace_narrative,
+            "pending_effects": pending_dicts,
+            "pruned_loci": result.pruned_loci if body.verbose else [],
             "verdicts": [
                 {"handle": v.handle, "sentence_index": v.sentence_index,
                  "verdict": v.verdict, "reason": v.reason}

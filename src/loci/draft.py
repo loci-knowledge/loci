@@ -117,6 +117,10 @@ class DraftRoutingLocus:
     source_anchor_md: str
     angle: str | None
     score: float
+    # Verbose-mode fields propagated from the retrieval layer.
+    channel_ranks: dict[str, int] = field(default_factory=dict)
+    channel_scores: dict[str, float] = field(default_factory=dict)
+    anchor_source: str | None = None
 
 
 @dataclass
@@ -134,6 +138,16 @@ class DraftResult:
     # Per-(sentence, handle) entailment verdicts from the verifier. Empty
     # when verification was disabled or skipped.
     verdicts: list[CitationVerdict] = field(default_factory=list)
+    # Pre-rendered markdown narrative of which locus routed which raw. The
+    # MCP layer ships this by default so callers see the trace shape without
+    # cross-walking trace_table + routing_loci by id.
+    trace_narrative: str = ""
+    # Job id for the reflect job enqueued at the end of the draft pipeline,
+    # or None if enqueue failed. Surfaced in `pending_effects` at the MCP
+    # layer so the user knows the graph will mutate after this call.
+    reflect_job_id: str | None = None
+    # Verbose-mode payload — loci that scored but routed nothing.
+    pruned_loci: list[dict] = field(default_factory=list)
 
 
 def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
@@ -234,14 +248,24 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
 
     # 10. Enqueue a reflection job — the interpreter agent gets to learn from
     # which loci routed which raws into a successful draft.
+    reflect_job_id: str | None = None
     try:
         from loci.jobs.queue import enqueue
-        enqueue(
+        reflect_job_id = enqueue(
             conn, kind="reflect", project_id=req.project_id,
             payload={"response_id": rid, "trigger": "draft"},
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("draft: failed to enqueue reflect job: %s", exc)
+
+    pruned_loci_payload = [
+        {
+            "id": pl.node_id, "subkind": pl.subkind, "title": pl.title,
+            "score": pl.score, "reason": pl.reason,
+            "channel_ranks": pl.channel_ranks,
+        }
+        for pl in retrieval.pruned_loci
+    ]
 
     return DraftResult(
         output_md=output_md,
@@ -252,6 +276,9 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
         candidate_count=len(candidates),
         retrieved_node_ids=[c.node_id for c in candidates],
         verdicts=verdicts,
+        trace_narrative=retrieval.trace_narrative,
+        reflect_job_id=reflect_job_id,
+        pruned_loci=pruned_loci_payload,
     )
 
 
@@ -457,6 +484,8 @@ def _to_routing_locus(ri: RoutingInterp) -> DraftRoutingLocus:
         relation_md=ri.relation_md, overlap_md=ri.overlap_md,
         source_anchor_md=ri.source_anchor_md, angle=ri.angle,
         score=ri.score,
+        channel_ranks=ri.channel_ranks, channel_scores=ri.channel_scores,
+        anchor_source=ri.anchor_source,
     )
 
 

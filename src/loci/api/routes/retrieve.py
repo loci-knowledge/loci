@@ -1,17 +1,23 @@
 """Retrieve endpoint.
 
     POST /projects/:id/retrieve
-      body: { query, k, anchors?, include?, hyde? }
+      body: { query, k, anchors?, include?, hyde?, verbose? }
       returns:
         {
-          nodes:           [...]   # ranked raws (default) or filtered set
-          routing_loci:    [...]   # the loci that routed to those raws
-          trace_table:     [...]   # per-raw interp path
-          trace_id:        str
+          nodes:            [...]   # ranked raws (default) or filtered set
+          routing_loci:     [...]   # the loci that routed to those raws
+          trace_table:      [...]   # per-raw interp path
+          trace_narrative:  str     # markdown story of the routing
+          pending_effects:  [...]   # graph mutations the call triggered
+          pruned_loci:      [...]   # verbose-only: scored-but-routed-nothing
+          trace_id:         str
         }
 
 The default `include` is raws only. To surface loci themselves (e.g. for graph
 inspection or debugging), pass include=["interpretation"] explicitly.
+
+Pass `verbose=true` to also receive `pruned_loci` and per-channel rank/score
+breakdown on each routing locus.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ class RetrieveBody(BaseModel):
     include: list[str] | None = None
     hyde: bool = False
     session_id: str = "default"
+    verbose: bool = False
 
 
 class RetrieveNodeOut(BaseModel):
@@ -60,12 +67,37 @@ class RoutingLocusOut(BaseModel):
     source_anchor_md: str
     angle: str | None
     score: float
+    # Verbose-only: per-channel rank (1-based) and RRF contribution. Empty
+    # dicts when the request did not pass verbose=true.
+    channel_ranks: dict[str, int] = {}
+    channel_scores: dict[str, float] = {}
+    # Verbose-only: how this locus seeded the PPR pass, if at all.
+    anchor_source: str | None = None
+
+
+class PrunedLocusOut(BaseModel):
+    id: str
+    subkind: str
+    title: str
+    score: float
+    reason: str
+    channel_ranks: dict[str, int] = {}
+
+
+class PendingEffectOut(BaseModel):
+    kind: str
+    job_id: str
+    trigger: str
+    purpose: str
 
 
 class RetrieveResponseBody(BaseModel):
     nodes: list[RetrieveNodeOut]
     routing_loci: list[RoutingLocusOut]
     trace_table: list[dict]
+    trace_narrative: str = ""
+    pending_effects: list[PendingEffectOut] = []
+    pruned_loci: list[PrunedLocusOut] = []
     trace_id: str
 
 
@@ -103,24 +135,37 @@ def post_retrieve(
     rid = CitationTracker(conn).write_response(
         record, retrieved_node_ids=[n.node_id for n in resp.nodes],
     )
+    routing_loci_out = [
+        RoutingLocusOut(
+            id=ri.node_id, subkind=ri.subkind, title=ri.title,
+            relation_md=ri.relation_md, overlap_md=ri.overlap_md,
+            source_anchor_md=ri.source_anchor_md, angle=ri.angle,
+            score=ri.score,
+            channel_ranks=ri.channel_ranks if body.verbose else {},
+            channel_scores=ri.channel_scores if body.verbose else {},
+            anchor_source=ri.anchor_source if body.verbose else None,
+        )
+        for ri in resp.routing_interps
+    ]
     publish_trace_run(
         project.id,
         response_id=rid,
         session_id=body.session_id,
         query=body.query,
         ts=now_iso(),
-        routing_loci=[
-            {
-                "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
-                "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
-                "source_anchor_md": ri.source_anchor_md,
-                "angle": ri.angle, "score": ri.score,
-            }
-            for ri in resp.routing_interps
-        ],
+        routing_loci=[loc.model_dump() for loc in routing_loci_out],
         trace_table=resp.trace_table,
         k=body.k,
     )
+    from loci.retrieve.effects import (
+        maybe_enqueue_retrieve_reflect,
+        pending_effects_from_reflect,
+    )
+    reflect_job_id = maybe_enqueue_retrieve_reflect(conn, project.id, rid)
+    pending = [
+        PendingEffectOut(**e)
+        for e in pending_effects_from_reflect(reflect_job_id, trigger="retrieve")
+    ]
     return RetrieveResponseBody(
         nodes=[
             RetrieveNodeOut(
@@ -133,16 +178,21 @@ def post_retrieve(
             )
             for n in resp.nodes
         ],
-        routing_loci=[
-            RoutingLocusOut(
-                id=ri.node_id, subkind=ri.subkind, title=ri.title,
-                relation_md=ri.relation_md, overlap_md=ri.overlap_md,
-                source_anchor_md=ri.source_anchor_md, angle=ri.angle,
-                score=ri.score,
-            )
-            for ri in resp.routing_interps
-        ],
+        routing_loci=routing_loci_out,
         trace_table=resp.trace_table,
+        trace_narrative=resp.trace_narrative,
+        pending_effects=pending,
+        pruned_loci=(
+            [
+                PrunedLocusOut(
+                    id=pl.node_id, subkind=pl.subkind, title=pl.title,
+                    score=pl.score, reason=pl.reason,
+                    channel_ranks=pl.channel_ranks,
+                )
+                for pl in resp.pruned_loci
+            ]
+            if body.verbose else []
+        ),
         trace_id=rid,
     )
 

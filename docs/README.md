@@ -28,6 +28,10 @@ If you're reading docs for the first time, read in this order:
    is used for which task (interpretation, RAG, classifier, HyDE).
 8. [session-lifecycle.md](./session-lifecycle.md) — the bigger picture: how
    a project evolves from "five questions" to a working knowledge graph.
+9. [research.md](./research.md) — the auto-research sub-agent: crawl papers
+   (no HF account needed by default), optionally run code in an HF Spaces
+   sandbox, and ingest findings into the graph. Covers live step-logging,
+   `progress_display` polling, and the full MCP workflow.
 
 The two repos:
 

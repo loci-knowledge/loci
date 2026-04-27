@@ -5,14 +5,15 @@ you can mix Anthropic, OpenAI, and OpenRouter models freely. Different tasks
 in loci can run on different providers — you might want a strong reasoning
 model for interpretation maintenance and a cheap fast model for HyDE.
 
-## The four LLM tasks
+## The five LLM tasks
 
 | Setting               | What uses it                                        | Default                  |
 |-----------------------|-----------------------------------------------------|--------------------------|
-| `interpretation_model`| Kickoff (project → first tensions) and the silent reflection cycle that creates / reinforces / softens interpretations after every draft | `openrouter:google/gemini-3-flash-preview` |
-| `rag_model`           | `loci draft` — synthesises markdown with citations  | `openrouter:google/gemini-3-flash-preview` |
+| `interpretation_model`| Kickoff (project → first tensions) and the silent reflection cycle that creates / reinforces / softens interpretations after every draft | `openrouter:openai/gpt-5.5` |
+| `rag_model`           | `loci draft` — synthesises markdown with citations  | `openrouter:anthropic/claude-opus-4.7` |
 | `classifier_model`    | Absorb's contradiction pass: 3-way classifier per (raw, interp) pair | `openrouter:deepseek/deepseek-v4-flash` |
 | `hyde_model`          | HyDE expansion in retrieval                         | `openrouter:deepseek/deepseek-v4-flash`    |
+| `research_model`      | Auto-research sub-agent — paper crawl, sandbox tool calls, summary synthesis | `openrouter:anthropic/claude-opus-4.6` |
 
 The picks above optimize for: strong reasoning where it matters, fast/cheap
 where the calls are high-frequency. Override any of them in `.env`:

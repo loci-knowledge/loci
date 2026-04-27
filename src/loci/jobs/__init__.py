@@ -20,10 +20,11 @@ Subpackages:
     communities  — Leiden community detection (optional, igraph-gated)
 """
 
-from loci.jobs.queue import enqueue, get_job, mark_failed
+from loci.jobs.queue import append_job_step, enqueue, get_job, mark_failed
 from loci.jobs.worker import run_worker_loop, start_worker_thread
 
 __all__ = [
+    "append_job_step",
     "enqueue",
     "get_job",
     "mark_failed",

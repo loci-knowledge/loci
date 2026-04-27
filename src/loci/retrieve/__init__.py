@@ -21,7 +21,9 @@ The shape of the result is documented in `pipeline.RetrievedNode` and
 `pipeline.RetrievalResponse`.
 """
 
+from loci.retrieve.narrative import render_trace_narrative
 from loci.retrieve.pipeline import (
+    PrunedLocus,
     RetrievalRequest,
     RetrievalResponse,
     RetrievedNode,
@@ -31,10 +33,12 @@ from loci.retrieve.pipeline import (
 )
 
 __all__ = [
+    "PrunedLocus",
     "RetrievalRequest",
     "RetrievalResponse",
     "RetrievedNode",
     "Retriever",
     "RouteHop",
     "RoutingInterp",
+    "render_trace_narrative",
 ]

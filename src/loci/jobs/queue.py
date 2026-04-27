@@ -92,6 +92,32 @@ def set_progress(
         pass
 
 
+def append_job_step(
+    conn: sqlite3.Connection,
+    job_id: str,
+    tool: str,
+    msg: str,
+    *,
+    max_entries: int = 60,
+) -> None:
+    """Append one step entry to the job's step_log JSON array.
+
+    Called from the research agent's event handler on each tool call so
+    loci_research_status can surface intermediate progress to the user.
+    """
+    row = conn.execute("SELECT step_log FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+        return
+    entries: list[dict] = json.loads(row["step_log"]) if row["step_log"] else []
+    entries.append({"t": now_iso(), "tool": tool, "msg": msg})
+    if len(entries) > max_entries:
+        entries = entries[-max_entries:]
+    conn.execute(
+        "UPDATE jobs SET step_log = ? WHERE id = ?",
+        (json.dumps(entries), job_id),
+    )
+
+
 def mark_done(
     conn: sqlite3.Connection, job_id: str, result: dict[str, Any] | None = None,
 ) -> None:
@@ -118,7 +144,7 @@ def mark_failed(conn: sqlite3.Connection, job_id: str, error: str) -> None:
 def get_job(conn: sqlite3.Connection, job_id: str) -> dict | None:
     row = conn.execute(
         """SELECT id, kind, project_id, status, progress, error, result,
-                  created_at, started_at, finished_at
+                  step_log, created_at, started_at, finished_at
            FROM jobs WHERE id = ?""",
         (job_id,),
     ).fetchone()
@@ -127,4 +153,6 @@ def get_job(conn: sqlite3.Connection, job_id: str) -> dict | None:
     out = dict(row)
     if out["result"]:
         out["result"] = json.loads(out["result"])
+    if out.get("step_log"):
+        out["step_log"] = json.loads(out["step_log"])
     return out
