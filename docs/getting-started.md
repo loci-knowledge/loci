@@ -458,16 +458,15 @@ Configure the server URL or pre-pin a project in VSCode settings:
 
 Full extension guide: [frontend.md](./frontend.md).
 
-## 11. Maintain: absorb (occasionally)
+## 11. Maintain: reflect + absorb (occasionally)
 
-Every ~30 sessions or once a week, run absorb to consolidate:
+Every ~30 sessions or once a week, run a reflect+absorb cycle to consolidate:
 
 ```bash
-uv run loci absorb codoc
+uv run loci reflect codoc --absorb
 ```
 
-What absorb does — periodic *housekeeping*, not the primary maintenance
-surface (the silent reflect cycle handles per-draft work):
+This runs absorb first (housekeeping), then a reflection pass. What absorb does:
 
 - replays trace logs into `access_count` / `confidence`
 - audits orphan nodes, broken `cites` (raws gone missing), bloat

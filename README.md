@@ -31,7 +31,7 @@ uv run loci workspace link transformer-attention-ws transformer-attention --role
 uv run loci workspace scan transformer-attention-ws
 uv run loci kickoff transformer-attention   # generate the first loci of thought
 uv run loci server                          # start the HTTP/MCP server
-uv run loci q transformer-attention "what is the rotary embedding insight?"
+uv run loci retrieve transformer-attention "what is the rotary embedding insight?"
 ```
 
 If you've upgraded across the DAG migration and want a clean slate:
@@ -56,18 +56,19 @@ uv run loci project bind transformer-attention
 
 ```
 src/loci/
-  config.py         # settings + paths
-  db/               # schema, migrations, connection (sqlite + sqlite-vec)
-  embed/            # local embedding model
-  graph/            # node/edge/project repositories
-  ingest/           # walk → hash → dedup → extract → embed
-  retrieve/         # lex + vec + hyde + PPR
-  citations/        # trace + response writers
-  jobs/             # background queue + absorb pipeline
-  llm/              # anthropic client + prompt assembly
+  ui/               # CLI (cli.py) and TUI (tui.py)
+  usecases/         # shared orchestration per operation (retrieve, draft)
   api/              # FastAPI REST + WebSocket
-  mcp/              # MCP adapter (curated subset of REST)
-  cli.py            # typer CLI
+  mcp/              # MCP adapter
+  graph/            # node/edge/project/workspace repositories
+  retrieve/         # lex + vec + hyde + PPR
+  draft.py          # draft pipeline
+  citations/        # trace + response writers
+  jobs/             # background queue + worker
+  ingest/           # walk → hash → dedup → extract → embed
+  llm/              # pydantic-ai wrapper
+  config.py         # settings + paths
+  db/               # schema, migrations, sqlite + sqlite-vec
 ```
 
 ## License

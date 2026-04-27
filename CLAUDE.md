@@ -65,8 +65,10 @@ Use `loci_current_project()` to verify which project is active.
 | `loci_expand_citation` | get the full body of a cited raw node |
 | `loci_expand_node` | get all three locus slots for an interpretation node |
 | `loci_propose_node` | author a new interpretation (relation_md / overlap_md / source_anchor_md) |
-| `loci_accept_proposal` | accept a housekeeping proposal from absorb |
-| `loci_absorb` | run periodic graph housekeeping |
+| `loci_accept_proposal` | accept a housekeeping proposal from reflect |
+| `loci_reflect` | run reflect (pass `absorb=True` to run absorb checkpoint first) |
+| `loci_research` | enqueue autoresearch job (paper search + optional sandbox) |
+| `loci_research_status` | poll an autoresearch job |
 | `loci_feedback` | submit citation-level feedback on a draft |
 | `loci_context` | get project profile + live loci summary for this session |
 | `loci_current_project` | resolve which project is active in this session |
@@ -75,16 +77,18 @@ Use `loci_current_project()` to verify which project is active.
 ## Key CLI commands
 
 ```bash
-uv run loci project create <slug>    # interactive setup wizard
-uv run loci project manage           # manage existing projects
-uv run loci workspace scan <ws>      # index / re-index sources
-uv run loci kickoff <project>        # seed the interpretation graph
-uv run loci draft <project> "..."    # draft with citations
-uv run loci q <project> "..."        # quick retrieval
-uv run loci absorb <project>         # periodic housekeeping
-uv run loci rebuild <project>        # re-derive all loci (keep raws)
-uv run loci reset                    # wipe everything
-uv run loci graph export <project>   # export D3 HTML visualization
+uv run loci project create <slug>       # interactive setup wizard
+uv run loci project manage              # manage existing projects
+uv run loci workspace scan <ws>         # index / re-index sources
+uv run loci kickoff <project>           # seed the interpretation graph
+uv run loci draft <project> "..."       # draft with citations
+uv run loci retrieve <project> "..."    # retrieval (alias: q)
+uv run loci reflect <project>           # run reflection cycle
+uv run loci reflect <project> --absorb  # absorb checkpoint then reflect
+uv run loci research <project> <ws> "..." # autoresearch (blocking)
+uv run loci rebuild <project>           # re-derive all loci (keep raws)
+uv run loci reset                       # wipe everything
+uv run loci graph export <project>      # export D3 HTML visualization
 ```
 
 ## Architecture in brief
@@ -99,5 +103,19 @@ Edges: `cites` (interp→raw) and `derives_from` (interp→interp). Strict DAG.
 Retrieval is interpretation-routed: loci are scored first, then their cited
 raws are promoted. Response includes `routing_loci[]` (side context) and
 `trace_table[]` (per-raw routing path).
+
+Source layout:
+```
+src/loci/
+  ui/         # CLI (ui/cli.py) and TUI (ui/tui.py) — entry: loci.ui.cli:main
+  usecases/   # shared orchestration: retrieve.py, draft.py
+  api/        # FastAPI REST + WebSocket
+  mcp/        # MCP adapter
+  graph/      # node/edge/project/workspace repositories
+  retrieve/   # lex + vec + hyde + PPR pipeline
+  draft.py    # draft pipeline (domain module)
+  jobs/       # background queue + worker
+  ingest/     # walk → hash → extract → embed
+```
 
 See `docs/` for full architecture, graph model, and agent behaviour.

@@ -101,7 +101,12 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
 
     reflection = result.output
 
-    # Log to agent_reflections with the new trigger kind.
+    # Log to agent_reflections. Map scope to a valid trigger value.
+    _VALID_TRIGGERS = frozenset(
+        ["draft", "feedback", "manual", "kickoff", "link",
+         "profile_refresh", "incremental", "retrieve"]
+    )
+    trigger = scope if scope in _VALID_TRIGGERS else "incremental"
     rid = new_id()
     conn.execute(
         """
@@ -109,7 +114,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
                                        instruction, deliberation_md, actions_json)
         VALUES (?, ?, NULL, ?, ?, ?, '[]')
         """,
-        (rid, project_id, scope, f"relevance pass: {workspace.name}", reflection.deliberation),
+        (rid, project_id, trigger, f"relevance pass: {workspace.name}", reflection.deliberation),
     )
 
     # Apply all proposed actions (no critique stage — stay cheap).

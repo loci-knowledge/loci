@@ -532,12 +532,12 @@ def feedback(response_id: str, edited_markdown_file: Path) -> None:
 
 
 @app.command
-def reflect(project: str, response_id: str | None = None) -> None:
-    """Manually run a reflection cycle against a project.
-
-    Pass `response_id` to reflect on a specific draft; omit to run a manual
-    reflection from the project's pinned set + latest activity.
-    """
+def reflect(
+    project: str,
+    response_id: str | None = None,
+    absorb: bool = False,
+) -> None:
+    """Run a reflection cycle. Pass --absorb to run absorb first."""
     from loci.db import migrate
     from loci.db.connection import connect
     from loci.jobs import enqueue
@@ -547,11 +547,16 @@ def reflect(project: str, response_id: str | None = None) -> None:
     migrate()
     conn = connect()
     proj = _resolve_project(conn, project)
+    if absorb:
+        aid = enqueue(conn, kind="absorb", project_id=proj.id)
+        console.print(f"[dim]enqueued absorb {aid}; running...[/dim]")
+        run_once(conn)
+        console.print(get_job(conn, aid))
     jid = enqueue(
         conn, kind="reflect", project_id=proj.id,
         payload={"response_id": response_id, "trigger": "manual"},
     )
-    console.print(f"[dim]enqueued {jid}; running...[/dim]")
+    console.print(f"[dim]enqueued reflect {jid}; running...[/dim]")
     run_once(conn)
     console.print(get_job(conn, jid))
 
@@ -571,7 +576,7 @@ def research(
     Saves paper notes, code, and a summary under the workspace's first source
     root at `<root>/research/<run_id>/`, then re-scans the workspace so the
     artifacts become raw nodes. A `relevance` locus is created that cites the
-    new raws, so subsequent `loci q`/`loci draft` can route to them.
+    new raws, so subsequent `loci retrieve`/`loci draft` can route to them.
 
     Sandbox requires HF_TOKEN env + --hf-owner (or LOCI_RESEARCH_HF_OWNER).
     Pass --no-sandbox to skip code execution and only do paper discovery.
@@ -610,23 +615,10 @@ def research(
     console.print(job)
 
 
-@app.command
+@app.command(name="absorb")
 def absorb(project: str) -> None:
-    """Enqueue and run an absorb checkpoint synchronously (CLI-blocking)."""
-    from loci.db import migrate
-    from loci.db.connection import connect
-    from loci.jobs import enqueue
-    from loci.jobs.queue import get_job
-    from loci.jobs.worker import run_once
-
-    migrate()
-    conn = connect()
-    proj = _resolve_project(conn, project)
-    jid = enqueue(conn, kind="absorb", project_id=proj.id)
-    console.print(f"[dim]enqueued {jid}; running...[/dim]")
-    run_once(conn)
-    j = get_job(conn, jid)
-    console.print(j)
+    """Deprecated: use 'reflect --absorb'. Runs absorb then reflect."""
+    reflect(project=project, absorb=True)
 
 
 @graph_app.command(name="json")
