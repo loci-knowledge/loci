@@ -25,6 +25,7 @@ and why.
 | `retrieve`    | A `loci_retrieve` MCP tool call completed (lightweight — no self-critique). Throttled to at most one per 5 minutes per project. |
 | `relevance`   | A workspace was linked to the project, the project profile changed, or incremental workspace members were added. Runs a focused single-pass synthesis without a self-critique stage. |
 | `update_angle` | Triggered by citation feedback on a `relevance` node when the angle appears wrong, or by a direct user edit to such a node. Retargets the node's `angle` and `rationale_md` without recreating it. |
+| `draft_refine` | Internal: the draft refinement loop (`agent/refine.py`) detected unsupported verdicts and rewrote the draft. Each iteration is logged to `agent_reflections` with this trigger. Not a reflect cycle — no graph mutations. |
 
 The first four are auto-enqueued. The agent runs in the worker thread, so
 your draft response is non-blocking — you read the draft while the agent

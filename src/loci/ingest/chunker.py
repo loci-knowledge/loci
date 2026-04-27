@@ -140,8 +140,7 @@ def _pack_paragraphs(
 
         # Single paragraph too big — emit current buffer, then hard-split it.
         if not buf and len(para) > MAX_CHARS:
-            for sub in _split_long(para, base_offset=global_start, section=section):
-                yield sub
+            yield from _split_long(para, base_offset=global_start, section=section)
             continue
 
         candidate = (buf + "\n\n" + para) if buf else para

@@ -1,7 +1,28 @@
-# Frontend (loki-frontend VSCode extension)
+# Frontend
+
+loci ships two visual interfaces that both connect to the same HTTP/WS API on
+port 7077.
+
+## Hosted graph web UI (built-in)
+
+The primary visual interface is a D3 force-directed graph served directly by
+the loci server. No install step; no separate repo.
+
+```bash
+uv run loci server          # start the server
+uv run loci graph serve     # prints the URL, opens in browser
+```
+
+See **[graph-ui.md](./graph-ui.md)** for the full feature reference, including
+the left-sidebar chat, trace-of-thought visualization, clickable citations, and
+the node editor panel.
+
+---
+
+## Loki Town (loki-frontend VSCode extension)
 
 The interpretation graph lives in `loci`. The **town panel** that lets you
-*see* and *interact with* it lives in a separate repo —
+*see* and *interact with* it in VSCode lives in a separate repo —
 [`loki-frontend`](https://github.com/<you>/loki-frontend) — published as a
 VSCode extension called *Loki Town*.
 

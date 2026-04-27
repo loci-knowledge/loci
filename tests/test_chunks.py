@@ -13,7 +13,6 @@ import pytest
 from loci.ingest import scan_path
 from loci.ingest.chunks import chunks_for, has_chunks
 from loci.retrieve import lex as lex_mod
-from loci.retrieve import vec as vec_mod
 
 
 @pytest.fixture

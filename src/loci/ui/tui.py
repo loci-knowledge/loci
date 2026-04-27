@@ -15,7 +15,6 @@ from pathlib import Path
 import questionary
 from rich.console import Console
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.table import Table
 
 console = Console()
@@ -403,8 +402,6 @@ def _link_existing_workspaces(
     if selected is None:
         return
 
-    from loci.graph.workspaces import WorkspaceRepository
-    ws_repo = WorkspaceRepository(conn)
     new_links: dict[str, str] = {}
     for ws_id in selected:
         ws = next((w for w in workspaces if w.id == ws_id), None)

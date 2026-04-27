@@ -134,11 +134,10 @@ def test_graph_view_includes_community_version(loci_dir):
 
 
 def test_graph_export_writes_standalone_html(loci_dir):
+    from loci.db import migrate
     from loci.db.connection import connect
     from loci.graph import Project, ProjectRepository
     from loci.graph.export import write_graph_html
-
-    from loci.db import migrate
 
     migrate()
     conn = connect()

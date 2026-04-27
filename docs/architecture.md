@@ -112,6 +112,20 @@ The effective member set for a project is computed by
 `project_effective_members` (see "Information Workspaces" above). Explicit
 `project_membership` rows take precedence over workspace-derived membership.
 
+## New tables (v2)
+
+Three tables added alongside the original schema:
+
+| table | purpose |
+|-------|---------|
+| `node_revisions` | event-sourced history of every locus edit (`create`, `update_locus`, `update_body`, `set_angle`, `hard_delete`, `revert`). Tombstone rows capture full snapshots for hard deletes. |
+| `preference_pairs` | implicit preference signal: each `cited_kept × cited_dropped` pair from a draft response is stored here for future CrossEncoder fine-tuning. |
+
+A new module `src/loci/agent/refine.py` runs a self-refine loop (max 2 iters)
+after the verifier on every draft: if `unsupported` verdicts remain, it
+rewrites the draft against a citation rubric before returning. Each iteration
+is logged to `agent_reflections` with `trigger="draft_refine"`.
+
 ## Storage layout on disk
 
 ```
@@ -180,6 +194,26 @@ return {
 
 Loci are not citable content. They are returned alongside raws as routing
 context, never as the answer.
+
+### Revision endpoints
+
+```
+GET  /nodes/:id/revisions?limit=50   → ordered revision history for a node
+POST /nodes/:id/revisions/:rid/revert → re-apply prior_values (writes new revision row)
+```
+
+Every write to a locus slot (`update_locus`, `update_body`, `set_angle`,
+`hard_delete`) is captured atomically inside the same transaction via
+`graph/revisions.py`. The `actor` and `source_tool` fields distinguish user
+edits (API/graph-UI), MCP tool calls, and agent reflection actions.
+
+### Graph UI route
+
+```
+GET /graph/:project_id   → the hosted D3 web UI (HTML)
+```
+
+See [graph-ui.md](./graph-ui.md) for the full feature reference.
 
 ### Awareness endpoints
 

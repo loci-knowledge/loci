@@ -44,7 +44,7 @@ from loci.db import migrate
 from loci.db.connection import get_connection
 from loci.embed.local import get_embedder
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
-from loci.graph.models import InterpretationNode, Workspace, WorkspaceKind, now_iso
+from loci.graph.models import InterpretationNode, Workspace, now_iso
 from loci.graph.workspaces import WorkspaceRepository
 from loci.jobs import enqueue
 from loci.mcp.resolve import ProjectNotFound, resolve_project_id
@@ -886,8 +886,8 @@ def build_mcp_server() -> FastMCP:
     )
     def loci_add_citation(locus_id: str, raw_id: str) -> dict[str, Any]:
         conn = get_connection()
-        from loci.graph.edges import EdgeError
         from loci.api.publishers import publish_edge_upsert
+        from loci.graph.edges import EdgeError
         try:
             edge = EdgeRepository(conn).create(locus_id, raw_id, type="cites")
         except EdgeError as exc:

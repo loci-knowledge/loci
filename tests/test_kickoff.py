@@ -17,8 +17,8 @@ from loci.jobs.worker import run_once
 
 def test_kickoff_skips_without_llm(conn, fake_embedder, project, workspace, corpus_dir, monkeypatch):
     """Without an LLM the kickoff handler returns skipped, no failure."""
-    from loci.llm import LLMNotConfiguredError
     import loci.jobs.kickoff as kickoff_mod
+    from loci.llm import LLMNotConfiguredError
     monkeypatch.setattr(kickoff_mod, "build_agent", lambda *a, **kw: (_ for _ in ()).throw(LLMNotConfiguredError("no key")))
 
     # Need a profile and some raws so the handler doesn't no-op for empty input.
@@ -35,8 +35,8 @@ def test_kickoff_skips_without_llm(conn, fake_embedder, project, workspace, corp
 
 def test_kickoff_no_input_returns_skip(conn, project, monkeypatch):
     """Empty profile + no raws → skip (no LLM call attempted)."""
-    from loci.llm import LLMNotConfiguredError
     import loci.jobs.kickoff as kickoff_mod
+    from loci.llm import LLMNotConfiguredError
     monkeypatch.setattr(kickoff_mod, "build_agent", lambda *a, **kw: (_ for _ in ()).throw(LLMNotConfiguredError("no key")))
     jid = enqueue(conn, kind="kickoff", project_id=project.id, payload={})
     run_once(conn)

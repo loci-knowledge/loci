@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from loci.ingest.chunker import (
     MAX_CHARS,
-    MIN_CHARS,
-    TARGET_CHARS,
     chunk_doc,
 )
 
@@ -42,7 +40,7 @@ def test_markdown_splits_on_headings():
 
 def test_markdown_large_section_packs_paragraphs():
     para = "This is a long paragraph that takes up some space. " * 20  # ~ 1k chars
-    text = f"# Big Section\n\n" + ("\n\n".join([para] * 6))  # ~6k chars
+    text = "# Big Section\n\n" + ("\n\n".join([para] * 6))  # ~6k chars
     chunks = chunk_doc(text, "md")
     assert len(chunks) >= 2
     for c in chunks:

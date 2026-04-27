@@ -278,6 +278,7 @@ def _anchor_isolated(
     interpreter agent, not by post-hoc co-citation).
     """
     import numpy as np
+
     from loci.graph.models import new_id
 
     isolated = conn.execute("""

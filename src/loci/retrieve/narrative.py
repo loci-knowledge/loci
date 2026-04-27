@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 
 def render_trace_narrative(
     *,
-    nodes: "list[RetrievedNode]",
-    routing_interps: "list[RoutingInterp]",
+    nodes: list[RetrievedNode],
+    routing_interps: list[RoutingInterp],
     max_raws: int = 10,
 ) -> str:
     """Render a per-raw markdown narrative of how each raw was reached.
@@ -67,7 +67,7 @@ def render_trace_narrative(
     return "\n".join(lines)
 
 
-def _locus_label(node_id: str, interp_by_id: "dict[str, RoutingInterp]") -> str:
+def _locus_label(node_id: str, interp_by_id: dict[str, RoutingInterp]) -> str:
     ri = interp_by_id.get(node_id)
     if ri is None:
         return f"locus `{node_id[:8]}…`"

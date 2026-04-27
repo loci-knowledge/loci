@@ -22,6 +22,8 @@ breakdown on each routing locus.
 
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel
 

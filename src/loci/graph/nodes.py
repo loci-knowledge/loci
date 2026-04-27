@@ -19,8 +19,13 @@ the action they represent.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from collections.abc import Iterable
+
+# RevisionLogger is imported lazily inside the class to avoid import cycles
+# with graph.revisions. The TYPE_CHECKING guard below is for type annotations only.
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -33,9 +38,6 @@ from loci.graph.models import (
     now_iso,
 )
 
-# RevisionLogger is imported lazily inside the class to avoid import cycles
-# with graph.revisions. The TYPE_CHECKING guard below is for type annotations only.
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from loci.graph.revisions import RevisionLogger
 
@@ -308,12 +310,10 @@ class NodeRepository:
                 "DELETE FROM project_membership WHERE node_id = ?", (node_id,)
             )
             # workspace_membership may not exist in all migration states; ignore if missing.
-            try:
+            with contextlib.suppress(Exception):
                 self.conn.execute(
                     "DELETE FROM workspace_membership WHERE node_id = ?", (node_id,)
                 )
-            except Exception:  # noqa: BLE001
-                pass
             self.conn.execute(
                 "DELETE FROM interpretation_nodes WHERE node_id = ?", (node_id,)
             )

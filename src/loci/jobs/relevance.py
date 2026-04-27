@@ -24,19 +24,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 
-from pydantic import BaseModel
-
 from loci.agent.interpreter import (
-    AGENT_BASE_CONF,
-    Reflection,
     _SYNTH_INSTRUCTIONS,
-    _build_context,
+    Reflection,
     _apply_actions,
 )
-from loci.citations import CitationTracker
 from loci.config import get_settings
-from loci.graph.models import InterpretationNode, RelevanceAngle, new_id
-from loci.graph.nodes import NodeRepository
+from loci.graph.models import new_id
 from loci.graph.projects import ProjectRepository
 from loci.graph.workspaces import WorkspaceRepository
 from loci.llm import LLMNotConfiguredError, build_agent

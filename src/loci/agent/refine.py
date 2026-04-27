@@ -70,10 +70,7 @@ def refine_draft(
     """
     # 1. Initial score.
     unsupported_count = sum(1 for v in verdicts if v.verdict == "unsupported")
-    if verdicts:
-        score = 1.0 - min(1.0, unsupported_count / max(1, len(verdicts)))
-    else:
-        score = 0.5  # no verdicts → assume partial quality
+    score = 1.0 - min(1.0, unsupported_count / max(1, len(verdicts))) if verdicts else 0.5
 
     # 2. Fast-path: already good enough.
     if score >= threshold and unsupported_count == 0:

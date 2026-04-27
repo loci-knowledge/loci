@@ -12,7 +12,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 
 from loci.api.dependencies import db
-from loci.api.publishers import projects_for_node, publish_node_upsert
+from loci.api.publishers import publish_node_upsert
 from loci.graph import NodeRepository
 
 router = APIRouter(tags=["revisions"])
@@ -56,7 +56,7 @@ def revert_node(
             (revision_id, node_id),
         ).fetchone()
     except sqlite3.OperationalError:
-        raise HTTPException(status_code=404, detail="revision not found")
+        raise HTTPException(status_code=404, detail="revision not found") from None
 
     if row is None:
         raise HTTPException(status_code=404, detail="revision not found")
@@ -64,7 +64,7 @@ def revert_node(
     try:
         prior_values: dict = json.loads(row["prior_values"])
     except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="revision prior_values is not valid JSON")
+        raise HTTPException(status_code=422, detail="revision prior_values is not valid JSON") from None
 
     # Extract only the locus fields that update_locus accepts.
     locus_fields = ("relation_md", "overlap_md", "source_anchor_md", "angle")

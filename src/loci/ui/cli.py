@@ -757,7 +757,6 @@ def graph_serve(
 @graph_app.command(name="revisions")
 def graph_revisions(project: str, node_id: str, limit: int = 20) -> None:
     """List revision history for an interpretation node."""
-    import json as _json
 
     from loci.db import migrate
     from loci.db.connection import connect
@@ -783,7 +782,7 @@ def graph_revisions(project: str, node_id: str, limit: int = 20) -> None:
         ).fetchall()
     except Exception as exc:
         console.print(f"[red]error reading revisions:[/red] {exc}")
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
     if not rows:
         console.print("[yellow]no revisions found for this node[/yellow]")
         return

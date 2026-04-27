@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def compute_affinity(
@@ -50,9 +50,9 @@ def compute_affinity(
     if now_ts is not None:
         now = datetime.fromisoformat(now_ts.replace("Z", "+00:00"))
         if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
+            now = now.replace(tzinfo=UTC)
     else:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
 
     placeholders = ",".join("?" * len(candidate_ids))
     rows = conn.execute(
@@ -96,7 +96,7 @@ def compute_affinity(
                     last_accessed_at.replace("Z", "+00:00")
                 )
                 if last_dt.tzinfo is None:
-                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    last_dt = last_dt.replace(tzinfo=UTC)
                 days = (now - last_dt).total_seconds() / 86400.0
             except (ValueError, AttributeError):
                 days = 365.0

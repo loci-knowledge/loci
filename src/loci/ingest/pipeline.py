@@ -32,7 +32,6 @@ from loci.graph.models import RawNode
 from loci.graph.nodes import NodeRepository
 from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest.chunker import Chunk, chunk_doc
-from loci.ingest.chunks import write_chunks
 from loci.ingest.content_hash import hash_file, store_blob
 from loci.ingest.extractors import ExtractedDoc, extract
 from loci.ingest.walker import walk
