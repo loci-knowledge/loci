@@ -244,6 +244,7 @@ def patch_node_locus(
     node_id: str,
     body: PatchLocus,
     if_match: str | None = Header(None, alias="If-Match"),
+    x_loci_actor: str | None = Header(None, alias="X-Loci-Actor"),
     conn: sqlite3.Connection = Depends(db),
 ) -> dict:
     from loci.api.publishers import projects_for_node
@@ -255,6 +256,7 @@ def patch_node_locus(
         raise HTTPException(400, detail="locus patch only applies to interpretation nodes")
     if if_match is not None and n.updated_at != if_match:
         raise HTTPException(409, detail="conflict: node modified since If-Match value was read")
+    actor = x_loci_actor if x_loci_actor in ("user", "agent", "system") else "user"
     # Re-embed using the merged (old + new) slot text.
     rel = body.relation_md if body.relation_md is not None else getattr(n, "relation_md", "")
     ovl = body.overlap_md if body.overlap_md is not None else getattr(n, "overlap_md", "")
@@ -266,6 +268,7 @@ def patch_node_locus(
         relation_md=body.relation_md, overlap_md=body.overlap_md,
         source_anchor_md=body.source_anchor_md, angle=body.angle,
         new_embedding=new_emb,
+        actor=actor, source_tool="api.patch_node_locus",
     )
     pids = projects_for_node(conn, node_id)
     if pids:
@@ -300,7 +303,7 @@ def delete_node(
         for r in edge_rows
     ]
     node_project_ids = projects_for_node(conn, node_id)
-    nodes_repo.hard_delete(node_id)
+    nodes_repo.hard_delete(node_id, actor="user", source_tool="api.delete_node")
     for eid, src, dst, pids in edge_fan:
         publish_edge_delete(conn, eid, src=src, dst=dst, project_ids=pids)
     publish_node_delete(conn, node_id, project_ids=node_project_ids)

@@ -642,6 +642,9 @@ def build_mcp_server() -> FastMCP:
             (project_id, since, since),
         ).fetchall()
 
+        from loci.agent.memo import build_project_memo
+        project_memo = build_project_memo(conn, project_id)
+
         return {
             "project": {
                 "id": proj.id, "slug": proj.slug, "name": proj.name,
@@ -667,6 +670,7 @@ def build_mcp_server() -> FastMCP:
                 for r in recent_nodes
             ],
             "since": since,
+            "project_memo": project_memo,
         }
 
     @mcp.tool(
@@ -803,12 +807,78 @@ def build_mcp_server() -> FastMCP:
             relation_md=relation_md, overlap_md=overlap_md,
             source_anchor_md=source_anchor_md, angle=angle,
             new_embedding=new_emb,
+            actor="user", source_tool="mcp.loci_edit_locus",
         )
         from loci.api.publishers import publish_node_upsert
         updated = NodeRepository(conn).get(node_id)
         if updated is not None:
             publish_node_upsert(conn, updated)
         return {"updated": True, "node_id": node_id}
+
+    @mcp.tool(
+        name="loci_node_history",
+        description=(
+            "Return the revision history for a single interpretation node — "
+            "every create, edit, and delete event in reverse chronological order."
+        ),
+    )
+    def loci_node_history(node_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, node_id, ts, actor, source_tool, op, reason,
+                       prior_values, new_values, parent_revision_id
+                FROM node_revisions WHERE node_id = ? ORDER BY ts DESC LIMIT ?
+                """,
+                (node_id, limit),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — table absent on old DBs
+            return []
+        return [dict(r) for r in rows]
+
+    @mcp.tool(
+        name="loci_revert_node",
+        description=(
+            "Revert an interpretation node's locus slots to their state at a given "
+            "revision. Provide the node_id and the revision_id to revert to. "
+            "This creates a new revision row (so the revert is itself undoable)."
+        ),
+    )
+    def loci_revert_node(node_id: str, revision_id: str) -> dict[str, Any]:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT * FROM node_revisions WHERE id = ? AND node_id = ?",
+            (revision_id, node_id),
+        ).fetchone()
+        if row is None:
+            return {"error": "revision not found", "revision_id": revision_id}
+        import json as _json
+        prior = _json.loads(row["prior_values"])
+        kwargs = {k: prior[k] for k in ("relation_md", "overlap_md", "source_anchor_md", "angle")
+                  if k in prior and prior[k] is not None}
+        if not kwargs:
+            return {"error": "no reversible slot values in this revision"}
+        from loci.embed.local import get_embedder as _get_embedder
+        n = NodeRepository(conn).get(node_id)
+        if n is None:
+            return {"error": "node not found", "node_id": node_id}
+        title = n.title
+        emb_text = "\n\n".join(p for p in [title,
+                                             kwargs.get("relation_md", ""),
+                                             kwargs.get("overlap_md", ""),
+                                             kwargs.get("source_anchor_md", "")] if p).strip()
+        new_emb = _get_embedder().encode(emb_text) if emb_text else None
+        NodeRepository(conn).update_locus(
+            node_id, **kwargs, new_embedding=new_emb,
+            actor="user", source_tool="mcp.loci_revert_node",
+            reason=f"revert to revision {revision_id}",
+        )
+        from loci.api.publishers import publish_node_upsert
+        updated = NodeRepository(conn).get(node_id)
+        if updated is not None:
+            publish_node_upsert(conn, updated)
+        return {"reverted": True, "node_id": node_id, "from_revision": revision_id}
 
     @mcp.tool(
         name="loci_add_citation",
@@ -871,7 +941,7 @@ def build_mcp_server() -> FastMCP:
             for r in edge_rows
         ]
         node_project_ids = projects_for_node(conn, node_id)
-        NodeRepository(conn).hard_delete(node_id)
+        NodeRepository(conn).hard_delete(node_id, actor="user", source_tool="mcp.loci_delete_node")
         for eid, src, dst, pids in edge_fan:
             publish_edge_delete(conn, eid, src=src, dst=dst, project_ids=pids)
         publish_node_delete(conn, node_id, project_ids=node_project_ids)

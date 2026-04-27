@@ -59,6 +59,7 @@ def create_app() -> FastAPI:
         draft,
         edges,
         feedback,
+        graph_ui,
         graph_view,
         jobs,
         nodes,
@@ -66,6 +67,7 @@ def create_app() -> FastAPI:
         proposals,
         responses,
         retrieve,
+        revisions,
         workspaces,
     )
 
@@ -82,6 +84,20 @@ def create_app() -> FastAPI:
     app.include_router(graph_view.router)
     app.include_router(jobs.router)
     app.include_router(responses.router)
+    app.include_router(revisions.router)
+    app.include_router(graph_ui.router)
+
+    from pathlib import Path
+
+    from fastapi.staticfiles import StaticFiles
+
+    _graph_ui_dir = Path(__file__).parent / "static" / "graph_ui"
+    if _graph_ui_dir.exists():
+        app.mount(
+            "/graph/static",
+            StaticFiles(directory=str(_graph_ui_dir)),
+            name="graph_static",
+        )
 
     # WebSocket routes are registered directly on the app.
     from loci.api.websocket import register_ws

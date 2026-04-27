@@ -431,7 +431,8 @@ CREATE TABLE agent_reflections (
     response_id     TEXT REFERENCES responses(id) ON DELETE SET NULL,
     trigger         TEXT NOT NULL CHECK (trigger IN (
         'draft','feedback','manual','kickoff',
-        'link','profile_refresh','incremental','retrieve'
+        'link','profile_refresh','incremental','retrieve',
+        'draft_refine'
     )),
     instruction     TEXT NOT NULL,
     deliberation_md TEXT NOT NULL DEFAULT '',

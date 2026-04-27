@@ -83,6 +83,9 @@ class DraftRequest:
     # Run the post-draft entailment verifier? Default on. Disable for tests
     # or fast paths where the extra LLM call isn't worth the latency.
     verify: bool = True
+    # Run the post-draft Self-Refine loop. Set False to skip extra LLM calls.
+    refine: bool = True
+    refine_max_iter: int = 2
 
 
 @dataclass
@@ -146,12 +149,18 @@ class DraftResult:
     # or None if enqueue failed. Surfaced in `pending_effects` at the MCP
     # layer so the user knows the graph will mutate after this call.
     reflect_job_id: str | None = None
+    # Number of Self-Refine iterations that ran (0 = skipped or already good).
+    refine_iters: int = 0
     # Verbose-mode payload — loci that scored but routed nothing.
     pruned_loci: list[dict] = field(default_factory=list)
 
 
 def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
     """Run the full draft pipeline. One LLM call for generation + one for verification."""
+    # 0. Build project memo (cached; injected into generation prompt).
+    from loci.agent.memo import build_project_memo, invalidate_memo_cache
+    project_memo = build_project_memo(conn, req.project_id)
+
     # 1. Retrieve. The new pipeline returns raws + trace_table + routing_interps,
     # each raw carrying its winning chunk_id + chunk_text where available.
     retriever = Retriever(conn)
@@ -183,6 +192,7 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
         candidate_block=candidate_block,
         style=req.style,
         cite_density=req.cite_density,
+        project_memo=project_memo,
     )
 
     # 4. Anti-fabrication: keep only handles that map to real candidates.
@@ -213,6 +223,34 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
                 if cur is None or rank[v.verdict] > rank[cur.verdict]:
                     verdict_by_handle[v.handle] = v
 
+    # 5b. Rubric-aligned refinement loop (optional, controlled by req.refine).
+    _refine_iters: list = []
+    if req.refine and verdicts:
+        try:
+            from loci.agent.refine import refine_draft as _refine
+            output_md, _refine_iters = _refine(
+                conn=conn,
+                project_id=req.project_id,
+                response_id=None,
+                instruction=req.instruction,
+                candidate_block=candidate_block,
+                output_md=output_md,
+                verdicts=verdicts,
+                handle_to_chunk_text=handle_to_chunk_text,
+                max_iter=req.refine_max_iter,
+            )
+            # Re-parse cited handles from the refined output.
+            cited_handles = [m.upper() for m in _CITE_RE.findall(output_md)]
+            cited_ids = []
+            seen: set[str] = set()
+            for h in cited_handles:
+                nid = handle_to_id.get(h)
+                if nid and nid not in seen:
+                    cited_ids.append(nid)
+                    seen.add(nid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("draft: refinement loop failed: %s", exc)
+
     # 6. Build the citations[] block (only raws), now annotated with chunks
     # and best-verdict.
     citations = _materialise_citations(
@@ -232,6 +270,8 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
             "hyde": req.hyde, "anchors": req.anchors,
             "has_context": req.context_md is not None,
             "verified": req.verify,
+            "refine": req.refine,
+            "refine_iters": len(_refine_iters),
         },
         output=output_md,
         cited_node_ids=cited_ids,
@@ -241,6 +281,12 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
     rid = CitationTracker(conn).write_response(
         record, retrieved_node_ids=[c.node_id for c in candidates],
     )
+
+    try:
+        from loci.jobs.preference_pairs import enqueue_preference_pairs
+        enqueue_preference_pairs(conn, req.project_id, rid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("draft: preference pair collection failed: %s", exc)
 
     # 9. Per-locus 'routed_via' traces — record which loci served each cited raw.
     _persist_route_traces(conn, req.project_id, req.session_id, rid,
@@ -267,6 +313,9 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
         for pl in retrieval.pruned_loci
     ]
 
+    # Draft wrote new revisions — stale memo on the next reflect call is a bug.
+    invalidate_memo_cache(req.project_id)
+
     return DraftResult(
         output_md=output_md,
         citations=citations,
@@ -278,6 +327,7 @@ def draft(conn: sqlite3.Connection, req: DraftRequest) -> DraftResult:
         verdicts=verdicts,
         trace_narrative=retrieval.trace_narrative,
         reflect_job_id=reflect_job_id,
+        refine_iters=len(_refine_iters),
         pruned_loci=pruned_loci_payload,
     )
 
@@ -604,6 +654,7 @@ def _generate(
     candidate_block: str,
     style: Style,
     cite_density: CiteDensity,
+    project_memo: str = "",
 ) -> tuple[str, list[str]]:
     """Call the LLM. Returns (output_md, list_of_handles_in_output_order)."""
     settings = get_settings()
@@ -619,7 +670,10 @@ def _generate(
         )
         return stub, []
 
-    sections: list[str] = [f"INSTRUCTION:\n{instruction}"]
+    sections: list[str] = []
+    if project_memo:
+        sections.append(f"PROJECT MEMO:\n{project_memo}")
+    sections.append(f"INSTRUCTION:\n{instruction}")
     if context_md:
         sections.append(f"CONTEXT_MD (user's draft so far):\n{context_md}")
     sections.append(f"CANDIDATES:\n\n{candidate_block}")

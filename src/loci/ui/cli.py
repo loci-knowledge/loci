@@ -58,7 +58,7 @@ project_app = App(name="project", help="Project commands.")
 app.command(project_app)
 workspace_app = App(name="workspace", help="Information workspace commands.")
 app.command(workspace_app)
-graph_app = App(name="graph", help="Export graph visualizations.")
+graph_app = App(name="graph", help="Visualize, export, and inspect the interpretation graph.")
 app.command(graph_app)
 
 
@@ -448,8 +448,13 @@ def draft(
     cite_density: str = "normal",
     k: int = 12,
     hyde: bool = False,
+    no_refine: bool = False,
 ) -> None:
-    """Generate a draft with citations from a project."""
+    """Generate a draft with citations from a project.
+
+    Runs retrieval → generation → entailment verification → Self-Refine loop
+    (disable with --no-refine to skip the extra LLM calls).
+    """
     from loci.db import migrate
     from loci.db.connection import connect
     from loci.draft import DraftRequest
@@ -465,14 +470,20 @@ def draft(
     res = run_draft(conn, DraftRequest(
         project_id=proj.id, session_id="cli", instruction=instruction,
         style=style, cite_density=cite_density,  # type: ignore[arg-type]
-        k=k, hyde=hyde, client="cli",
+        k=k, hyde=hyde, client="cli", refine=not no_refine,
     ))
     console.rule("draft")
     console.print(res.output_md)
+    if res.refine_iters:
+        console.print(
+            f"[dim]refined {res.refine_iters} iteration(s) — "
+            f"citation quality improved[/dim]"
+        )
     console.rule("citations (raws)")
     nodes_by_id = {rl.node_id: rl for rl in res.routing_loci}
     for c in res.citations:
-        line = f"  [{c.kind}/{c.subkind}] {c.title!r} — {c.why_cited}"
+        verdict_tag = f" [{c.verdict}]" if c.verdict not in ("unknown", "supported") else ""
+        line = f"  [{c.kind}/{c.subkind}] {c.title!r}{verdict_tag} — {c.why_cited}"
         if c.routed_by:
             routers = []
             for iid in c.routed_by[:3]:
@@ -488,6 +499,7 @@ def draft(
                 f"    relation: {rl.relation_md[:160]}"
             )
     console.print(f"\n[dim]response_id: {res.response_id}[/dim]")
+    console.print(f"[dim]view graph:  loci graph serve {proj.slug}[/dim]")
 
 
 @app.command
@@ -660,8 +672,14 @@ def graph_export(
     project: str,
     output: Path = Path("/tmp/loci_graph.html"),
     include_raw: bool = True,
+    inline: bool = False,
 ) -> None:
-    """Write a standalone HTML graph snapshot for a project."""
+    """Write an HTML graph file for a project.
+
+    By default the file redirects to the live hosted UI (loci server must be
+    running on localhost:7077). Pass --inline to get a self-contained D3
+    snapshot that works offline.
+    """
     from loci.db import migrate
     from loci.db.connection import connect
     from loci.graph import ProjectRepository
@@ -673,7 +691,7 @@ def graph_export(
     if proj is None:
         console.print(f"[red]no such project:[/red] {project}")
         raise SystemExit(1)
-    out = write_graph_html(proj, conn, output, include_raw=include_raw)
+    out = write_graph_html(proj, conn, output, include_raw=include_raw, standalone=inline)
     console.print(f"[green]wrote[/green] {out}")
 
     # Diagnostics when the graph looks thin
@@ -706,6 +724,123 @@ def graph_export(
                 "     (kickoff may have skipped if workspace was empty when it ran; "
                 "re-run after scanning)"
             )
+
+
+@graph_app.command(name="serve")
+def graph_serve(
+    project: str,
+    host: str = "127.0.0.1",
+    port: int = 7077,
+) -> None:
+    """Open the live graph editor in a browser (server must be running).
+
+    Prints the URL and opens it automatically. Start the server separately
+    with `loci server` if it isn't already running.
+    """
+    import webbrowser
+
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph import ProjectRepository
+
+    migrate()
+    conn = connect()
+    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
+    if proj is None:
+        console.print(f"[red]no such project:[/red] {project}")
+        raise SystemExit(1)
+    url = f"http://{host}:{port}/graph/{proj.id}"
+    console.print(f"Opening [link={url}]{url}[/link]")
+    webbrowser.open(url)
+
+
+@graph_app.command(name="revisions")
+def graph_revisions(project: str, node_id: str, limit: int = 20) -> None:
+    """List revision history for an interpretation node."""
+    import json as _json
+
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph import ProjectRepository
+
+    migrate()
+    conn = connect()
+    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
+    if proj is None:
+        console.print(f"[red]no such project:[/red] {project}")
+        raise SystemExit(1)
+    try:
+        rows = conn.execute(
+            """
+            SELECT nr.id, nr.op, nr.actor, nr.ts, nr.reason,
+                   COALESCE(n.title, nr.node_id) AS title
+            FROM node_revisions nr
+            LEFT JOIN nodes n ON n.id = nr.node_id
+            WHERE nr.node_id = ?
+            ORDER BY nr.ts DESC LIMIT ?
+            """,
+            (node_id, limit),
+        ).fetchall()
+    except Exception as exc:
+        console.print(f"[red]error reading revisions:[/red] {exc}")
+        raise SystemExit(1)
+    if not rows:
+        console.print("[yellow]no revisions found for this node[/yellow]")
+        return
+    table = Table("revision_id", "op", "actor", "ts", "reason", show_lines=False)
+    for r in rows:
+        table.add_row(
+            r["id"][:16] + "…", r["op"], r["actor"] or "—",
+            (r["ts"] or "")[:16], r["reason"] or "—",
+        )
+    console.print(f"[bold]{rows[0]['title']}[/bold] — revision log")
+    console.print(table)
+    console.print(f"\n[dim]to revert: loci graph revert {project} {node_id} <revision_id>[/dim]")
+
+
+@graph_app.command(name="revert")
+def graph_revert(project: str, node_id: str, revision_id: str) -> None:
+    """Revert an interpretation node to a prior revision (logs a new revision row)."""
+    import json as _json
+
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.embed.local import get_embedder
+    from loci.graph import NodeRepository, ProjectRepository
+
+    migrate()
+    conn = connect()
+    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
+    if proj is None:
+        console.print(f"[red]no such project:[/red] {project}")
+        raise SystemExit(1)
+    row = conn.execute(
+        "SELECT * FROM node_revisions WHERE id = ? AND node_id = ?",
+        (revision_id, node_id),
+    ).fetchone()
+    if row is None:
+        console.print(f"[red]revision not found:[/red] {revision_id}")
+        raise SystemExit(1)
+    prior = _json.loads(row["prior_values"])
+    kwargs = {k: prior[k] for k in ("relation_md", "overlap_md", "source_anchor_md", "angle")
+              if k in prior and prior[k] is not None}
+    if not kwargs:
+        console.print("[yellow]no reversible slot values in this revision[/yellow]")
+        return
+    n = NodeRepository(conn).get(node_id)
+    if n is None:
+        console.print(f"[red]node not found:[/red] {node_id}")
+        raise SystemExit(1)
+    emb_text = "\n\n".join(p for p in [
+        n.title, kwargs.get("relation_md", ""), kwargs.get("overlap_md", ""),
+    ] if p).strip()
+    new_emb = get_embedder().encode(emb_text) if emb_text else None
+    NodeRepository(conn).update_locus(
+        node_id, **kwargs, new_embedding=new_emb,
+        actor="user", source_tool="cli.graph_revert",
+        reason=f"revert to {revision_id[:16]}",
+    )
+    console.print(f"[green]reverted[/green] {node_id[:20]}… to revision {revision_id[:16]}…")
 
 
 @app.command
@@ -849,21 +984,48 @@ def rebuild(project: str, n: int = 6) -> None:
 
 @app.command
 def status(project: str | None = None) -> None:
-    """Show counts: nodes, edges, projects, jobs, traces."""
+    """Show graph counts and (with a project slug) the project memo.
+
+    With a project: shows recent edits, open threads, what's been mattering,
+    and a hint to open the graph editor. Without a project: shows global counts.
+    """
     from loci.db import migrate
     from loci.db.connection import connect
 
     migrate()
     conn = connect()
-    rows = []
     if project:
+        from loci.agent.memo import build_project_memo
         from loci.graph import ProjectRepository
         proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
         if proj is None:
             console.print(f"[red]no such project:[/red] {project}")
             raise SystemExit(1)
-        nm = conn.execute("SELECT COUNT(*) AS c FROM project_membership WHERE project_id = ?", (proj.id,)).fetchone()["c"]
-        rows.append(("project", proj.slug, str(nm)))
+        nm = conn.execute(
+            "SELECT COUNT(*) AS c FROM project_membership WHERE project_id = ?", (proj.id,)
+        ).fetchone()["c"]
+        dirty = conn.execute(
+            "SELECT COUNT(*) AS c FROM nodes n JOIN project_membership pm ON pm.node_id = n.id"
+            " WHERE pm.project_id = ? AND n.status IN ('dirty','stale')", (proj.id,)
+        ).fetchone()["c"]
+        pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM proposals WHERE project_id = ? AND status='pending'",
+            (proj.id,)
+        ).fetchone()["c"]
+        queued = conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE status='queued'").fetchone()["c"]
+        console.rule(f"[bold]{proj.slug}[/bold]")
+        console.print(
+            f"  {nm} nodes  ·  {dirty} dirty/stale  ·  {pending} pending proposals  ·  {queued} jobs queued"
+        )
+        console.rule("project memo")
+        memo = build_project_memo(conn, proj.id)
+        console.print(memo)
+        console.print(
+            f"\n[dim]graph editor: loci graph serve {proj.slug}[/dim]"
+        )
+        return
+
+    rows = []
     rows.append(("nodes", "", str(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])))
     rows.append(("edges", "", str(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0])))
     rows.append(("projects", "", str(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])))

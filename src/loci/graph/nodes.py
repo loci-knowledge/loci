@@ -33,6 +33,12 @@ from loci.graph.models import (
     now_iso,
 )
 
+# RevisionLogger is imported lazily inside the class to avoid import cycles
+# with graph.revisions. The TYPE_CHECKING guard below is for type annotations only.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from loci.graph.revisions import RevisionLogger
+
 
 class NodeRepository:
     """All node reads and writes go through this class.
@@ -43,6 +49,14 @@ class NodeRepository:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+        self._revisions: RevisionLogger | None = None
+
+    @property
+    def revisions(self) -> RevisionLogger:
+        if self._revisions is None:
+            from loci.graph.revisions import RevisionLogger as _RL
+            self._revisions = _RL(self.conn)
+        return self._revisions
 
     # -----------------------------------------------------------------------
     # Reads
@@ -150,6 +164,10 @@ class NodeRepository:
         self,
         node: InterpretationNode,
         embedding: np.ndarray | None = None,
+        *,
+        actor: str = "system",
+        source_tool: str | None = None,
+        reason: str | None = None,
     ) -> InterpretationNode:
         with self._txn():
             self.conn.execute(
@@ -182,6 +200,17 @@ class NodeRepository:
             self._write_tags(node.id, node.tags)
             if embedding is not None:
                 self._write_embedding(node.id, embedding)
+            self.revisions.log_create(
+                node.id,
+                {
+                    "title": node.title, "body": node.body,
+                    "relation_md": node.relation_md, "overlap_md": node.overlap_md,
+                    "source_anchor_md": node.source_anchor_md,
+                    "angle": node.angle, "rationale_md": node.rationale_md,
+                    "origin": node.origin,
+                },
+                actor=actor, source_tool=source_tool, reason=reason,
+            )
         return node
 
     def update_locus(
@@ -194,6 +223,9 @@ class NodeRepository:
         angle: str | None = None,
         new_embedding: np.ndarray | None = None,
         bump_dirty: bool = True,
+        actor: str = "system",
+        source_tool: str | None = None,
+        reason: str | None = None,
     ) -> None:
         """Edit locus-specific slots on an interpretation node.
 
@@ -216,7 +248,9 @@ class NodeRepository:
             params.append(angle)
         if not slots and new_embedding is None:
             return
+        from loci.graph.revisions import capture_locus_snapshot
         with self._txn():
+            prior = capture_locus_snapshot(self.conn, node_id)
             if slots:
                 params.append(node_id)
                 self.conn.execute(
@@ -230,8 +264,28 @@ class NodeRepository:
                 self._write_embedding(node_id, new_embedding, replace=True)
             if bump_dirty:
                 self._mark_neighbors_dirty(node_id)
+            new_vals: dict = {}
+            if relation_md is not None:
+                new_vals["relation_md"] = relation_md
+            if overlap_md is not None:
+                new_vals["overlap_md"] = overlap_md
+            if source_anchor_md is not None:
+                new_vals["source_anchor_md"] = source_anchor_md
+            if angle is not None:
+                new_vals["angle"] = angle
+            self.revisions.log_update_locus(
+                node_id, prior, new_vals,
+                actor=actor, source_tool=source_tool, reason=reason,
+            )
 
-    def hard_delete(self, node_id: str) -> None:
+    def hard_delete(
+        self,
+        node_id: str,
+        *,
+        actor: str = "system",
+        source_tool: str | None = None,
+        reason: str | None = None,
+    ) -> None:
         """Hard-delete an interpretation node and all incident edges.
 
         The caller must snapshot project fan-out *before* calling this, then
@@ -243,7 +297,10 @@ class NodeRepository:
             raise ValueError(f"node {node_id} not found")
         if n.kind == "raw":
             raise ValueError("hard_delete does not support raw nodes")
+        from loci.graph.revisions import capture_edge_snapshot, capture_locus_snapshot
         with self._txn():
+            prior = capture_locus_snapshot(self.conn, node_id)
+            prior["_edges"] = capture_edge_snapshot(self.conn, node_id)
             self.conn.execute(
                 "DELETE FROM edges WHERE src = ? OR dst = ?", (node_id, node_id)
             )
@@ -263,33 +320,54 @@ class NodeRepository:
             self.conn.execute("DELETE FROM node_vec WHERE node_id = ?", (node_id,))
             self.conn.execute("DELETE FROM node_tags WHERE node_id = ?", (node_id,))
             self.conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            self.revisions.log_hard_delete(
+                node_id, prior,
+                actor=actor, source_tool=source_tool, reason=reason,
+            )
 
     def set_angle(
         self,
         node_id: str,
         angle: str | None,
         rationale_md: str | None = None,
+        *,
+        actor: str = "system",
+        source_tool: str | None = None,
+        reason: str | None = None,
     ) -> None:
         """Update the angle (and optionally rationale_md) on a relevance interp."""
+        from loci.graph.revisions import capture_locus_snapshot
         sets = ["angle = ?"]
         params: list[object] = [angle]
         if rationale_md is not None:
             sets.append("rationale_md = ?")
             params.append(rationale_md)
         params.append(node_id)
-        self.conn.execute(
-            f"UPDATE interpretation_nodes SET {', '.join(sets)} WHERE node_id = ?",
-            tuple(params),
-        )
-        self.conn.execute(
-            "UPDATE nodes SET updated_at = ? WHERE id = ?", (now_iso(), node_id)
+        with self._txn():
+            prior = capture_locus_snapshot(self.conn, node_id)
+            self.conn.execute(
+                f"UPDATE interpretation_nodes SET {', '.join(sets)} WHERE node_id = ?",
+                tuple(params),
+            )
+            self.conn.execute(
+                "UPDATE nodes SET updated_at = ? WHERE id = ?", (now_iso(), node_id)
+            )
+        new_vals: dict = {"angle": angle}
+        if rationale_md is not None:
+            new_vals["rationale_md"] = rationale_md
+        self.revisions.log_set_angle(
+            node_id, prior, new_vals,
+            actor=actor, source_tool=source_tool, reason=reason,
         )
 
     def update_body(self, node_id: str, *, title: str | None = None,
                     body: str | None = None,
                     tags: list[str] | None = None,
                     new_embedding: np.ndarray | None = None,
-                    bump_dirty: bool = True) -> None:
+                    bump_dirty: bool = True,
+                    actor: str = "system",
+                    source_tool: str | None = None,
+                    reason: str | None = None) -> None:
         """Edit a node's body / title / tags. Bumps `updated_at`.
 
         If `bump_dirty=True` (the default), one-hop neighbours on cites/semantic
@@ -298,7 +376,9 @@ class NodeRepository:
         """
         if title is None and body is None and tags is None and new_embedding is None:
             return  # nothing to do
+        from loci.graph.revisions import capture_locus_snapshot
         with self._txn():
+            prior = capture_locus_snapshot(self.conn, node_id)
             sets: list[str] = ["updated_at = ?"]
             params: list[object] = [now_iso()]
             if title is not None:
@@ -319,6 +399,15 @@ class NodeRepository:
                 self._write_embedding(node_id, new_embedding, replace=True)
             if bump_dirty:
                 self._mark_neighbors_dirty(node_id)
+            new_vals: dict = {}
+            if title is not None:
+                new_vals["title"] = title
+            if body is not None:
+                new_vals["body"] = body
+            self.revisions.log_update_body(
+                node_id, prior, new_vals,
+                actor=actor, source_tool=source_tool, reason=reason,
+            )
 
     def set_status(self, node_id: str, status: NodeStatus) -> None:
         self.conn.execute(

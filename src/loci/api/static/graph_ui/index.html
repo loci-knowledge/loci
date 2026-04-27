@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>loci — graph view</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+  <style>
+    /* Full-page layout with a right side panel */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { display: flex; height: 100vh; font-family: -apple-system, sans-serif; background: #0f0f13; color: #e0e0e0; }
+    #cy { flex: 1; height: 100vh; }
+    #panel { width: 380px; height: 100vh; overflow-y: auto; background: #1a1a24; border-left: 1px solid #333; padding: 1rem; display: none; flex-direction: column; gap: 0.75rem; }
+    #panel.open { display: flex; }
+    #panel h2 { font-size: 1rem; color: #a0a0ff; }
+    #panel .slot { background: #12121a; border-radius: 6px; padding: 0.75rem; }
+    #panel .slot h3 { font-size: 0.75rem; color: #666; text-transform: uppercase; margin-bottom: 0.4rem; }
+    #panel textarea { width: 100%; background: #0f0f13; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 0.5rem; font-size: 0.85rem; resize: vertical; min-height: 80px; }
+    #panel button { background: #4040c0; color: white; border: none; border-radius: 4px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.85rem; }
+    #panel button:hover { background: #5050d0; }
+    #panel button.danger { background: #802020; }
+    #panel .revisions { font-size: 0.75rem; color: #666; }
+    #panel .revisions .rev { padding: 0.25rem 0; border-bottom: 1px solid #222; }
+    #panel .rev-revert { font-size: 0.7rem; color: #a0a0ff; cursor: pointer; text-decoration: underline; margin-left: 0.5rem; }
+    #close-panel { float: right; background: none; border: none; color: #666; cursor: pointer; font-size: 1.2rem; }
+    #status { position: fixed; top: 1rem; right: 400px; background: #1a1a24; padding: 0.3rem 0.7rem; border-radius: 4px; font-size: 0.75rem; color: #666; }
+  </style>
+</head>
+<body>
+<div id="cy"></div>
+<div id="panel">
+  <div>
+    <button id="close-panel">×</button>
+    <h2 id="panel-title">Node</h2>
+  </div>
+  <div class="slot">
+    <h3>Relation</h3>
+    <textarea id="edit-relation"></textarea>
+  </div>
+  <div class="slot">
+    <h3>Overlap</h3>
+    <textarea id="edit-overlap"></textarea>
+  </div>
+  <div class="slot">
+    <h3>Source Anchor</h3>
+    <textarea id="edit-anchor"></textarea>
+  </div>
+  <div style="display:flex;gap:0.5rem">
+    <button id="save-btn">Save changes</button>
+    <button id="cancel-btn" style="background:#333">Cancel</button>
+  </div>
+  <div>
+    <h3 style="font-size:0.75rem;color:#666;text-transform:uppercase;margin-bottom:0.4rem">Revision history</h3>
+    <div id="revisions-list" class="revisions"></div>
+  </div>
+</div>
+<div id="status">connecting…</div>
+<script>
+const PROJECT_ID = "__PROJECT_ID__";
+const API = "";
+
+let cy;
+let selectedNode = null;
+
+// ---- init Cytoscape ----
+async function init() {
+  const res = await fetch(`${API}/projects/${PROJECT_ID}/graph`);
+  const data = await res.json();
+
+  const elements = [];
+  for (const n of (data.nodes || [])) {
+    elements.push({
+      data: {
+        id: n.id,
+        label: n.title || n.id.slice(-8),
+        kind: n.kind,
+        subkind: n.subkind,
+        status: n.status,
+        relation_md: n.relation_md || "",
+        overlap_md: n.overlap_md || "",
+        source_anchor_md: n.source_anchor_md || "",
+      }
+    });
+  }
+  for (const e of (data.edges || [])) {
+    elements.push({ data: { id: e.id, source: e.src, target: e.dst, type: e.type } });
+  }
+
+  cy = cytoscape({
+    container: document.getElementById("cy"),
+    elements,
+    style: [
+      { selector: "node[kind='raw']", style: {
+        "background-color": "#2a4a6a", "label": "data(label)",
+        "color": "#8ab", "font-size": 10, "text-valign": "bottom",
+        "text-halign": "center", "width": 28, "height": 28,
+      }},
+      { selector: "node[kind='interpretation']", style: {
+        "background-color": "#3a2a6a", "label": "data(label)",
+        "color": "#a8f", "font-size": 10, "text-valign": "bottom",
+        "text-halign": "center", "shape": "diamond", "width": 32, "height": 32,
+      }},
+      { selector: "node:selected", style: { "border-width": 2, "border-color": "#8080ff" }},
+      { selector: "edge[type='cites']", style: {
+        "line-color": "#444", "target-arrow-color": "#444",
+        "target-arrow-shape": "triangle", "width": 1.5,
+        "curve-style": "bezier",
+      }},
+      { selector: "edge[type='derives_from']", style: {
+        "line-color": "#6040a0", "target-arrow-color": "#6040a0",
+        "target-arrow-shape": "triangle", "width": 1.5,
+        "curve-style": "bezier", "line-style": "dashed",
+      }},
+    ],
+    layout: { name: "cose", animate: false, nodeOverlap: 20 },
+  });
+
+  cy.on("tap", "node", e => openPanel(e.target));
+  cy.on("tap", e => { if (e.target === cy) closePanel(); });
+  document.getElementById("status").textContent = `${elements.filter(el => !el.data.source).length} nodes`;
+  connectWS();
+}
+
+// ---- side panel ----
+function openPanel(node) {
+  selectedNode = node;
+  const d = node.data();
+  document.getElementById("panel-title").textContent = d.label;
+  document.getElementById("edit-relation").value = d.relation_md || "";
+  document.getElementById("edit-overlap").value = d.overlap_md || "";
+  document.getElementById("edit-anchor").value = d.source_anchor_md || "";
+  document.getElementById("panel").classList.add("open");
+  loadRevisions(d.id);
+}
+
+function closePanel() {
+  selectedNode = null;
+  document.getElementById("panel").classList.remove("open");
+}
+
+async function loadRevisions(nodeId) {
+  const list = document.getElementById("revisions-list");
+  list.textContent = "loading…";
+  try {
+    const res = await fetch(`${API}/nodes/${nodeId}/revisions?limit=10`);
+    const revs = await res.json();
+    if (!revs.length) { list.textContent = "(no revisions yet)"; return; }
+    list.innerHTML = revs.map(r => `
+      <div class="rev">
+        <b>${r.op}</b> ${r.actor} <span style="color:#444">${r.ts.slice(0,16)}</span>
+        ${r.reason ? `— ${r.reason}` : ""}
+        <span class="rev-revert" data-nid="${r.node_id}" data-rid="${r.id}">revert</span>
+      </div>
+    `).join("");
+    list.querySelectorAll(".rev-revert").forEach(el => {
+      el.addEventListener("click", () => revertRevision(el.dataset.nid, el.dataset.rid));
+    });
+  } catch(e) { list.textContent = "(error loading revisions)"; }
+}
+
+async function revertRevision(nodeId, revisionId) {
+  if (!confirm("Revert to this revision?")) return;
+  await fetch(`${API}/nodes/${nodeId}/revisions/${revisionId}/revert`, { method: "POST" });
+  loadRevisions(nodeId);
+}
+
+document.getElementById("close-panel").addEventListener("click", closePanel);
+document.getElementById("cancel-btn").addEventListener("click", closePanel);
+
+document.getElementById("save-btn").addEventListener("click", async () => {
+  if (!selectedNode) return;
+  const nodeId = selectedNode.data("id");
+  const body = {
+    relation_md: document.getElementById("edit-relation").value,
+    overlap_md: document.getElementById("edit-overlap").value,
+    source_anchor_md: document.getElementById("edit-anchor").value,
+  };
+  try {
+    const res = await fetch(`${API}/nodes/${nodeId}/locus`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "X-Loci-Actor": "user" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    selectedNode.data("relation_md", body.relation_md);
+    selectedNode.data("overlap_md", body.overlap_md);
+    selectedNode.data("source_anchor_md", body.source_anchor_md);
+    closePanel();
+  } catch(e) { alert("Save failed: " + e); }
+});
+
+// ---- WebSocket live updates ----
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.host}/projects/${PROJECT_ID}/subscribe`);
+  ws.onopen = () => { document.getElementById("status").textContent = "live"; };
+  ws.onclose = () => {
+    document.getElementById("status").textContent = "reconnecting…";
+    setTimeout(connectWS, 3000);
+  };
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    applyDelta(msg);
+  };
+}
+
+function applyDelta(msg) {
+  const { op, entity, payload } = msg;
+  if (!cy || !entity || !payload) return;
+  if (entity === "node") {
+    const existing = cy.getElementById(payload.id);
+    if (op === "upsert") {
+      if (existing.length) {
+        existing.data("label", payload.title || payload.id.slice(-8));
+        existing.data("relation_md", payload.relation_md || "");
+        existing.data("overlap_md", payload.overlap_md || "");
+        existing.data("source_anchor_md", payload.source_anchor_md || "");
+        existing.data("status", payload.status);
+      } else {
+        cy.add({ data: {
+          id: payload.id, label: payload.title || payload.id.slice(-8),
+          kind: payload.kind, subkind: payload.subkind,
+          relation_md: payload.relation_md || "",
+          overlap_md: payload.overlap_md || "",
+          source_anchor_md: payload.source_anchor_md || "",
+          status: payload.status,
+        }});
+        cy.layout({ name: "cose", animate: true, stop: () => {} }).run();
+      }
+    } else if (op === "delete" && existing.length) {
+      cy.remove(existing);
+    }
+  } else if (entity === "edge") {
+    const existing = cy.getElementById(payload.id);
+    if (op === "upsert" && !existing.length) {
+      cy.add({ data: { id: payload.id, source: payload.src, target: payload.dst, type: payload.type }});
+    } else if (op === "delete" && existing.length) {
+      cy.remove(existing);
+    }
+  }
+}
+
+init().catch(console.error);
+</script>
+</body>
+</html>

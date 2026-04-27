@@ -33,6 +33,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
+from loci.agent.feedback import summarise_citation_feedback
+from loci.agent.memo import build_project_memo
 from loci.citations import CitationTracker
 from loci.config import get_settings
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
@@ -262,6 +264,8 @@ def _build_context(
         return None
     pinned_ids = pr.members(project_id, roles=["pinned"])
 
+    memo = build_project_memo(conn, project_id)
+
     instruction = "(no specific task)"
     candidates: list[dict] = []
     cited_set: set[str] = set()
@@ -281,7 +285,7 @@ def _build_context(
             ).fetchall()
             retrieved_ids = [r["node_id"] for r in rows]
             candidates = _materialise_candidates(conn, retrieved_ids, cited_set)
-            feedback_summary = _summarise_citation_feedback(conn, response_id)
+            feedback_summary = summarise_citation_feedback(conn, response_id)
 
     pinned_block = _materialise_pinned(conn, pinned_ids)
     workspace_block = _materialise_workspace_context(conn, ws_repo, project_id)
@@ -302,6 +306,7 @@ def _build_context(
     candidate_block = "\n\n".join(cand_lines) if cand_lines else "(none)"
 
     user_prompt = (
+        f"MEMO:\n{memo}\n---\n\n"
         f"PROJECT PROFILE:\n{project.profile_md or '(empty)'}\n\n"
         f"---\n\nUSER'S CURRENT TASK:\n{instruction}\n\n"
         f"---\n\nPINNED INTERPRETATIONS (the user's voice — match this style):\n"
@@ -516,7 +521,8 @@ def _apply_actions(
             if target_id is None:
                 continue
             try:
-                nodes_repo.set_angle(target_id, a.angle, "")
+                nodes_repo.set_angle(target_id, a.angle, "",
+                                     actor="agent", source_tool="agent.reflect")
                 tracker.append_trace(project_id, target_id, "agent_updated_angle",
                                        response_id=response_id, client="agent")
                 applied += 1

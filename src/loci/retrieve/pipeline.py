@@ -61,19 +61,25 @@ RRF_K = 60
 # Channel weights for the interp-stage RRF fusion. Vec leads because the
 # locus's relation/overlap/anchor text encodes the bridge semantically; lex
 # catches exact-term loci; PPR brings DAG centrality.
+# NOTE: "personal" weight is 0.0 here as a placeholder; the actual weight is
+# read from settings at runtime (personalization_weight) and injected during
+# the retrieve() call.
 INTERP_WEIGHTS: dict[str, float] = {
     "lex": 1.0,
     "vec": 1.5,
     "hyde": 0.8,
     "ppr": 0.7,
+    "personal": 0.0,
 }
 
 # Channel weights for the direct-raw RRF fusion. Lex weighs higher than for
 # interps because raws are long documents with verbatim terminology.
+# NOTE: same placeholder pattern — "personal" weight is injected at runtime.
 DIRECT_WEIGHTS: dict[str, float] = {
     "lex": 1.2,
     "vec": 1.2,
     "hyde": 0.6,
+    "personal": 0.0,
 }
 
 # Routing parameters — how much the interp layer biases raw retrieval.
@@ -223,8 +229,47 @@ class Retriever:
         anchors_tagged = self._resolve_anchors_tagged(req, interp_vec)
         anchor_source_by_id: dict[str, str] = {a: src for a, src in anchors_tagged}
         anchors = [a for a, _src in anchors_tagged]
-        ppr_result = ppr_mod.run(self.conn, req.project_id, anchors)
+
+        # Build anchor weights for PPR: pinned nodes and recently cited_kept
+        # nodes receive 2x personalisation mass (only when personalization is on).
+        from loci.config import get_settings as _get_settings
+        _personal_weight = _get_settings().personalization_weight
+        anchor_weights: dict[str, float] | None = None
+        if _personal_weight > 0 and anchors:
+            anchor_weights = self._build_anchor_weights(req.project_id, anchors)
+
+        ppr_result = ppr_mod.run(
+            self.conn, req.project_id, anchors, anchor_weights=anchor_weights,
+        )
         ppr_ranked = sorted(ppr_result.scores.items(), key=lambda kv: -kv[1])
+
+        # Personalization channel for interpretations.
+        # NOTE: personalization_weight should be kept <= 0.3 to avoid
+        # double-boosting pinned nodes that are also PPR anchor seeds.
+        from loci.retrieve.affinity import compute_affinity as _compute_affinity
+        interp_candidate_ids = list({
+            h.node_id for h in interp_lex
+        } | {
+            h.node_id for h in interp_vec
+        } | {
+            h.node_id for h in interp_hyde
+        } | {
+            nid for nid, _ in ppr_ranked
+        })
+        interp_affinity = (
+            _compute_affinity(self.conn, req.project_id, interp_candidate_ids)
+            if _personal_weight > 0 and interp_candidate_ids
+            else {}
+        )
+        interp_personal_ranked = sorted(
+            interp_affinity.keys(),
+            key=lambda nid: interp_affinity.get(nid, 0.0),
+            reverse=True,
+        )
+
+        # Build runtime interp weights with the personalization channel live.
+        _interp_weights = dict(INTERP_WEIGHTS)
+        _interp_weights["personal"] = _personal_weight
 
         interp_scores, interp_channel_scores, interp_channel_ranks = (
             self._fuse_with_breakdown(
@@ -233,8 +278,9 @@ class Retriever:
                     ("vec", [h.node_id for h in interp_vec]),
                     ("hyde", [h.node_id for h in interp_hyde]),
                     ("ppr", [nid for nid, _ in ppr_ranked]),
+                    ("personal", interp_personal_ranked),
                 ],
-                weights=INTERP_WEIGHTS,
+                weights=_interp_weights,
             )
         )
         # Full ranking — keep the tail so we can report "considered but pruned"
@@ -277,13 +323,37 @@ class Retriever:
                     self.conn, req.project_id, hyp,
                     k=req.k_hyde, embedder=self.embedder, kind="raw",
                 )
+        # Personalization channel for direct raws.
+        raw_candidate_ids = list({
+            h.node_id for h in raw_lex
+        } | {
+            h.node_id for h in raw_vec
+        } | {
+            h.node_id for h in raw_hyde
+        })
+        raw_affinity = (
+            _compute_affinity(self.conn, req.project_id, raw_candidate_ids)
+            if _personal_weight > 0 and raw_candidate_ids
+            else {}
+        )
+        raw_personal_ranked = sorted(
+            raw_affinity.keys(),
+            key=lambda nid: raw_affinity.get(nid, 0.0),
+            reverse=True,
+        )
+
+        # Build runtime direct weights with the personalization channel live.
+        _direct_weights = dict(DIRECT_WEIGHTS)
+        _direct_weights["personal"] = _personal_weight
+
         direct_scores = self._fuse(
             channels=[
                 ("lex", [h.node_id for h in raw_lex]),
                 ("vec", [h.node_id for h in raw_vec]),
                 ("hyde", [h.node_id for h in raw_hyde]),
+                ("personal", raw_personal_ranked),
             ],
-            weights=DIRECT_WEIGHTS,
+            weights=_direct_weights,
         )
 
         # --------------------------------------------------------------
@@ -411,6 +481,33 @@ class Retriever:
     # -----------------------------------------------------------------------
     # Internals
     # -----------------------------------------------------------------------
+
+    def _build_anchor_weights(
+        self, project_id: str, anchor_ids: list[str],
+    ) -> dict[str, float]:
+        """Assign weight 2.0 to anchors that are pinned or recently cited_kept.
+
+        Used by PPR to give heavier personalisation mass to nodes the user has
+        explicitly favoured.  All other anchors get the default weight 1.0.
+        """
+        if not anchor_ids:
+            return {}
+        placeholders = ",".join("?" * len(anchor_ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT n.id
+            FROM nodes n
+            LEFT JOIN project_membership pm
+                ON pm.node_id = n.id AND pm.project_id = ?
+            LEFT JOIN traces t
+                ON t.node_id = n.id AND t.project_id = ? AND t.kind = 'cited_kept'
+            WHERE n.id IN ({placeholders})
+              AND (pm.role = 'pinned' OR t.id IS NOT NULL)
+            """,
+            (project_id, project_id, *anchor_ids),
+        ).fetchall()
+        boosted = {r[0] for r in rows}
+        return {a: (2.0 if a in boosted else 1.0) for a in anchor_ids}
 
     def _resolve_anchors(
         self, req: RetrievalRequest, interp_vec: list[vec_mod.VecHit],

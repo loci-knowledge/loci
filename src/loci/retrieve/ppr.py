@@ -59,6 +59,7 @@ def run(
     alpha: float | None = None,
     max_iter: int | None = None,
     tol: float | None = None,
+    anchor_weights: dict[str, float] | None = None,
 ) -> PPRResult:
     """Run PPR on the interp subgraph of `project_id`, seeded by `anchor_ids`.
 
@@ -69,6 +70,15 @@ def run(
     Anchors that aren't interpretation nodes in this project are silently
     dropped. If no valid anchors remain, returns an empty PPRResult — the
     caller is responsible for falling back to a no-PPR path.
+
+    Parameters
+    ----------
+    anchor_weights:
+        Optional dict mapping anchor_id -> weight. When provided, the
+        personalisation vector ``p`` is built using these weights instead of
+        the uniform 1/|anchors| distribution. Anchors absent from the dict
+        default to weight 1.0. The vector is always L1-normalised after
+        construction so that the random walk is well-defined.
     """
     settings = get_settings()
     alpha = alpha if alpha is not None else settings.ppr_alpha
@@ -85,9 +95,13 @@ def run(
         return PPRResult(scores={}, anchors_used=[], iterations=0)
 
     p = np.zeros(len(node_ids), dtype=np.float64)
-    for a in valid_anchors:
-        p[index[a]] = 1.0
-    p /= p.sum()  # safe: at least one anchor mapped
+    if anchor_weights:
+        for a in valid_anchors:
+            p[index[a]] = anchor_weights.get(a, 1.0)
+    else:
+        for a in valid_anchors:
+            p[index[a]] = 1.0
+    p /= p.sum()  # L1-normalise; safe: at least one anchor mapped
 
     r = p.copy()
     iterations = 0

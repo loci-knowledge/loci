@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # --- Retrieval -------------------------------------------------------
     # Default top-k for the retrieval pipeline. Endpoints can override.
     retrieve_default_k: int = 10
+    # Weight of the personalization channel in RRF fusion. Keep <= 0.3 to
+    # avoid double-boosting pinned nodes that also appear as PPR anchors.
+    # Override via LOCI_PERSONALIZATION_WEIGHT.
+    personalization_weight: float = 0.15
     # Personalized PageRank damping factor (Page-Brin classical 0.85).
     ppr_alpha: float = 0.85
     # Iteration cap for the sparse PPR power method. Convergence is checked

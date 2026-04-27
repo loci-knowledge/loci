@@ -100,8 +100,36 @@ def build_graph_payload(
     }
 
 
-def render_graph_html(payload: dict[str, object], *, inline_d3: bool = True) -> str:
-    """Render a standalone HTML document with an embedded D3 force graph."""
+_LIVE_UI_BASE = "http://localhost:7077"
+
+
+def render_graph_html(
+    payload: dict[str, object],
+    *,
+    inline_d3: bool = True,
+    standalone: bool = False,
+) -> str:
+    """Render an HTML document for the project graph.
+
+    By default (``standalone=False``) this returns a redirect page that sends
+    the browser straight to the hosted Cytoscape graph editor
+    (``/graph/<project_id>``).  Pass ``standalone=True`` (or the CLI flag
+    ``--inline``) to get the original self-contained D3 snapshot instead.
+    """
+    if not standalone:
+        project_id = str(payload["project"]["id"])  # type: ignore[index]
+        live_url = f"{_LIVE_UI_BASE}/graph/{project_id}"
+        return (
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<head>"
+            f'<meta http-equiv="refresh" content="0; url={live_url}">'
+            "</head>\n"
+            "<body>Redirecting to live graph view...</body>\n"
+            "</html>\n"
+        )
+
+    # ---- original D3 standalone path ----
     data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     project_name = html.escape(str(payload["project"]["name"]))  # type: ignore[index]
     d3_block = f"<script>{_d3_inline()}</script>" if inline_d3 else f'<script src="{_D3_CDN}"></script>'
@@ -120,8 +148,14 @@ def write_graph_html(
     *,
     include_raw: bool = True,
     statuses: list[str] | None = None,
+    standalone: bool = False,
 ) -> Path:
-    """Write a standalone graph HTML file and return the output path."""
+    """Write a graph HTML file and return the output path.
+
+    When ``standalone=False`` (the default) the file is a redirect to the
+    live hosted UI.  Pass ``standalone=True`` for a self-contained D3
+    snapshot (the original behaviour, now opt-in via ``--inline``).
+    """
     payload = build_graph_payload(
         project,
         conn,
@@ -129,7 +163,7 @@ def write_graph_html(
         statuses=statuses,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(render_graph_html(payload))
+    output.write_text(render_graph_html(payload, standalone=standalone))
     return output
 
 

@@ -174,3 +174,32 @@ def _shingles(s: str, k: int = 3) -> set[str]:
     if len(words) < k:
         return {" ".join(words)} if words else set()
     return {" ".join(words[i:i + k]) for i in range(len(words) - k + 1)}
+
+
+# ---------------------------------------------------------------------------
+# Citation feedback summary (used by interpreter + memo)
+# ---------------------------------------------------------------------------
+
+
+def summarise_citation_feedback(conn: sqlite3.Connection, response_id: str) -> str:
+    """Roll up citation-level traces for this response into a short prose
+    summary the LLM can use as input."""
+    rows = conn.execute(
+        """
+        SELECT t.kind AS tk, n.title AS title
+        FROM traces t
+        JOIN nodes n ON n.id = t.node_id
+        WHERE t.response_id = ? AND t.kind IN
+              ('cited_kept','cited_dropped','cited_replaced','requery')
+        """,
+        (response_id,),
+    ).fetchall()
+    if not rows:
+        return ""
+    buckets: dict[str, list[str]] = {}
+    for r in rows:
+        buckets.setdefault(r["tk"], []).append(r["title"])
+    lines: list[str] = []
+    for kind, titles in buckets.items():
+        lines.append(f"{kind}: " + "; ".join(titles[:6]))
+    return "\n".join(lines)
