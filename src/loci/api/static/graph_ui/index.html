@@ -2,244 +2,842 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>loci — graph view</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+  <title>loci</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
   <style>
-    /* Full-page layout with a right side panel */
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { display: flex; height: 100vh; font-family: -apple-system, sans-serif; background: #0f0f13; color: #e0e0e0; }
-    #cy { flex: 1; height: 100vh; }
-    #panel { width: 380px; height: 100vh; overflow-y: auto; background: #1a1a24; border-left: 1px solid #333; padding: 1rem; display: none; flex-direction: column; gap: 0.75rem; }
-    #panel.open { display: flex; }
-    #panel h2 { font-size: 1rem; color: #a0a0ff; }
-    #panel .slot { background: #12121a; border-radius: 6px; padding: 0.75rem; }
-    #panel .slot h3 { font-size: 0.75rem; color: #666; text-transform: uppercase; margin-bottom: 0.4rem; }
-    #panel textarea { width: 100%; background: #0f0f13; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 0.5rem; font-size: 0.85rem; resize: vertical; min-height: 80px; }
-    #panel button { background: #4040c0; color: white; border: none; border-radius: 4px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.85rem; }
-    #panel button:hover { background: #5050d0; }
-    #panel button.danger { background: #802020; }
-    #panel .revisions { font-size: 0.75rem; color: #666; }
-    #panel .revisions .rev { padding: 0.25rem 0; border-bottom: 1px solid #222; }
-    #panel .rev-revert { font-size: 0.7rem; color: #a0a0ff; cursor: pointer; text-decoration: underline; margin-left: 0.5rem; }
-    #close-panel { float: right; background: none; border: none; color: #666; cursor: pointer; font-size: 1.2rem; }
-    #status { position: fixed; top: 1rem; right: 400px; background: #1a1a24; padding: 0.3rem 0.7rem; border-radius: 4px; font-size: 0.75rem; color: #666; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #07090f;
+      --raw: #2b5f96;
+      --raw-hi: #4a8fc8;
+      --interp: #9c6c14;
+      --interp-hi: #d08c28;
+      --mint: #4ee4b2;
+      --danger: #d05050;
+      --text: #b0b4c2;
+      --muted: #42465a;
+      --border: rgba(255,255,255,0.055);
+      --panel-bg: rgba(7,9,15,0.97);
+      --font: 'IBM Plex Mono', 'Courier New', monospace;
+    }
+
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+    }
+
+    svg#graph {
+      width: 100%; height: 100%;
+      position: absolute; top: 0; left: 0;
+      cursor: grab;
+    }
+    svg#graph.dragging { cursor: grabbing; }
+
+    /* ── Links ──────────────────────────────────────────────────────────── */
+    .link { fill: none; transition: opacity 0.22s; }
+    .link.cites { stroke: rgba(255,255,255,0.065); stroke-width: 0.9; }
+    .link.derives-from {
+      stroke: rgba(148,100,255,0.22);
+      stroke-width: 0.9;
+      stroke-dasharray: 4 3;
+    }
+    .link.dimmed { opacity: 0.04 !important; }
+    .link.lit { opacity: 1 !important; }
+
+    /* ── Node groups ────────────────────────────────────────────────────── */
+    .node { cursor: pointer; }
+
+    .node .core { transition: fill-opacity 0.22s, r 0.18s; }
+    .node .chunk-ring { transition: stroke-opacity 0.22s; }
+    .node .pin-ring { pointer-events: none; }
+    .node .hover-lbl {
+      font-size: 10.5px;
+      fill: rgba(180,184,200,0.82);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.16s;
+      font-family: var(--font);
+    }
+
+    .node.dimmed .core { fill-opacity: 0.08; }
+    .node.dimmed .chunk-ring { stroke-opacity: 0.04; }
+    .node.dimmed .hover-lbl { opacity: 0 !important; }
+    .node.hovered .hover-lbl { opacity: 1; }
+    .node.selected .core { stroke: rgba(255,255,255,0.55) !important; stroke-width: 2 !important; }
+
+    /* ── Tooltip ────────────────────────────────────────────────────────── */
+    #tooltip {
+      position: fixed;
+      pointer-events: none;
+      z-index: 300;
+      opacity: 0;
+      transition: opacity 0.12s;
+      background: rgba(7, 9, 15, 0.95);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 9px;
+      padding: 11px 15px;
+      max-width: 270px;
+      font-family: var(--font);
+    }
+    #tooltip.vis { opacity: 1; }
+    .tt-badge {
+      font-size: 9.5px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.08em;
+      margin-bottom: 5px;
+    }
+    .tt-title { font-size: 12px; color: #dde0ea; font-weight: 500; line-height: 1.35; margin-bottom: 6px; }
+    .tt-body { font-size: 10.5px; color: #6a6e7c; line-height: 1.5; }
+    .tt-stats { font-size: 9.5px; color: #38394a; margin-top: 7px; }
+
+    /* ── Side panel ─────────────────────────────────────────────────────── */
+    #panel {
+      position: fixed; top: 0; right: 0;
+      width: 354px; height: 100vh;
+      background: var(--panel-bg);
+      border-left: 1px solid var(--border);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      transform: translateX(100%);
+      transition: transform 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow-y: auto; z-index: 100;
+      display: flex; flex-direction: column;
+    }
+    #panel.open { transform: translateX(0); }
+
+    .ph {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0;
+      background: var(--panel-bg); z-index: 1;
+    }
+    .ph-badge {
+      font-size: 9px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.1em;
+      margin-bottom: 5px;
+    }
+    .ph-title {
+      font-size: 13px; color: #dde0ea;
+      font-weight: 500; line-height: 1.4;
+      padding-right: 28px;
+    }
+    .ph-meta { font-size: 10px; color: #33374a; margin-top: 5px; }
+    #close-btn {
+      position: absolute; top: 14px; right: 14px;
+      background: none; border: none;
+      color: var(--muted); font-size: 18px;
+      cursor: pointer; line-height: 1;
+      padding: 2px 6px; border-radius: 4px;
+      font-family: var(--font);
+      transition: color 0.12s;
+    }
+    #close-btn:hover { color: var(--text); }
+
+    .pb { padding: 14px 18px; flex: 1; display: flex; flex-direction: column; gap: 13px; }
+
+    .slot-lbl {
+      font-size: 9.5px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.09em;
+      margin-bottom: 6px;
+    }
+
+    textarea.slot-ta {
+      width: 100%;
+      background: rgba(255,255,255,0.025);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 11px;
+      font-family: var(--font);
+      font-size: 11.5px;
+      resize: vertical; min-height: 68px;
+      line-height: 1.55;
+      transition: border-color 0.14s;
+    }
+    textarea.slot-ta:focus {
+      outline: none;
+      border-color: rgba(255,255,255,0.16);
+    }
+
+    .body-pre {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--border);
+      border-radius: 6px; padding: 9px 11px;
+      font-size: 10.5px; color: #5c6070;
+      line-height: 1.65; max-height: 200px;
+      overflow-y: auto; white-space: pre-wrap;
+      font-family: var(--font);
+    }
+
+    .p-actions { display: flex; gap: 8px; }
+    .btn {
+      font-family: var(--font);
+      font-size: 11.5px;
+      padding: 7px 14px;
+      border-radius: 5px; border: 1px solid transparent;
+      cursor: pointer; transition: background 0.13s, color 0.13s;
+    }
+    .btn-save {
+      background: rgba(78,228,178,0.1);
+      color: var(--mint);
+      border-color: rgba(78,228,178,0.22);
+    }
+    .btn-save:hover { background: rgba(78,228,178,0.2); }
+    .btn-cancel {
+      background: rgba(255,255,255,0.03);
+      color: var(--muted);
+      border-color: var(--border);
+    }
+    .btn-cancel:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+
+    /* Revisions */
+    .rev-section { border-top: 1px solid var(--border); padding-top: 13px; }
+    .rev-row {
+      display: flex; align-items: baseline; gap: 6px;
+      padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.025);
+      font-size: 10.5px;
+    }
+    .rev-op { color: var(--mint); font-size: 9.5px; min-width: 70px; }
+    .rev-who { color: var(--muted); }
+    .rev-date { color: #2c2e3c; font-size: 9.5px; }
+    .rev-why { color: #4a4e5c; font-size: 9.5px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rev-revert {
+      font-size: 9.5px; color: rgba(78,228,178,0.45);
+      cursor: pointer; white-space: nowrap;
+      transition: color 0.12s;
+    }
+    .rev-revert:hover { color: var(--mint); }
+
+    /* ── HUD ────────────────────────────────────────────────────────────── */
+    #hud {
+      position: fixed; bottom: 18px; left: 18px;
+      display: flex; align-items: center; gap: 10px; z-index: 50;
+    }
+    .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: #2a2c3a; flex-shrink: 0;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .dot.live { background: #3ed49a; box-shadow: 0 0 7px rgba(62,212,154,0.5); }
+    .dot.err { background: var(--danger); }
+    #hud-txt { font-size: 10.5px; color: var(--muted); }
+
+    /* ── Legend ─────────────────────────────────────────────────────────── */
+    #legend {
+      position: fixed; bottom: 18px; right: 18px;
+      display: flex; flex-direction: column; gap: 7px; z-index: 50;
+    }
+    .leg { display: flex; align-items: center; gap: 8px; font-size: 9.5px; color: var(--muted); }
+    .leg-c { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .leg-l { width: 18px; height: 1px; flex-shrink: 0; }
+
+    /* ── Wordmark ────────────────────────────────────────────────────────── */
+    #wordmark {
+      position: fixed; top: 16px; left: 18px;
+      font-size: 11px; color: #22253a;
+      letter-spacing: 0.12em; z-index: 50;
+      text-transform: lowercase;
+    }
+
+    /* ── Hint ────────────────────────────────────────────────────────────── */
+    #hint {
+      position: fixed; top: 16px; left: 50%;
+      transform: translateX(-50%);
+      font-size: 9.5px; color: #1e2030;
+      letter-spacing: 0.05em; z-index: 50;
+      pointer-events: none;
+      transition: opacity 1.2s;
+    }
+    #hint.hidden { opacity: 0; }
   </style>
 </head>
 <body>
-<div id="cy"></div>
-<div id="panel">
-  <div>
-    <button id="close-panel">×</button>
-    <h2 id="panel-title">Node</h2>
-  </div>
-  <div class="slot">
-    <h3>Relation</h3>
-    <textarea id="edit-relation"></textarea>
-  </div>
-  <div class="slot">
-    <h3>Overlap</h3>
-    <textarea id="edit-overlap"></textarea>
-  </div>
-  <div class="slot">
-    <h3>Source Anchor</h3>
-    <textarea id="edit-anchor"></textarea>
-  </div>
-  <div style="display:flex;gap:0.5rem">
-    <button id="save-btn">Save changes</button>
-    <button id="cancel-btn" style="background:#333">Cancel</button>
-  </div>
-  <div>
-    <h3 style="font-size:0.75rem;color:#666;text-transform:uppercase;margin-bottom:0.4rem">Revision history</h3>
-    <div id="revisions-list" class="revisions"></div>
-  </div>
+
+<svg id="graph">
+  <defs>
+    <marker id="ar-cites" viewBox="0 -4 8 8" refX="8" refY="0"
+            markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,-3.5L8,0L0,3.5Z" fill="rgba(255,255,255,0.18)"/>
+    </marker>
+    <marker id="ar-derives" viewBox="0 -4 8 8" refX="8" refY="0"
+            markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0,-3.5L8,0L0,3.5Z" fill="rgba(148,100,255,0.35)"/>
+    </marker>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g id="zg">
+    <g id="ll"></g>
+    <g id="nl"></g>
+  </g>
+</svg>
+
+<div id="tooltip">
+  <div class="tt-badge" id="tt-badge"></div>
+  <div class="tt-title" id="tt-title"></div>
+  <div class="tt-body" id="tt-body"></div>
+  <div class="tt-stats" id="tt-stats"></div>
 </div>
-<div id="status">connecting…</div>
+
+<div id="panel">
+  <div class="ph">
+    <div class="ph-badge" id="ph-badge">—</div>
+    <div class="ph-title" id="ph-title">—</div>
+    <div class="ph-meta" id="ph-meta"></div>
+    <button id="close-btn">×</button>
+  </div>
+  <div class="pb" id="pb"></div>
+</div>
+
+<div id="hud">
+  <div class="dot" id="dot"></div>
+  <span id="hud-txt">loading…</span>
+</div>
+
+<svg id="legend" width="120" height="80" style="position:fixed;bottom:18px;right:18px;z-index:50;overflow:visible">
+  <g transform="translate(0,0)">
+    <circle cx="5" cy="5" r="5" fill="#2b5f96" fill-opacity="0.85" stroke="#4a8fc8" stroke-width="1"/>
+    <text x="16" y="9" font-size="9.5" fill="#42465a" font-family="'IBM Plex Mono',monospace">raw source</text>
+  </g>
+  <g transform="translate(0,20)">
+    <circle cx="5" cy="5" r="5" fill="#9c6c14" fill-opacity="0.85" stroke="#d08c28" stroke-width="1"/>
+    <text x="16" y="9" font-size="9.5" fill="#42465a" font-family="'IBM Plex Mono',monospace">interpretation</text>
+  </g>
+  <g transform="translate(0,40)">
+    <circle cx="5" cy="5" r="5" fill="#2b5f96" fill-opacity="0.85" stroke="#4ee4b2" stroke-width="2"/>
+    <text x="16" y="9" font-size="9.5" fill="#42465a" font-family="'IBM Plex Mono',monospace">pinned</text>
+  </g>
+  <g transform="translate(0,60)">
+    <line x1="0" y1="5" x2="18" y2="5" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+    <text x="22" y="9" font-size="9.5" fill="#42465a" font-family="'IBM Plex Mono',monospace">cites</text>
+  </g>
+</svg>
+
+<div id="wordmark">loci</div>
+<div id="hint">scroll to zoom · drag to pan · hover to explore · click to inspect</div>
+
 <script>
 const PROJECT_ID = "__PROJECT_ID__";
-const API = "";
 
-let cy;
-let selectedNode = null;
+// ── Data ─────────────────────────────────────────────────────────────────────
+const gd = { nodes: [], edges: [] };  // ground truth; edges store raw string src/dst
+let sim;
+let selId = null;
 
-// ---- init Cytoscape ----
-async function init() {
-  const res = await fetch(`${API}/projects/${PROJECT_ID}/graph`);
-  const data = await res.json();
+// ── D3 selections ─────────────────────────────────────────────────────────────
+const svg = d3.select("#graph");
+const zg  = svg.select("#zg");
+const ll  = zg.select("#ll");
+const nl  = zg.select("#nl");
+const tip = document.getElementById("tooltip");
 
-  const elements = [];
-  for (const n of (data.nodes || [])) {
-    elements.push({
-      data: {
-        id: n.id,
-        label: n.title || n.id.slice(-8),
-        kind: n.kind,
-        subkind: n.subkind,
-        status: n.status,
-        relation_md: n.relation_md || "",
-        overlap_md: n.overlap_md || "",
-        source_anchor_md: n.source_anchor_md || "",
-      }
-    });
-  }
-  for (const e of (data.edges || [])) {
-    elements.push({ data: { id: e.id, source: e.src, target: e.dst, type: e.type } });
-  }
-
-  cy = cytoscape({
-    container: document.getElementById("cy"),
-    elements,
-    style: [
-      { selector: "node[kind='raw']", style: {
-        "background-color": "#2a4a6a", "label": "data(label)",
-        "color": "#8ab", "font-size": 10, "text-valign": "bottom",
-        "text-halign": "center", "width": 28, "height": 28,
-      }},
-      { selector: "node[kind='interpretation']", style: {
-        "background-color": "#3a2a6a", "label": "data(label)",
-        "color": "#a8f", "font-size": 10, "text-valign": "bottom",
-        "text-halign": "center", "shape": "diamond", "width": 32, "height": 32,
-      }},
-      { selector: "node:selected", style: { "border-width": 2, "border-color": "#8080ff" }},
-      { selector: "edge[type='cites']", style: {
-        "line-color": "#444", "target-arrow-color": "#444",
-        "target-arrow-shape": "triangle", "width": 1.5,
-        "curve-style": "bezier",
-      }},
-      { selector: "edge[type='derives_from']", style: {
-        "line-color": "#6040a0", "target-arrow-color": "#6040a0",
-        "target-arrow-shape": "triangle", "width": 1.5,
-        "curve-style": "bezier", "line-style": "dashed",
-      }},
-    ],
-    layout: { name: "cose", animate: false, nodeOverlap: 20 },
-  });
-
-  cy.on("tap", "node", e => openPanel(e.target));
-  cy.on("tap", e => { if (e.target === cy) closePanel(); });
-  document.getElementById("status").textContent = `${elements.filter(el => !el.data.source).length} nodes`;
-  connectWS();
+// ── Size encoding ─────────────────────────────────────────────────────────────
+function nodeR(d) {
+  const ac = d.access_count || 0;
+  const base = d.kind === "raw" ? 5 : 8;
+  const max  = d.kind === "raw" ? 13 : 18;
+  return Math.min(max, base + Math.sqrt(ac) * 0.9 + (d._deg || 0) * 0.35);
 }
 
-// ---- side panel ----
-function openPanel(node) {
-  selectedNode = node;
-  const d = node.data();
-  document.getElementById("panel-title").textContent = d.label;
-  document.getElementById("edit-relation").value = d.relation_md || "";
-  document.getElementById("edit-overlap").value = d.overlap_md || "";
-  document.getElementById("edit-anchor").value = d.source_anchor_md || "";
-  document.getElementById("panel").classList.add("open");
+// ── Color encoding ────────────────────────────────────────────────────────────
+function nodeFill(d)   { return d.kind === "raw" ? "#2b5f96" : "#9c6c14"; }
+function nodeStroke(d) { return d.role === "pinned" ? "#4ee4b2" : (d.kind === "raw" ? "#4a8fc8" : "#d08c28"); }
+function nodeSW(d)     { return d.role === "pinned" ? 2 : 1.2; }
+function nodeFO(d)     {
+  if (d.kind === "interpretation") return Math.max(0.45, Math.min(1, d.confidence || 0.75));
+  return 0.82;
+}
+
+// ── Zoom ──────────────────────────────────────────────────────────────────────
+const zoom = d3.zoom()
+  .scaleExtent([0.06, 5])
+  .on("zoom", e => zg.attr("transform", e.transform));
+
+svg.call(zoom).on("dblclick.zoom", null);
+svg.on("mousedown.svg", () => svg.classed("dragging", true));
+svg.on("mouseup.svg", () => svg.classed("dragging", false));
+
+// ── Main render ───────────────────────────────────────────────────────────────
+function render() {
+  const W = window.innerWidth, H = window.innerHeight;
+
+  // Compute degree for sizing
+  const deg = {};
+  gd.nodes.forEach(n => deg[n.id] = 0);
+  gd.edges.forEach(e => {
+    const s = rawId(e.src), t = rawId(e.dst);
+    if (deg[s] !== undefined) deg[s]++;
+    if (deg[t] !== undefined) deg[t]++;
+  });
+  gd.nodes.forEach(n => n._deg = deg[n.id] || 0);
+
+  // Build adjacency set for highlight
+  const adj = {};
+  gd.nodes.forEach(n => adj[n.id] = new Set());
+  gd.edges.forEach(e => {
+    const s = rawId(e.src), t = rawId(e.dst);
+    if (adj[s]) adj[s].add(t);
+    if (adj[t]) adj[t].add(s);
+  });
+  gd.nodes.forEach(n => n._adj = adj[n.id] || new Set());
+
+  // Build links for D3 (fresh array every call, no mutation of gd.edges)
+  const byId = new Map(gd.nodes.map(n => [n.id, n]));
+  const links = gd.edges.map(e => ({
+    ...e, id: e.id,
+    source: byId.get(rawId(e.src)),
+    target: byId.get(rawId(e.dst)),
+  })).filter(e => e.source && e.target);
+
+  // ── Link enter/exit ───────────────────────────────────────────────────────
+  const lSel = ll.selectAll(".link").data(links, d => d.id);
+
+  lSel.enter().append("line")
+    .attr("class", d => `link ${d.type === "derives_from" ? "derives-from" : "cites"}`)
+    .attr("marker-end", d => d.type === "derives_from" ? "url(#ar-derives)" : "url(#ar-cites)");
+
+  lSel.exit().remove();
+
+  // ── Node enter/exit ───────────────────────────────────────────────────────
+  const nSel = nl.selectAll(".node").data(gd.nodes, d => d.id);
+  const nEnter = nSel.enter().append("g").attr("class", "node");
+
+  // Main circle
+  nEnter.append("circle").attr("class", "core");
+
+  // Chunk indicator ring (only for chunk subkind)
+  nEnter.filter(d => d.subkind === "chunk").append("circle")
+    .attr("class", "chunk-ring")
+    .attr("fill", "none")
+    .attr("stroke-dasharray", "2.5 2.5");
+
+  // Pinned glow ring (for pinned role)
+  nEnter.filter(d => d.role === "pinned").append("circle")
+    .attr("class", "pin-ring")
+    .attr("fill", "none")
+    .attr("stroke", "rgba(78,228,178,0.18)")
+    .attr("stroke-width", 5)
+    .attr("filter", "url(#glow)");
+
+  // Hover label — appears above node when hovered
+  nEnter.append("text").attr("class", "hover-lbl").attr("text-anchor", "middle");
+
+  const nAll = nEnter.merge(nSel);
+
+  // Apply attributes (enter + update)
+  nAll.select(".core")
+    .attr("r", nodeR)
+    .attr("fill", nodeFill)
+    .attr("fill-opacity", nodeFO)
+    .attr("stroke", nodeStroke)
+    .attr("stroke-width", nodeSW);
+
+  nAll.select(".chunk-ring")
+    .attr("r", d => nodeR(d) + 5)
+    .attr("stroke", nodeStroke)
+    .attr("stroke-width", 0.7)
+    .attr("stroke-opacity", 0.3);
+
+  nAll.select(".pin-ring")
+    .attr("r", d => nodeR(d) + 8);
+
+  nAll.select(".hover-lbl")
+    .attr("dy", d => -(nodeR(d) + 9))
+    .text(d => trunc(d.title || d.id.slice(-8), 34));
+
+  nSel.exit().remove();
+
+  // ── Interactions ──────────────────────────────────────────────────────────
+  nAll.call(
+    d3.drag()
+      .on("start", (ev, d) => {
+        if (!ev.active) sim.alphaTarget(0.3).restart();
+        d.fx = d.x; d.fy = d.y;
+      })
+      .on("drag", (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
+      .on("end", (ev) => { if (!ev.active) sim.alphaTarget(0); })
+  );
+
+  nAll
+    .on("mouseover", (ev, d) => {
+      showTip(ev, d);
+      dim(d);
+      nl.selectAll(".node").filter(n => n.id === d.id).classed("hovered", true);
+      dismissHint();
+    })
+    .on("mousemove", ev => posTip(ev))
+    .on("mouseout", (ev, d) => {
+      hideTip();
+      clearDim();
+      nl.selectAll(".node").filter(n => n.id === d.id).classed("hovered", false);
+    })
+    .on("click", (ev, d) => { ev.stopPropagation(); selId = d.id; openPanel(d); markSelected(); })
+    .on("dblclick", (ev, d) => { ev.stopPropagation(); d.fx = null; d.fy = null; sim.alpha(0.25).restart(); });
+
+  svg.on("click.bg", () => { closePanel(); clearSelected(); });
+
+  // ── Simulation ────────────────────────────────────────────────────────────
+  if (!sim) {
+    sim = d3.forceSimulation()
+      .force("link", d3.forceLink().id(d => d.id)
+        .distance(d => d.type === "derives_from" ? 160 : 95)
+        .strength(0.35))
+      .force("charge", d3.forceManyBody().strength(d => d.kind === "raw" ? -180 : -260))
+      .force("center", d3.forceCenter(W / 2, H / 2).strength(0.04))
+      .force("collide", d3.forceCollide().radius(d => nodeR(d) + 28).strength(0.85))
+      .alphaDecay(0.016)
+      .on("tick", tick);
+
+    // Fit view after sim settles
+    setTimeout(fitView, 2800);
+  }
+
+  sim.nodes(gd.nodes);
+  sim.force("link").links(links);
+  sim.alpha(0.35).restart();
+}
+
+// ── Tick ─────────────────────────────────────────────────────────────────────
+function tick() {
+  ll.selectAll(".link")
+    .attr("x1", d => lx1(d)).attr("y1", d => ly1(d))
+    .attr("x2", d => lx2(d)).attr("y2", d => ly2(d));
+  nl.selectAll(".node").attr("transform", d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+}
+
+// Compute link endpoint at source surface
+function lx1(d) {
+  const dx = (d.target.x ?? 0) - (d.source.x ?? 0), dy = (d.target.y ?? 0) - (d.source.y ?? 0);
+  const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+  return (d.source.x ?? 0) + dx / dist * nodeR(d.source);
+}
+function ly1(d) {
+  const dx = (d.target.x ?? 0) - (d.source.x ?? 0), dy = (d.target.y ?? 0) - (d.source.y ?? 0);
+  const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+  return (d.source.y ?? 0) + dy / dist * nodeR(d.source);
+}
+// Compute link endpoint at target surface (extra gap for arrowhead)
+function lx2(d) {
+  const dx = (d.target.x ?? 0) - (d.source.x ?? 0), dy = (d.target.y ?? 0) - (d.source.y ?? 0);
+  const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+  return (d.target.x ?? 0) - dx / dist * (nodeR(d.target) + 5);
+}
+function ly2(d) {
+  const dx = (d.target.x ?? 0) - (d.source.x ?? 0), dy = (d.target.y ?? 0) - (d.source.y ?? 0);
+  const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+  return (d.target.y ?? 0) - dy / dist * (nodeR(d.target) + 5);
+}
+
+// ── Highlight / dim ───────────────────────────────────────────────────────────
+function dim(d) {
+  const nb = d._adj || new Set();
+  nl.selectAll(".node").classed("dimmed", n => n.id !== d.id && !nb.has(n.id));
+  ll.selectAll(".link").classed("dimmed", l => {
+    const s = rawId(l.source), t = rawId(l.target);
+    return s !== d.id && t !== d.id;
+  }).classed("lit", l => {
+    const s = rawId(l.source), t = rawId(l.target);
+    return s === d.id || t === d.id;
+  });
+}
+function clearDim() {
+  nl.selectAll(".node").classed("dimmed", false);
+  ll.selectAll(".link").classed("dimmed", false).classed("lit", false);
+}
+function markSelected() {
+  nl.selectAll(".node").classed("selected", n => n.id === selId);
+}
+function clearSelected() {
+  selId = null;
+  nl.selectAll(".node").classed("selected", false);
+}
+
+// ── Tooltip ───────────────────────────────────────────────────────────────────
+function showTip(ev, d) {
+  const isChunk = d.subkind === "chunk";
+  const kindLabel = d.kind === "raw"
+    ? (isChunk ? "chunk · raw source" : "raw source")
+    : "interpretation · locus";
+
+  document.getElementById("tt-badge").textContent = kindLabel;
+  document.getElementById("tt-title").textContent = d.title || d.id.slice(-8);
+
+  let body = "";
+  if (d.kind === "interpretation" && d.relation_md)
+    body = trunc(d.relation_md.replace(/^#+\s*/gm, "").trim(), 90);
+  else if (d.kind === "raw" && d.body)
+    body = trunc(d.body.trim(), 90);
+
+  document.getElementById("tt-body").textContent = body;
+  document.getElementById("tt-body").style.display = body ? "" : "none";
+
+  const stats = [];
+  if (d.access_count) stats.push(`accessed ${d.access_count}×`);
+  if (d.status && d.status !== "live") stats.push(d.status);
+  if (d.angle) stats.push(`angle: ${d.angle}`);
+  document.getElementById("tt-stats").textContent = stats.join(" · ");
+  document.getElementById("tt-stats").style.display = stats.length ? "" : "none";
+
+  tip.classList.add("vis");
+  posTip(ev);
+}
+
+function posTip(ev) {
+  const pad = 16, w = 270;
+  const th = tip.offsetHeight || 100;
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + w > window.innerWidth - 16) x = ev.clientX - w - pad;
+  if (y + th > window.innerHeight - 16) y = ev.clientY - th - pad;
+  tip.style.left = x + "px";
+  tip.style.top  = y + "px";
+}
+
+function hideTip() { tip.classList.remove("vis"); }
+
+// ── Panel ─────────────────────────────────────────────────────────────────────
+function openPanel(d) {
+  const panel = document.getElementById("panel");
+  const pb    = document.getElementById("pb");
+
+  document.getElementById("ph-badge").textContent =
+    d.kind === "raw" ? (d.subkind ? `${d.subkind} · raw` : "raw source") : "interpretation · locus";
+  document.getElementById("ph-title").textContent = d.title || d.id.slice(-8);
+
+  const meta = [];
+  if (d.access_count) meta.push(`${d.access_count} accesses`);
+  if (d.confidence != null) meta.push(`confidence ${(d.confidence * 100).toFixed(0)}%`);
+  if (d.status && d.status !== "live") meta.push(d.status);
+  document.getElementById("ph-meta").textContent = meta.join(" · ");
+
+  pb.innerHTML = "";
+
+  if (d.kind === "interpretation") {
+    pb.innerHTML = `
+      <div>
+        <div class="slot-lbl">Relation</div>
+        <textarea class="slot-ta" id="ed-rel" rows="4">${esc(d.relation_md || "")}</textarea>
+      </div>
+      <div>
+        <div class="slot-lbl">Overlap</div>
+        <textarea class="slot-ta" id="ed-ovl" rows="3">${esc(d.overlap_md || "")}</textarea>
+      </div>
+      <div>
+        <div class="slot-lbl">Source Anchor</div>
+        <textarea class="slot-ta" id="ed-anc" rows="3">${esc(d.source_anchor_md || "")}</textarea>
+      </div>
+      <div class="p-actions">
+        <button class="btn btn-save" id="save-btn">Save</button>
+        <button class="btn btn-cancel" id="cancel-btn">Cancel</button>
+      </div>
+    `;
+    document.getElementById("save-btn").addEventListener("click", () => saveNode(d));
+    document.getElementById("cancel-btn").addEventListener("click", closePanel);
+  } else {
+    const preview = d.body ? d.body.slice(0, 500) : "(no content)";
+    const ellipsis = d.body && d.body.length > 500 ? "\n…" : "";
+    pb.innerHTML = `
+      <div>
+        <div class="slot-lbl">Content</div>
+        <div class="body-pre">${esc(preview)}${ellipsis}</div>
+      </div>
+    `;
+  }
+
+  // Revision history (always shown)
+  const revSec = document.createElement("div");
+  revSec.className = "rev-section";
+  revSec.innerHTML = `<div class="slot-lbl">Revision history</div><div id="rev-list" style="font-size:10.5px;color:var(--muted)">loading…</div>`;
+  pb.appendChild(revSec);
+
+  panel.classList.add("open");
   loadRevisions(d.id);
 }
 
 function closePanel() {
-  selectedNode = null;
   document.getElementById("panel").classList.remove("open");
 }
 
-async function loadRevisions(nodeId) {
-  const list = document.getElementById("revisions-list");
-  list.textContent = "loading…";
-  try {
-    const res = await fetch(`${API}/nodes/${nodeId}/revisions?limit=10`);
-    const revs = await res.json();
-    if (!revs.length) { list.textContent = "(no revisions yet)"; return; }
-    list.innerHTML = revs.map(r => `
-      <div class="rev">
-        <b>${r.op}</b> ${r.actor} <span style="color:#444">${r.ts.slice(0,16)}</span>
-        ${r.reason ? `— ${r.reason}` : ""}
-        <span class="rev-revert" data-nid="${r.node_id}" data-rid="${r.id}">revert</span>
-      </div>
-    `).join("");
-    list.querySelectorAll(".rev-revert").forEach(el => {
-      el.addEventListener("click", () => revertRevision(el.dataset.nid, el.dataset.rid));
-    });
-  } catch(e) { list.textContent = "(error loading revisions)"; }
-}
-
-async function revertRevision(nodeId, revisionId) {
-  if (!confirm("Revert to this revision?")) return;
-  await fetch(`${API}/nodes/${nodeId}/revisions/${revisionId}/revert`, { method: "POST" });
-  loadRevisions(nodeId);
-}
-
-document.getElementById("close-panel").addEventListener("click", closePanel);
-document.getElementById("cancel-btn").addEventListener("click", closePanel);
-
-document.getElementById("save-btn").addEventListener("click", async () => {
-  if (!selectedNode) return;
-  const nodeId = selectedNode.data("id");
+async function saveNode(d) {
+  const btn = document.getElementById("save-btn");
   const body = {
-    relation_md: document.getElementById("edit-relation").value,
-    overlap_md: document.getElementById("edit-overlap").value,
-    source_anchor_md: document.getElementById("edit-anchor").value,
+    relation_md:      document.getElementById("ed-rel").value,
+    overlap_md:       document.getElementById("ed-ovl").value,
+    source_anchor_md: document.getElementById("ed-anc").value,
   };
+  btn.textContent = "Saving…"; btn.disabled = true;
   try {
-    const res = await fetch(`${API}/nodes/${nodeId}/locus`, {
+    const res = await fetch(`/nodes/${d.id}/locus`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", "X-Loci-Actor": "user" },
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(await res.text());
-    selectedNode.data("relation_md", body.relation_md);
-    selectedNode.data("overlap_md", body.overlap_md);
-    selectedNode.data("source_anchor_md", body.source_anchor_md);
-    closePanel();
-  } catch(e) { alert("Save failed: " + e); }
-});
+    Object.assign(d, body);
+    btn.textContent = "Saved ✓";
+    setTimeout(closePanel, 700);
+  } catch (e) {
+    btn.textContent = "Save"; btn.disabled = false;
+    alert("Save failed: " + e.message);
+  }
+}
 
-// ---- WebSocket live updates ----
+async function loadRevisions(nodeId) {
+  const el = document.getElementById("rev-list");
+  if (!el) return;
+  try {
+    const res = await fetch(`/nodes/${nodeId}/revisions?limit=15`);
+    const revs = await res.json();
+    if (!revs.length) { el.textContent = "(no revisions yet)"; return; }
+    el.innerHTML = revs.map(r => `
+      <div class="rev-row">
+        <span class="rev-op">${r.op}</span>
+        <span class="rev-who">${r.actor}</span>
+        <span class="rev-date">${(r.ts || "").slice(0, 10)}</span>
+        <span class="rev-why" title="${esc(r.reason || "")}">${esc(r.reason || "")}</span>
+        <span class="rev-revert" data-nid="${r.node_id}" data-rid="${r.id}">revert</span>
+      </div>
+    `).join("");
+    el.querySelectorAll(".rev-revert").forEach(el2 =>
+      el2.addEventListener("click", () => doRevert(el2.dataset.nid, el2.dataset.rid, nodeId))
+    );
+  } catch { if (el) el.textContent = "(unavailable)"; }
+}
+
+async function doRevert(nodeId, revId, currentId) {
+  if (!confirm("Revert node to this revision?")) return;
+  await fetch(`/nodes/${nodeId}/revisions/${revId}/revert`, { method: "POST" });
+  loadRevisions(currentId);
+}
+
+document.getElementById("close-btn").addEventListener("click", closePanel);
+
+// ── Fit view ──────────────────────────────────────────────────────────────────
+function fitView() {
+  const g = document.getElementById("nl");
+  if (!g) return;
+  const bb = g.getBBox();
+  if (!bb.width || !bb.height) return;
+  const pad = 72;
+  const scale = Math.min(
+    (window.innerWidth - pad * 2) / bb.width,
+    (window.innerHeight - pad * 2) / bb.height,
+    1.2
+  );
+  const tx = window.innerWidth  / 2 - scale * (bb.x + bb.width  / 2);
+  const ty = window.innerHeight / 2 - scale * (bb.y + bb.height / 2);
+  svg.transition().duration(700).ease(d3.easeCubicInOut)
+    .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+let wsDelay = 1200;
 function connectWS() {
+  const dot = document.getElementById("dot");
   const ws = new WebSocket(`ws://${location.host}/projects/${PROJECT_ID}/subscribe`);
-  ws.onopen = () => { document.getElementById("status").textContent = "live"; };
+  ws.onopen  = () => { dot.className = "dot live"; wsDelay = 1200; };
   ws.onclose = () => {
-    document.getElementById("status").textContent = "reconnecting…";
-    setTimeout(connectWS, 3000);
+    dot.className = "dot err";
+    setTimeout(connectWS, wsDelay = Math.min(wsDelay * 1.6, 16000));
   };
-  ws.onmessage = e => {
-    const msg = JSON.parse(e.data);
-    applyDelta(msg);
-  };
+  ws.onmessage = ev => applyDelta(JSON.parse(ev.data));
 }
 
 function applyDelta(msg) {
   const { op, entity, payload } = msg;
-  if (!cy || !entity || !payload) return;
+  if (!entity || !payload) return;
   if (entity === "node") {
-    const existing = cy.getElementById(payload.id);
     if (op === "upsert") {
-      if (existing.length) {
-        existing.data("label", payload.title || payload.id.slice(-8));
-        existing.data("relation_md", payload.relation_md || "");
-        existing.data("overlap_md", payload.overlap_md || "");
-        existing.data("source_anchor_md", payload.source_anchor_md || "");
-        existing.data("status", payload.status);
-      } else {
-        cy.add({ data: {
-          id: payload.id, label: payload.title || payload.id.slice(-8),
-          kind: payload.kind, subkind: payload.subkind,
+      const idx = gd.nodes.findIndex(n => n.id === payload.id);
+      if (idx >= 0) {
+        Object.assign(gd.nodes[idx], {
+          title: payload.title, kind: payload.kind, subkind: payload.subkind,
+          status: payload.status, access_count: payload.access_count,
+          confidence: payload.confidence, role: payload.role,
           relation_md: payload.relation_md || "",
           overlap_md: payload.overlap_md || "",
           source_anchor_md: payload.source_anchor_md || "",
-          status: payload.status,
-        }});
-        cy.layout({ name: "cose", animate: true, stop: () => {} }).run();
+          body: payload.body || "",
+        });
+        if (selId === payload.id) openPanel(gd.nodes[idx]);
+      } else {
+        gd.nodes.push({
+          ...payload, body: payload.body || "",
+          x: window.innerWidth / 2, y: window.innerHeight / 2,
+        });
       }
-    } else if (op === "delete" && existing.length) {
-      cy.remove(existing);
+    } else if (op === "delete") {
+      gd.nodes = gd.nodes.filter(n => n.id !== payload.id);
+      gd.edges = gd.edges.filter(e => rawId(e.src) !== payload.id && rawId(e.dst) !== payload.id);
+      if (selId === payload.id) closePanel();
     }
   } else if (entity === "edge") {
-    const existing = cy.getElementById(payload.id);
-    if (op === "upsert" && !existing.length) {
-      cy.add({ data: { id: payload.id, source: payload.src, target: payload.dst, type: payload.type }});
-    } else if (op === "delete" && existing.length) {
-      cy.remove(existing);
-    }
+    if (op === "upsert" && !gd.edges.find(e => e.id === payload.id))
+      gd.edges.push(payload);
+    else if (op === "delete")
+      gd.edges = gd.edges.filter(e => e.id !== payload.id);
+  }
+  render();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function rawId(v) { return typeof v === "object" && v !== null ? v.id : v; }
+function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + "…" : (s || ""); }
+function esc(s) {
+  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+let hintDismissed = false;
+function dismissHint() {
+  if (hintDismissed) return;
+  hintDismissed = true;
+  document.getElementById("hint").classList.add("hidden");
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+async function init() {
+  const hud = document.getElementById("hud-txt");
+  try {
+    const res = await fetch(`/projects/${PROJECT_ID}/graph`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    gd.nodes = (data.nodes || []).map(n => ({
+      id: n.id, kind: n.kind, subkind: n.subkind, title: n.title,
+      body: n.body || "", status: n.status, access_count: n.access_count || 0,
+      confidence: n.confidence, role: n.role, angle: n.angle,
+      relation_md: n.relation_md || "", overlap_md: n.overlap_md || "",
+      source_anchor_md: n.source_anchor_md || "",
+    }));
+    gd.edges = (data.edges || []).map(e => ({
+      id: e.id, src: e.src, dst: e.dst, type: e.type,
+    }));
+
+    const loci  = gd.nodes.filter(n => n.kind === "interpretation").length;
+    const raws  = gd.nodes.filter(n => n.kind === "raw").length;
+    hud.textContent = `${loci} loci · ${raws} sources`;
+
+    render();
+    connectWS();
+
+    setTimeout(() => document.getElementById("hint").classList.add("hidden"), 6000);
+  } catch (e) {
+    hud.textContent = `error: ${e.message}`;
+    document.getElementById("dot").className = "dot err";
   }
 }
 
-init().catch(console.error);
+window.addEventListener("resize", () => {
+  if (sim) sim.force("center", d3.forceCenter(window.innerWidth / 2, window.innerHeight / 2).strength(0.04));
+});
+
+init();
 </script>
 </body>
 </html>
