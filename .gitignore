@@ -29,7 +29,6 @@ htmlcov/
 # uv / venvs
 .venv/
 venv/
-uv.lock
 
 # Loci runtime data
 # Default data dir (override with LOCI_DATA_DIR). Tests use tmp_path.
