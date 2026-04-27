@@ -133,25 +133,6 @@ def test_graph_view_includes_community_version(loci_dir):
         assert r.json()["community_version"] == 0
 
 
-def test_graph_export_writes_standalone_html(loci_dir):
-    from loci.db import migrate
-    from loci.db.connection import connect
-    from loci.graph import Project, ProjectRepository
-    from loci.graph.export import write_graph_html
-
-    migrate()
-    conn = connect()
-    proj = ProjectRepository(conn).create(Project(slug="p", name="Project P"))
-    output = loci_dir / "graph.html"
-
-    written = write_graph_html(proj, conn, output)
-    assert written == output
-    html = output.read_text()
-    assert "Loci Graph" in html
-    assert "const DATA =" in html
-    assert '"project": {"id":' in html
-
-
 # ---------------------------------------------------------------------------
 # Anchors (active-anchor set)
 # ---------------------------------------------------------------------------

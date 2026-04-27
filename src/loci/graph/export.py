@@ -5,8 +5,8 @@ this module turns it into a self-contained D3 visualization that can be saved
 to disk and opened directly in a browser.
 
 D3 is embedded inline so the file is self-contained with no external deps.
-If the cached copy at ~/.loci/d3.v7.min.js is missing, it is fetched once
-from the CDN and cached there. Subsequent exports are offline-capable.
+If the cached copy at ~/.loci/assets/d3.v7.min.js is missing, it is fetched
+once from the CDN and cached there. Subsequent exports are offline-capable.
 """
 
 from __future__ import annotations
@@ -23,14 +23,15 @@ _D3_CDN = "https://d3js.org/d3.v7.min.js"
 
 
 def _d3_inline() -> str:
-    """Return the D3 v7 minified source, caching in ~/.loci/d3.v7.min.js."""
+    """Return the D3 v7 minified source, caching in ~/.loci/assets/d3.v7.min.js."""
     from loci.config import get_settings
-    cache_path = get_settings().data_dir / "d3.v7.min.js"
+    cache_path = get_settings().assets_dir / "d3.v7.min.js"
     if cache_path.exists():
         return cache_path.read_text()
     try:
         import httpx
         src = httpx.get(_D3_CDN, timeout=30).text
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(src)
         return src
     except Exception:

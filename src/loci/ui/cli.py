@@ -8,9 +8,10 @@ Subcommands:
     loci worker [--poll-interval]
     loci project create <slug>            interactive setup wizard
     loci project manage                   edit / delete existing projects
-    loci project bind <slug>              write .loci/project in cwd
+    loci project bind <slug>              write .loci/project.toml in cwd
     loci project list
     loci project info <slug>
+    loci current set/clear/show           pin a project for MCP sessions
     loci workspace create/list/info/add-source/link/unlink/scan
     loci scan <project>                   scan all linked workspaces
     loci q <project> <query> [--k] [--hyde]
@@ -21,6 +22,9 @@ Subcommands:
                                           autoresearch: search papers + sandbox
     loci absorb <project>
     loci graph export <project> [--output FILE]
+    loci graph json/serve/revisions/revert
+    loci export [project] [--to PATH]     write graph.json + memo.md snapshots
+    loci doctor                           print resolved storage paths
     loci rebuild <project>
     loci reset
     loci status [project]
@@ -60,6 +64,8 @@ workspace_app = App(name="workspace", help="Information workspace commands.")
 app.command(workspace_app)
 graph_app = App(name="graph", help="Visualize, export, and inspect the interpretation graph.")
 app.command(graph_app)
+current_app = App(name="current", help="Manage the MCP cwd-pinned project (stored in ~/.loci/state/current).")
+app.command(current_app)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +84,10 @@ def server(
 
     settings = get_settings()
     settings.ensure_dirs()
+    from loci.logging_config import setup_logging
+    from loci.layout import ensure_layout
+    setup_logging(settings.data_dir)
+    ensure_layout(settings.data_dir, settings.assets_dir)
 
     if not no_worker:
         from loci.jobs.worker import start_worker_thread
@@ -96,6 +106,12 @@ def server(
 @app.command
 def mcp() -> None:
     """Run the loci MCP server over stdio (for Claude Code)."""
+    settings = get_settings()
+    settings.ensure_dirs()
+    from loci.logging_config import setup_logging
+    from loci.layout import ensure_layout
+    setup_logging(settings.data_dir)
+    ensure_layout(settings.data_dir, settings.assets_dir)
     from loci.mcp import run_stdio
     run_stdio()
 
@@ -159,9 +175,9 @@ def project_manage() -> None:
 
 @project_app.command(name="bind")
 def project_bind(slug: str) -> None:
-    """Bind the current directory to a project. Writes .loci/project."""
-    from loci.mcp.resolve import write_project_file
-    path = write_project_file(slug)
+    """Bind the current directory to a project. Writes .loci/project.toml."""
+    from loci.mcp.resolve import write_project_toml
+    path = write_project_toml(slug)
     console.print(f"[green]bound[/green] [bold]{slug}[/bold] → {path}")
 
 
@@ -202,6 +218,38 @@ def project_info(slug: str) -> None:
     if proj.profile_md:
         console.rule("profile")
         console.print(proj.profile_md)
+
+
+# ---------------------------------------------------------------------------
+# Current project (MCP pin)
+# ---------------------------------------------------------------------------
+
+
+@current_app.command(name="set")
+def current_set(slug: str) -> None:
+    """Pin a project for MCP sessions that lack a .loci/project.toml walk-up."""
+    from loci.mcp.resolve import write_state_file
+    path = write_state_file(slug)
+    console.print(f"[green]set[/green] current project → [bold]{slug}[/bold] ({path})")
+
+
+@current_app.command(name="clear")
+def current_clear() -> None:
+    """Clear the pinned MCP project."""
+    from loci.mcp.resolve import clear_state_file
+    clear_state_file()
+    console.print("[green]cleared[/green] current project")
+
+
+@current_app.command(name="show")
+def current_show() -> None:
+    """Show the pinned MCP project (if any)."""
+    from loci.mcp.resolve import read_state_file
+    slug = read_state_file()
+    if slug:
+        console.print(f"current project: [bold]{slug}[/bold]")
+    else:
+        console.print("[dim]no current project set[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -670,7 +718,7 @@ def graph_json(
 @graph_app.command(name="export")
 def graph_export(
     project: str,
-    output: Path = Path("/tmp/loci_graph.html"),
+    output: Path | None = None,
     include_raw: bool = True,
     inline: bool = False,
 ) -> None:
@@ -687,6 +735,12 @@ def graph_export(
 
     migrate()
     conn = connect()
+    settings = get_settings()
+    if output is None:
+        import datetime
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        output = settings.exports_dir / f"{project}-{ts}.html"
+        output.parent.mkdir(parents=True, exist_ok=True)
     proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
     if proj is None:
         console.print(f"[red]no such project:[/red] {project}")
@@ -1037,6 +1091,133 @@ def status(project: str | None = None) -> None:
     for e, f, c in rows:
         table.add_row(e, f, c)
     console.print(table)
+
+
+@app.command
+def doctor() -> None:
+    """Print resolved storage paths, settings sources, and active project."""
+    import os
+
+    from loci.config import get_settings
+    from loci.mcp.resolve import find_project_file, read_state_file
+
+    settings = get_settings()
+
+    console.print("[bold]loci doctor[/bold]")
+    console.print()
+    console.print("[bold]Data root[/bold]")
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    paths = {
+        "data_dir": settings.data_dir,
+        "db": settings.db_path,
+        "blobs": settings.blob_dir,
+        "models": settings.model_cache_dir,
+        "logs": settings.logs_dir,
+        "exports": settings.exports_dir,
+        "research": settings.research_dir,
+        "assets": settings.assets_dir,
+        "state": settings.state_dir,
+    }
+    for name, path in paths.items():
+        exists = "[green]✓[/green]" if path.exists() else "[dim]–[/dim]"
+        table.add_row(exists, name, str(path))
+    console.print(table)
+
+    console.print()
+    console.print("[bold]Settings sources[/bold]")
+    sources = []
+    env_loci = os.environ.get("LOCI_DATA_DIR")
+    if env_loci:
+        sources.append(f"LOCI_DATA_DIR={env_loci} (env var)")
+    cwd_env = Path(".env")
+    if cwd_env.exists():
+        sources.append(f"{cwd_env.resolve()} (cwd .env)")
+    home_env = settings.data_dir / ".env"
+    if home_env.exists():
+        sources.append(f"{home_env} (~/.loci/.env)")
+    home_toml = settings.data_dir / "config.toml"
+    if home_toml.exists():
+        sources.append(f"{home_toml} (~/.loci/config.toml)")
+    for s in sources:
+        console.print(f"  {s}")
+    if not sources:
+        console.print("  [dim]only defaults / environment variables[/dim]")
+
+    console.print()
+    console.print("[bold]Active project[/bold]")
+    cwd_slug = find_project_file()
+    env_slug = os.environ.get("LOCI_PROJECT")
+    state_slug = read_state_file()
+    if env_slug:
+        console.print(f"  LOCI_PROJECT={env_slug}")
+    if cwd_slug:
+        console.print(f"  .loci/project.toml walk-up → {cwd_slug}")
+    if state_slug:
+        console.print(f"  ~/.loci/state/current → {state_slug}")
+    if not any([env_slug, cwd_slug, state_slug]):
+        console.print("  [dim]none (pass project= or run `loci project bind <slug>`)[/dim]")
+
+
+@app.command
+def export(
+    project: str | None = None,
+    to: Path | None = None,
+) -> None:
+    """Export graph.json and memo.md snapshots for a project.
+
+    When run from a directory bound to a project (via .loci/project.toml),
+    writes to <repo>/.loci/views/. Otherwise writes to ~/.loci/exports/.
+    """
+    import json as _json
+    import datetime
+
+    from loci.config import get_settings
+    from loci.db import migrate
+    from loci.db.connection import connect
+    from loci.graph import ProjectRepository
+    from loci.graph.export import build_graph_payload
+    from loci.agent.memo import build_project_memo
+    from loci.mcp.resolve import find_project_dir, find_project_file
+
+    migrate()
+    conn = connect()
+    settings = get_settings()
+
+    # Resolve project
+    if project is None:
+        project = find_project_file()
+    if project is None:
+        console.print("[red]no project specified and no .loci/project.toml found[/red]")
+        raise SystemExit(1)
+
+    proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
+    if proj is None:
+        console.print(f"[red]no such project:[/red] {project}")
+        raise SystemExit(1)
+
+    # Resolve output directory
+    if to is not None:
+        views_dir = to
+    else:
+        loci_dir = find_project_dir()
+        if loci_dir is not None:
+            views_dir = loci_dir / "views"
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            views_dir = settings.exports_dir / f"{proj.slug}-{ts}"
+    views_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write graph.json
+    payload = build_graph_payload(proj, conn)
+    graph_path = views_dir / "graph.json"
+    graph_path.write_text(_json.dumps(payload, ensure_ascii=False, indent=2))
+    console.print(f"[green]wrote[/green] {graph_path}")
+
+    # Write memo.md
+    memo = build_project_memo(conn, proj.id)
+    memo_path = views_dir / "memo.md"
+    memo_path.write_text(memo or "")
+    console.print(f"[green]wrote[/green] {memo_path}")
 
 
 def main() -> None:  # script entrypoint (pyproject `loci = "loci.ui.cli:main"`)

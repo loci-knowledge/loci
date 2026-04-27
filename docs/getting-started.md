@@ -1,8 +1,8 @@
 # Getting started
 
 Imagine you have a folder of mixed PDFs, code, and notes — you want loci to
-build a memory graph over them, then a town-style visualization in VSCode for
-exploring it. This walks you all the way through.
+build a memory graph over them, then query it from the CLI or Claude Code.
+This walks you through a complete setup.
 
 We'll use a real example folder throughout: `~/Documents/codoc/` — three roots
 side-by-side under one parent:
@@ -16,115 +16,98 @@ side-by-side under one parent:
 
 You can substitute your own folder anywhere you see `codoc`.
 
-## The two pieces
-
-You're standing up two repos:
-
-- **`loci/`** — the server. Owns SQLite, the embedding model, the agent. Talks
-  HTTP/WS on `127.0.0.1:7077` and MCP over stdio.
-- **`loki-frontend/`** — a VSCode extension that opens a "Town" panel. Talks to
-  the loci server. *Optional* — everything works from the CLI; the extension
-  is a richer UI when you want one.
-
-You always start `loci` first. The extension connects to it.
-
 ## 0. Install loci
 
-loci targets Python 3.12+.
+loci requires Python 3.12+.
 
-### Option A — one-liner (recommended)
-
-**macOS / Linux:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/loci-knowledge/loci/main/install.sh | sh
-```
-
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/loci-knowledge/loci/main/install.ps1 | iex
-```
-
-Both scripts prefer [uv](https://docs.astral.sh/uv/) → [pipx](https://pipx.pypa.io/) → pip,
-installing loci into an isolated environment and putting `loci` on your PATH.
-
-### Option B — install from PyPI
+### Recommended — isolated install via uv
 
 ```bash
-# with uv (isolated, recommended)
 uv tool install loci
+```
 
-# with pipx
+Or with pipx / pip:
+
+```bash
 pipx install loci
-
-# with pip
 pip install --user loci
 ```
 
-### Option C — from source (development)
+After install, `loci` is on your PATH. Verify with:
+
+```bash
+loci --version
+loci doctor    # shows all resolved paths — useful for debugging
+```
+
+### From source (development / contributor)
 
 ```bash
 git clone https://github.com/loci-knowledge/loci.git
 cd loci
-uv sync                 # creates .venv with the runtime deps
-uv sync --extra dev     # add test/lint deps if you want to run pytest
+uv sync
+# all commands below work with `uv run loci <cmd>` from the repo root
 ```
 
-This installs `pydantic-ai-slim`, `sqlite-vec`, `sentence-transformers`,
-FastAPI, and friends. The first scan downloads the embedding model
-(`BAAI/bge-small-en-v1.5`, ~130 MB) into `~/.loci/models/`.
+## 1. First-run setup
 
-For Apple Silicon, MPS is auto-detected. For CUDA, set
-`LOCI_EMBEDDING_DEVICE=cuda`.
-
-## 1. Configure provider keys
-
-loci runs without LLM keys (retrieval, FTS, scan all work LLM-free), but the
-LLM-dependent features — drafting, kickoff, the silent reflection cycle, HyDE
-— degrade to no-ops. Set at least one provider key in `.env` at the repo
-root:
+Run the interactive setup wizard once:
 
 ```bash
-# .env (any one of these is enough; loci will pick whichever the model spec
-# points at — see step 1b)
+loci config init
+```
+
+This writes:
+- `~/.loci/.env` — your provider API keys (chmod 600, never committed)
+- `~/.loci/config.toml` — optional non-secret defaults (model IDs, weights)
+
+It walks you through adding at least one LLM provider key. loci works without
+keys for retrieval, scan, and FTS, but drafting, kickoff, and reflect need one.
+
+### Provider keys (manual)
+
+If you prefer to write the file yourself, `~/.loci/.env` format:
+
+```bash
+# At least one of these:
 OPENAI_API_KEY=sk-...
 OPENROUTER_API_KEY=sk-or-...
 ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional extras
+HF_TOKEN=hf_...          # needed for autoresearch sandbox
+S2_API_KEY=...           # raises Semantic Scholar rate limit
 ```
 
-### 1b. Pick your models (defaults are OpenAI)
+### Model overrides (optional)
 
-The four model roles default to:
+In `~/.loci/config.toml` or `~/.loci/.env`:
 
-```
-interpretation_model = openrouter:google/gemini-3-flash-preview  # builds + maintains the interp layer
-rag_model            = openrouter:google/gemini-3-flash-preview  # synthesises drafts
-classifier_model     = openrouter:deepseek/deepseek-v4-flash     # contradiction classifier in absorb
-hyde_model           = openrouter:deepseek/deepseek-v4-flash     # hypothetical-doc expansion
-```
-
-Override any of them in `.env`:
-
-```bash
-LOCI_INTERPRETATION_MODEL=openrouter:openai/gemini-3-flash-preview
-LOCI_RAG_MODEL=openrouter:google/gpt-5.5
+```toml
+# ~/.loci/config.toml
+loci_interpretation_model = "openai:gpt-4o-mini"
+loci_rag_model = "openrouter:anthropic/claude-opus-4.7"
+loci_classifier_model = "openrouter:deepseek/deepseek-v4-flash"
+loci_hyde_model = "openrouter:deepseek/deepseek-v4-flash"
 ```
 
 Full guide: [model-config.md](./model-config.md).
 
 ## 2. Create your project
 
-A project is a *view* over the global graph: a profile, the set of nodes
+A **project** is a *view* over the global graph: a profile, the set of nodes
 included, and the agent's voice anchor. One PDF can participate in many
 projects without duplication.
 
 ### Interactive wizard (recommended)
 
-When you run `loci project create <name>` from a terminal it launches a
-`create-next-app`-style setup wizard that walks you through every step:
+```bash
+loci project create codoc
+```
+
+The wizard walks you through every step:
 
 ```
-$ uv run loci project create codoc
-
 ╭─────────────────────────────────╮
 │ loci — personal memory graph    │
 │ Interactive project setup       │
@@ -157,10 +140,7 @@ $ uv run loci project create codoc
 ── Step 4  Review ──────────────────────────────────
   Apply, or change something?
   > Apply — create project and scan
-    Change name / slug
-    Change profile
-    Change workspace
-    Cancel
+    ...
 
 ── Applying ────────────────────────────────────────
   ✓ Project codoc created
@@ -168,318 +148,214 @@ $ uv run loci project create codoc
   ✓ Scan: 373 new, 0 deduped, 5 skipped
   ✓ Kickoff: 6 observations written
 
-Next: loci server  →  then open Loki Town in VSCode
+Next: loci server  →  then query with `loci retrieve codoc "..."`
 ```
 
-The fastest path to a working project: just supply your project folder as the
-workspace root and the wizard will add each subfolder as a labeled source.
+The fastest path to a working project: supply your project folder as the
+workspace root and the wizard adds each subfolder as a labeled source.
 
 Other wizard entry points:
-- **Resume / edit** a project: `loci project create codoc` if `codoc` is
-  taken offers to edit instead.
-- **Manage all projects**: `loci project manage` — arrow-key menu to
-  create, edit, or delete any project.
-
-The wizard adapts to what you've already set up:
-- If you choose not to set up a workspace, scan and kickoff steps are skipped.
-- If kickoff is skipped (no raws yet), it prints the command to re-run after
-  scanning.
+- **Manage all projects**: `loci project manage` — arrow-key menu.
 
 ### Non-interactive (scripted) setup
 
-Pass `--yes` to bypass the wizard and create the project directly:
+Pass `--yes` to bypass the wizard:
 
 ```bash
-uv run loci project create codoc \
+loci project create codoc \
   --name "Code-as-Document" \
-  --profile /tmp/codoc-profile.md \
+  --profile /path/to/codoc-profile.md \
   --yes
 # → created codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
 ```
 
 The profile is the seed for kickoff and the agent's "what are we doing
-here?" prompt. Keep it 50–300 words and write it from the user's
-perspective — what you want from loci, not a description of the files.
-
-```bash
-cat > /tmp/codoc-profile.md <<'EOF'
-# codoc — research project
-
-I'm investigating how documentation, code, and notes intermix in real
-codebases — especially for tools that bridge code and natural language
-(deepwiki-open, codenav-vscode), with the goal of designing better
-"code-as-document" UX.
-
-The vault has three roots, organised by *modality*:
-- `papers/` — published research I'm drawing on (PDFs).
-- `code/`   — open-source projects I'm reading and learning from.
-- `notes/`  — my own working notes, including a paper-in-progress.
-
-What I want from loci:
-1. Surface conceptual links across modalities — e.g. how a UIST paper's
-   claim about navigation relates to a specific function in the code, or
-   how my own RR plan responds to a reviewer point.
-2. When I draft new text, cite spans inside files, not just file names.
-3. Build interpretations that compress how I actually think about this
-   work — not summaries of every paper.
-
-Style: concise, technical. Prefer interpretations as short claims with
-evidence pointers, not prose blurbs.
-EOF
-```
-
-Save the ULID from `project create` — the frontend uses it. (You can always
-look it up later with `uv run loci project list`.)
+here?" prompt. Keep it 50–300 words, written from your perspective — what you
+want from loci, not a description of the files.
 
 ## 3. Create a workspace and add sources
 
 > **If you used the wizard** (step 2) and linked an existing workspace, you
-> can skip this step — your workspace is already linked and scanned. Come
-> back here if you want to add more source roots or link a second workspace.
+> can skip this step.
 
-A **workspace** is a named collection of source roots. It sits between your
-filesystem and a project, so the same scanned files can serve multiple
-projects without re-scanning.
+A **workspace** is a named collection of source roots. The same scanned files
+can serve multiple projects without re-scanning.
 
 ```bash
-uv run loci workspace create codoc-ws \
-  --name "Codoc sources" \
-  --kind mixed
+loci workspace create codoc-ws --name "Codoc sources" --kind mixed
 ```
 
-`kind` is one of `papers | codebase | notes | transcripts | web | mixed`. Use
-`mixed` when a workspace spans more than one modality (as in our case).
+`kind` is one of `papers | codebase | notes | transcripts | web | mixed`.
 
-Now register the three roots:
+Register the roots:
 
 ```bash
-uv run loci workspace add-source codoc-ws ~/Documents/codoc/papers --label papers
-uv run loci workspace add-source codoc-ws ~/Documents/codoc/code   --label code
-uv run loci workspace add-source codoc-ws ~/Documents/codoc/notes  --label notes
+loci workspace add-source codoc-ws ~/Documents/codoc/papers --label papers
+loci workspace add-source codoc-ws ~/Documents/codoc/code   --label code
+loci workspace add-source codoc-ws ~/Documents/codoc/notes  --label notes
 ```
 
 Supported file types: PDF, Markdown, plain text, RST/org, HTML, transcripts
-(VTT/SRT), and ~30 source-code extensions. See [sources.md](./sources.md)
-for the full list and high-quality PDF parsing via marker.
+(VTT/SRT), and ~30 source-code extensions. See [sources.md](./sources.md).
 
 ## 4. Link the workspace to your project
 
 ```bash
-uv run loci workspace link codoc-ws codoc --role primary
+loci workspace link codoc-ws codoc --role primary
 ```
 
-Roles: `primary` (the workspace's content drives this project's context),
-`reference` (supplementary; included but weighted lower), or `excluded`
-(explicitly suppressed). A project can link multiple workspaces — one might
-be `primary`, others `reference`.
-
-Linking with `--role primary` automatically enqueues a `relevance` job that
-does a focused single-pass synthesis for the workspace↔project pair. This
-runs in the background; you can proceed without waiting for it.
-
-> **Tip — sharing a workspace across projects.** If you have a second project
-> that should see the same raws (say, a `codoc-review` project a colleague is
-> using), just link the same workspace there:
-> ```bash
-> uv run loci workspace link codoc-ws codoc-review --role reference
-> ```
-> The workspace is scanned once and both projects see the same raw nodes via
-> the `project_effective_members` view — no re-scanning, no duplication.
+Roles: `primary` (drives the project's context), `reference` (supplementary),
+or `excluded`. A project can link multiple workspaces.
 
 ## 5. Scan
 
 ```bash
-uv run loci workspace scan codoc-ws
+loci workspace scan codoc-ws
 ```
 
-This walks every source registered to the workspace, content-hashes each
-file, deduplicates against the global raw store, extracts text, batches
-embeddings through the local model, and writes one `RawNode` per file.
-Sample output:
-
-```
-{
-  'scanned': 131, 'new_raw': 131, 'deduped': 0,
-  'members_added': 131, 'errors': []
-}
-```
-
-Re-run `loci workspace scan codoc-ws` whenever you add files — it's
-idempotent. Files already present (by content hash) are skipped without
-re-extraction. Because the workspace is linked to the project, newly scanned
-nodes immediately become part of `codoc`'s effective members.
+Walks every source root, content-hashes each file, deduplicates against the
+global store, extracts text, embeds, writes one `RawNode` per file.
+Re-run whenever you add files — it's idempotent.
 
 ## 6. Kickoff: seed the interpretation graph
 
-Kickoff reads your profile + a sample of the raws and generates 5–8
-*relationship observations* — `relevance`, `philosophy`, and `decision`
-nodes that capture **how the workspace content connects to the project's
-goals**. They land at confidence 0.5, directly into the live graph.
-
-Unlike open questions, these seed the graph with actionable observations:
-"these codebases show the server-as-CLI pattern this project needs" is more
-useful on day one than "what should the CLI look like?"
-
 ```bash
-uv run loci kickoff codoc --n 6
-# → result: { 'skipped': false, 'observations_written': 6,
-#            'model': 'openrouter:google/gemini-3-flash-preview' }
+loci kickoff codoc --n 6
 ```
 
-The observations show up in retrieval immediately alongside raw sources.
+Reads your profile + a sample of the raws and generates 5–8 relationship
+observations (`relevance`, `philosophy`, `decision` nodes). They appear in
+retrieval immediately.
 
-Note: if the `relevance` job from the workspace link (step 4) has not yet
-finished, kickoff will still work — it draws from whatever raws are already
-scanned.
-
-## 7. Draft something
-
-Now the high-leverage operation. Ask loci to write something using your
-sources:
+## 7. Start the server
 
 ```bash
-uv run loci draft codoc \
-  "Synthesize what CoDoc, codenav-vscode, and Knuth's literate programming
-   each say about the relation between code and prose. Where do they agree,
-   where do they diverge?" \
+loci server
+# → worker thread started
+# → Uvicorn running on http://127.0.0.1:7077
+# → logs: ~/.loci/logs/loci.log
+```
+
+The HTTP API is at `http://127.0.0.1:7077/docs`.
+
+## 8. Retrieve and draft
+
+```bash
+# retrieval with routing trace
+loci retrieve codoc "what is the rotary embedding insight?"
+
+# cited markdown draft
+loci draft codoc \
+  "Synthesize what CoDoc and Knuth's literate programming say about
+   code and prose. Where do they agree?" \
   --k 12
 ```
 
-You'll get markdown with inline `[C1]`, `[C2]`, … citations that map to
-specific nodes (PDFs, code files, notes), followed by a `citations[]` block.
-Each citation includes the node id, kind, title, and *why* it was retrieved
-(which signals matched).
+Draft output includes inline `[C1]`, `[C2]`, … citations that map to specific
+nodes, followed by a `citations[]` block. After each draft, a `reflect` job
+auto-enqueues silently.
 
-**While you read the draft**, a `reflect` job auto-enqueues. The agent reads
-your task + the citations the draft used, and (silently, in the worker
-thread) decides whether to add new interpretation nodes, reinforce existing
-ones, or soften ones that didn't help. Background; non-blocking.
+## 9. MCP integration (Claude Code)
 
-By the time you come back tomorrow, the graph has a few new live
-interpretation nodes you didn't write. See [agent.md](./agent.md) for what
-the agent is allowed to do.
-
-## 8. Close the alignment loop with feedback
-
-If you edit the draft (kept these citations, dropped those, rewrote the
-sentence around C2…) and submit your edit:
+Register loci as a global MCP server once:
 
 ```bash
-loci feedback <response_id> /path/to/your-edit.md
+claude mcp add loci --transport stdio --scope user -- loci mcp
 ```
 
-loci diffs the `[Cn]` markers, emits per-citation traces (kept / dropped /
-replaced), then enqueues a follow-up reflection that aligns the
-interpretation layer with how you actually used the draft. Citations you
-kept reinforce the underlying nodes; ones you dropped soften them.
+### Project auto-resolution
 
-This is the core alignment loop. Three or four cycles in, the agent's voice
-starts to sound like yours.
+MCP tools need to know which loci project to work on. Three options:
 
-## 9. Start the server
-
-For the VSCode extension, MCP clients, or the REST API, run the server:
+**Option A — bind the directory** (git-trackable)
 
 ```bash
-uv run loci server
-# → worker thread started
-# → Uvicorn running on http://127.0.0.1:7077
+cd ~/Documents/my-research
+loci project bind codoc   # writes .loci/project.toml here
 ```
 
-The HTTP API is at `http://127.0.0.1:7077/docs` (FastAPI auto-generated).
+MCP tools walk up the directory tree to find `.loci/project.toml`.
 
-For Claude Code MCP integration:
+**Option B — pin for the session**
 
 ```bash
-uv run loci mcp        # stdio transport — Claude subprocesses this
+loci current set codoc    # writes ~/.loci/state/current
+loci current show         # verify
+loci current clear        # unpin
 ```
 
-To use loci from **any project directory** in Claude Code, add a `.mcp.json`
-to that project:
+**Option C — per-workspace `.mcp.json`** (pin for a specific workspace)
 
 ```json
 {
   "mcpServers": {
     "loci": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--project", "/path/to/loci", "loci", "mcp"]
+      "command": "loci",
+      "args": ["mcp"],
+      "env": { "LOCI_PROJECT": "codoc" }
     }
   }
 }
 ```
 
-Then bind the project so MCP tools know which loci project to use:
-
-```bash
-# from inside your project directory:
-loci project bind codoc   # writes .loci/project in the cwd
-```
-
-MCP tools walk up the directory tree to find `.loci/project`. You can also set
-`LOCI_PROJECT=codoc` as an environment variable, or pass `project=` explicitly
-in each tool call.
-
-The loci repo itself ships `.mcp.json` and `CLAUDE.md` so Claude Code picks it
-up automatically when you open the loci directory.
+Also works: pass `project=` explicitly per call, or set `LOCI_PROJECT` env var.
 
 ## 10. Connect the VSCode extension (loki-frontend)
 
-The extension lives in a separate repo. Once the loci server is running on
-127.0.0.1:7077, the extension picks it up automatically.
+Once `loci server` is running on `127.0.0.1:7077`, the loki-frontend VSCode
+extension connects automatically. Full guide: [frontend.md](./frontend.md).
+
+## 11. Maintenance: reflect + absorb
+
+Periodically run a reflect+absorb cycle to consolidate:
 
 ```bash
-git clone https://github.com/<you>/loki-frontend.git
-cd loki-frontend
-npm install
-npm run build       # builds extension/ + webview/
+loci reflect codoc --absorb
 ```
 
-Then open the `loki-frontend` folder in VSCode and press F5 to launch the
-Extension Development Host. In the new window:
-
-1. Cmd+Shift+P → **"Loci: Open Town"**.
-2. The first time, you get a project picker — select **Code-as-Document**
-   (or whatever you slugged your project as). Selection is remembered in
-   workspace settings.
-3. The Town panel opens. The webview subscribes via WebSocket and renders
-   nodes as villagers, communities as districts, pinned interpretations on
-   pedestals, and traces as villager animations (walking to the council
-   plaza when a citation fires).
-
-Configure the server URL or pre-pin a project in VSCode settings:
-
-```jsonc
-{
-  "lokiTown.serverUrl": "http://127.0.0.1:7077",
-  "lokiTown.projectId": "01KQ2AGY2T146QMDSF5QMFVJ7A"
-}
-```
-
-Full extension guide: [frontend.md](./frontend.md).
-
-## 11. Maintain: reflect + absorb (occasionally)
-
-Every ~30 sessions or once a week, run a reflect+absorb cycle to consolidate:
-
-```bash
-uv run loci reflect codoc --absorb
-```
-
-This runs absorb first (housekeeping), then a reflection pass. What absorb does:
-
+What absorb does:
 - replays trace logs into `access_count` / `confidence`
-- audits orphan nodes, broken `cites` (raws gone missing), bloat
-- alias-detection over interpretation nodes (cosine > 0.92 → propose merge)
-- forgetting candidates (no access in N days + low confidence)
-- contradiction pass (LLM-mediated; needs an API key)
-- community detection (Leiden; needs `loci[graph]` extra)
+- audits orphan nodes, broken citations, bloat
+- alias-detection (cosine > 0.92 → propose merge)
+- forgetting candidates (inactive + low confidence)
+- contradiction pass (LLM-mediated)
+- community detection (needs `loci[graph]` extra)
+
+## Storage reference
+
+All user data lives under `~/.loci/`:
+
+```
+~/.loci/
+  loci.sqlite          # the graph (nodes, edges, projects, workspaces, jobs, traces)
+  blobs/               # content-addressed raw file bytes
+  models/              # embedding model (~130 MB, downloaded on first scan)
+  assets/              # D3 cache for graph export
+  logs/loci.log        # rotating application log (10 MB × 5)
+  exports/             # default `loci graph export` output
+  research/            # autoresearch artifacts (fallback)
+  state/current        # pinned project slug for MCP sessions
+  .env                 # provider keys (chmod 600)
+  config.toml          # non-secret defaults
+  version.json         # layout version stamp
+```
+
+Per-repo binding (committed to git if desired):
+
+```
+<your-repo>/.loci/
+  project.toml         # { slug = "...", created_at = "..." }
+  .gitignore           # auto-generated
+  views/graph.json     # optional: loci export snapshot
+  views/memo.md        # optional: loci export snapshot
+  research/<run_id>/   # autoresearch artifacts (preferred over ~/.loci/research/)
+```
 
 ## What's next
 
-- [frontend.md](./frontend.md) — the VSCode extension in depth.
-- [agent.md](./agent.md) — what the silent reflection cycle actually does
-  to your graph.
+- [frontend.md](./frontend.md) — the VSCode extension.
+- [agent.md](./agent.md) — what the silent reflection cycle does to your graph.
 - [architecture.md](./architecture.md) — the three layers; how files flow.
 - [model-config.md](./model-config.md) — picking provider/model per task.
 - [sources.md](./sources.md) — file format support, marker setup.

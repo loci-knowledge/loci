@@ -1,10 +1,12 @@
 """Runtime settings for loci.
 
-All settings are sourced (in order) from:
+All settings are sourced (in order of precedence — first wins) from:
 
 1. Environment variables prefixed `LOCI_` (e.g. `LOCI_DATA_DIR=/tmp/loci`).
 2. A `.env` file in the working directory.
-3. The defaults below.
+3. A `.env` file at `~/.loci/.env` (per-install defaults).
+4. A `config.toml` file at `~/.loci/config.toml` (declarative install config).
+5. The defaults below.
 
 The single source of truth is the `Settings` instance returned by `get_settings()`.
 We expose it as a function (not a module-level constant) so tests can override
@@ -17,13 +19,16 @@ from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="LOCI_",
-        env_file=".env",
+        # Order matters: pydantic-settings loads files left-to-right and the
+        # *last* loaded file wins. By placing `~/.loci/.env` first and `.env`
+        # second, the cwd `.env` overrides the per-install one.
+        env_file=[str(Path.home() / ".loci" / ".env"), ".env"],
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -148,11 +153,54 @@ class Settings(BaseSettings):
     def model_cache_dir(self) -> Path:
         return self.data_dir / "models"
 
+    @property
+    def logs_dir(self) -> Path:
+        return self.data_dir / "logs"
+
+    @property
+    def exports_dir(self) -> Path:
+        return self.data_dir / "exports"
+
+    @property
+    def research_dir(self) -> Path:
+        return self.data_dir / "research"
+
+    @property
+    def assets_dir(self) -> Path:
+        return self.data_dir / "assets"
+
+    @property
+    def state_dir(self) -> Path:
+        return self.data_dir / "state"
+
     def ensure_dirs(self) -> None:
         """Create storage directories if missing. Safe to call repeatedly."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self.model_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.exports_dir.mkdir(parents=True, exist_ok=True)
+        self.research_dir.mkdir(parents=True, exist_ok=True)
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        from pydantic_settings import TomlConfigSettingsSource
+        toml_path = Path.home() / ".loci" / "config.toml"
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            TomlConfigSettingsSource(settings_cls, toml_file=str(toml_path)),
+        )
 
     # --- Helpers --------------------------------------------------------
     def secret(self, name: str) -> str | None:

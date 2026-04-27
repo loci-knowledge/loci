@@ -73,10 +73,10 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
             "register one with `loci workspace add-source` first.",
         )
 
-    base_root = Path(sources[0].root_path)
-    base_root.mkdir(parents=True, exist_ok=True)
     run_id = new_id()[:8]
-    output_dir = base_root / "research" / run_id
+    from loci.jobs.research_paths import resolve_research_output_dir, resolve_research_source_root
+    output_dir = resolve_research_output_dir(run_id)
+    research_root = resolve_research_source_root(run_id)
 
     settings = get_settings()
     enable_sandbox = bool(payload.get("sandbox", False))
@@ -127,6 +127,9 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
 
     if job_id:
         set_progress(conn, job_id, 0.7)
+
+    # Ensure the research output dir is a registered source so scan_workspace picks it up.
+    _ensure_research_source(conn, workspace_id, research_root)
 
     # The agent has written artifacts under `output_dir`. Re-scan the workspace
     # so the new files become raw nodes; existing files are deduped by content
@@ -267,3 +270,24 @@ def _create_summary_locus(
             log.warning("autoresearch: cites edge failed (%s → %s): %s", locus.id, raw_id, exc)
 
     return locus.id
+
+
+def _ensure_research_source(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    research_root: Path,
+) -> None:
+    """Register research_root as a workspace source if not already present."""
+    root_str = str(research_root.resolve())
+    existing = conn.execute(
+        "SELECT id FROM workspace_sources WHERE workspace_id = ? AND root_path = ?",
+        (workspace_id, root_str),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO workspace_sources (id, workspace_id, root_path) "
+            "VALUES (?, ?, ?)",
+            (new_id(), workspace_id, root_str),
+        )
+        conn.commit()
+        log.info("autoresearch: registered research source root %s", root_str)
