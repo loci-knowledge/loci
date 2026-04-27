@@ -54,7 +54,7 @@ class _ParsedSpec:
     name: str      # provider-specific model name
 
 
-def parse_spec(spec: str) -> _ParsedSpec:
+def _parse_spec(spec: str) -> _ParsedSpec:
     """Parse `provider:model_name`. Raises ValueError on malformed input."""
     if ":" not in spec:
         raise ValueError(
@@ -72,11 +72,11 @@ def parse_spec(spec: str) -> _ParsedSpec:
     return _ParsedSpec(provider=provider, name=name)
 
 
-def has_credentials_for(spec: str, settings: Settings | None = None) -> bool:
+def _has_credentials_for(spec: str, settings: Settings | None = None) -> bool:
     """Return True if the configured API key for `spec`'s provider is present."""
     settings = settings or get_settings()
     try:
-        parsed = parse_spec(spec)
+        parsed = _parse_spec(spec)
     except ValueError:
         return False
     key_field = {
@@ -110,7 +110,7 @@ def build_agent(
     Raises LLMNotConfiguredError if the provider's API key is missing.
     """
     settings = settings or get_settings()
-    parsed = parse_spec(spec)
+    parsed = _parse_spec(spec)
     model = _build_model(parsed, settings)
     model_settings = _build_model_settings(parsed, settings, enable_cache)
     return Agent(

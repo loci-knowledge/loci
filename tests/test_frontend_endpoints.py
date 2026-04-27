@@ -60,7 +60,11 @@ def test_pinned_returns_pinned_node_ids(loci_dir, fake_embedder, tmp_path):
     (src / "x.md").write_text("alpha bravo charlie")
     with TestClient(create_app()) as c:
         pid = c.post("/projects", json={"slug": "p", "name": "P"}).json()["id"]
-        c.post(f"/projects/{pid}/sources/scan", json={"root": str(src)})
+        ws = c.post("/workspaces", json={"slug": "ws-p", "name": "P"}).json()
+        ws_id = ws["id"]
+        c.post(f"/workspaces/{ws_id}/sources", json={"root": str(src)})
+        c.post(f"/projects/{pid}/workspaces/{ws_id}", json={"role": "primary"})
+        c.post(f"/workspaces/{ws_id}/scan")
 
         r = c.get(f"/projects/{pid}/pinned")
         assert r.status_code == 200
@@ -230,7 +234,11 @@ def test_retrieve_falls_back_to_active_anchors(loci_dir, fake_embedder, tmp_path
 
     with TestClient(create_app()) as c:
         pid = c.post("/projects", json={"slug": "p", "name": "P"}).json()["id"]
-        c.post(f"/projects/{pid}/sources/scan", json={"root": str(src)})
+        ws = c.post("/workspaces", json={"slug": "ws-p", "name": "P"}).json()
+        ws_id = ws["id"]
+        c.post(f"/workspaces/{ws_id}/sources", json={"root": str(src)})
+        c.post(f"/projects/{pid}/workspaces/{ws_id}", json={"role": "primary"})
+        c.post(f"/workspaces/{ws_id}/scan")
 
         # Pre-set active anchors.
         anchor_id = "01" + "Y" * 24
@@ -303,7 +311,11 @@ def test_publish_trace_on_pin(loci_dir, fake_embedder, tmp_path):
         (src / "x.md").write_text("alpha")
         with TestClient(create_app()) as c:
             pid = c.post("/projects", json={"slug": "p", "name": "P"}).json()["id"]
-            c.post(f"/projects/{pid}/sources/scan", json={"root": str(src)})
+            ws = c.post("/workspaces", json={"slug": "ws-p", "name": "P"}).json()
+            ws_id = ws["id"]
+            c.post(f"/workspaces/{ws_id}/sources", json={"root": str(src)})
+            c.post(f"/projects/{pid}/workspaces/{ws_id}", json={"role": "primary"})
+            c.post(f"/workspaces/{ws_id}/scan")
             ids = [n["id"] for n in c.post(
                 f"/projects/{pid}/retrieve", json={"query": "alpha"}
             ).json()["nodes"]]

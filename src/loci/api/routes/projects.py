@@ -1,19 +1,12 @@
-"""Project endpoints + ingest endpoints (sources scan).
+"""Project endpoints.
 
-PLAN.md §API §Ingest and project setup:
-
+Routes:
     GET  /projects                       list (most-recently-active first)
     POST /projects
-    POST /projects/:id/sources
-    POST /projects/:id/sources/scan
     GET  /projects/:id
     PATCH /projects/:id/profile
     GET  /projects/:id/pinned            pinned node ids
     GET  /projects/:id/communities       latest community snapshot
-
-The latter three exist for the planned VSCode extension (loki-frontend), which
-needs a project picker, a stability hint for graph layout, and the community
-labels for districting.
 """
 
 from __future__ import annotations
@@ -22,18 +15,12 @@ import calendar
 import json
 import sqlite3
 from datetime import datetime
-from pathlib import Path as PPath
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from loci.api.dependencies import db, project_by_id
-from loci.graph.models import Project, Workspace
+from loci.graph.models import Project
 from loci.graph.projects import ProjectRepository
-from loci.graph.workspaces import WorkspaceRepository
-from loci.ingest import scan_path
-from loci.ingest.content_hash import hash_file
-from loci.ingest.extractors import extract
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -53,23 +40,6 @@ class CreateProject(BaseModel):
 class UpdateProfile(BaseModel):
     profile_md: str
 
-
-class RegisterSource(BaseModel):
-    """Register a single path or URL for ingest. Returns content_hash on success."""
-    path: str  # absolute path or file:// URL
-
-
-class ScanRequest(BaseModel):
-    root: str  # absolute path to walk
-
-
-class ScanResponse(BaseModel):
-    scanned: int
-    new_raw: int
-    deduped: int
-    skipped: int
-    members_added: int
-    errors: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -286,63 +256,3 @@ def update_profile(
     return {"updated": True}
 
 
-@router.post("/{project_id}/sources", status_code=status.HTTP_201_CREATED)
-def register_source(
-    body: RegisterSource,
-    project: Project = Depends(project_by_id),
-    conn: sqlite3.Connection = Depends(db),
-) -> dict:
-    """Register a single file. Returns the content hash + node id.
-
-    For directory walks, use /sources/scan instead — it's batched and idempotent.
-    """
-    p = PPath(body.path).expanduser().resolve()
-    if not p.is_file():
-        raise HTTPException(400, detail=f"not a file: {p}")
-    full, trunc, _size = hash_file(p)
-    extracted = extract(p)
-    if extracted is None:
-        raise HTTPException(415, detail=f"unsupported file type: {p.suffix}")
-    ws_id = _primary_workspace_id(conn, project)
-    res = scan_path(conn, ws_id, p)
-    return {
-        "content_hash": trunc,
-        "full_hash": full,
-        "result": res.__dict__,
-    }
-
-
-@router.post("/{project_id}/sources/scan")
-def scan_sources(
-    body: ScanRequest,
-    project: Project = Depends(project_by_id),
-    conn: sqlite3.Connection = Depends(db),
-) -> ScanResponse:
-    root = PPath(body.root).expanduser().resolve()
-    if not root.exists():
-        raise HTTPException(404, detail=f"root not found: {root}")
-    ws_id = _primary_workspace_id(conn, project)
-    res = scan_path(conn, ws_id, root)
-    return ScanResponse(**res.__dict__)
-
-
-def _primary_workspace_id(conn: sqlite3.Connection, project: Project) -> str:
-    """Return (creating if needed) the primary workspace id for a project.
-
-    Legacy scan endpoints route through the workspace abstraction by resolving
-    the project to its auto-created primary workspace.
-    """
-    ws_repo = WorkspaceRepository(conn)
-    links = ws_repo.linked_workspaces(project.id)
-    for ws, link in links:
-        if link.role == "primary":
-            return ws.id
-    # Auto-create a primary workspace for this project.
-    slug = f"ws-{project.slug}"
-    ws = ws_repo.get_by_slug(slug)
-    if ws is None:
-        ws = Workspace(slug=slug, name=project.name, kind="mixed",
-                       description_md=f"Primary workspace for project '{project.name}'.")
-        ws_repo.create(ws)
-    ws_repo.link_project(project.id, ws.id, role="primary")
-    return ws.id

@@ -3,7 +3,7 @@
 API:
     enqueue(conn, kind, project_id, payload)            → job_id
     claim_one(conn) → row | None                        atomic claim
-    set_progress(conn, job_id, progress, msg=None)      progress updates
+    set_progress(conn, job_id, progress)                 progress updates
     mark_done(conn, job_id, result)                     terminal
     mark_failed(conn, job_id, error)                    terminal
     get_job(conn, job_id) → dict | None                 read
@@ -80,16 +80,10 @@ def claim_one(conn: sqlite3.Connection) -> dict | None:
 
 def set_progress(
     conn: sqlite3.Connection, job_id: str, progress: float,
-    *, message: str | None = None,
 ) -> None:
-    """0.0 ≤ progress ≤ 1.0. Optionally publish a message to the job channel."""
+    """0.0 ≤ progress ≤ 1.0."""
     progress = max(0.0, min(1.0, progress))
     conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (progress, job_id))
-    if message is not None:
-        # Pubsub publish is async; we publish only when called from an async
-        # context. For sync workers, the message is dropped here — they can
-        # instead call `pubsub.bus.publish` directly when running async.
-        pass
 
 
 def append_job_step(

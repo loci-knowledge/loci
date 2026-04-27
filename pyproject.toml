@@ -101,7 +101,7 @@ dev = [
 ]
 
 [project.scripts]
-loci = "loci.cli:main"
+loci = "loci.ui.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/loci-knowledge/loci"

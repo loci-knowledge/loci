@@ -22,16 +22,12 @@ breakdown on each routing locus.
 
 from __future__ import annotations
 
-import sqlite3
-
 from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel
 
 from loci.api.dependencies import db, project_by_id
 from loci.api.publishers import publish_trace_run
-from loci.citations import CitationTracker, ResponseRecord
 from loci.graph.models import Project, now_iso
-from loci.retrieve import RetrievalRequest, Retriever
 
 router = APIRouter(prefix="/projects", tags=["retrieve"])
 
@@ -109,32 +105,18 @@ def post_retrieve(
     user_agent: str = Header("unknown"),
 ) -> RetrieveResponseBody:
     from loci.api.routes.anchors import get_active_anchors
+    from loci.usecases.retrieve import run_retrieve
 
     anchors = (
         get_active_anchors(project.id) if body.anchors is None
         else list(body.anchors)
     )
-
-    req = RetrievalRequest(
-        project_id=project.id,
-        query=body.query,
-        k=body.k,
-        anchors=anchors,
-        include=body.include,
-        hyde=body.hyde,
+    result = run_retrieve(
+        conn, project_id=project.id, query=body.query, k=body.k,
+        anchors=anchors, hyde=body.hyde, include=body.include,
+        session_id=body.session_id, client=user_agent,
     )
-    resp = Retriever(conn).retrieve(req)
-    record = ResponseRecord(
-        project_id=project.id, session_id=body.session_id,
-        request=body.model_dump(),
-        output="",
-        cited_node_ids=[],
-        trace_table=resp.trace_table,
-        client=user_agent,
-    )
-    rid = CitationTracker(conn).write_response(
-        record, retrieved_node_ids=[n.node_id for n in resp.nodes],
-    )
+    resp = result.response
     routing_loci_out = [
         RoutingLocusOut(
             id=ri.node_id, subkind=ri.subkind, title=ri.title,
@@ -148,52 +130,35 @@ def post_retrieve(
         for ri in resp.routing_interps
     ]
     publish_trace_run(
-        project.id,
-        response_id=rid,
-        session_id=body.session_id,
-        query=body.query,
-        ts=now_iso(),
+        project.id, response_id=result.trace_id, session_id=body.session_id,
+        query=body.query, ts=now_iso(),
         routing_loci=[loc.model_dump() for loc in routing_loci_out],
-        trace_table=resp.trace_table,
-        k=body.k,
+        trace_table=resp.trace_table, k=body.k,
     )
-    from loci.retrieve.effects import (
-        maybe_enqueue_retrieve_reflect,
-        pending_effects_from_reflect,
-    )
-    reflect_job_id = maybe_enqueue_retrieve_reflect(conn, project.id, rid)
-    pending = [
-        PendingEffectOut(**e)
-        for e in pending_effects_from_reflect(reflect_job_id, trigger="retrieve")
-    ]
     return RetrieveResponseBody(
         nodes=[
             RetrieveNodeOut(
                 id=n.node_id, kind=n.kind, subkind=n.subkind, title=n.title,
                 snippet=n.snippet, score=n.score, why=n.why,
-                trace=[
-                    {"id": h.src, "edge": h.edge_type, "to": h.dst}
-                    for h in n.trace
-                ],
+                trace=[{"id": h.src, "edge": h.edge_type, "to": h.dst} for h in n.trace],
             )
             for n in resp.nodes
         ],
         routing_loci=routing_loci_out,
         trace_table=resp.trace_table,
         trace_narrative=resp.trace_narrative,
-        pending_effects=pending,
+        pending_effects=[PendingEffectOut(**e) for e in result.pending_effects],
         pruned_loci=(
             [
                 PrunedLocusOut(
                     id=pl.node_id, subkind=pl.subkind, title=pl.title,
-                    score=pl.score, reason=pl.reason,
-                    channel_ranks=pl.channel_ranks,
+                    score=pl.score, reason=pl.reason, channel_ranks=pl.channel_ranks,
                 )
                 for pl in resp.pruned_loci
             ]
             if body.verbose else []
         ),
-        trace_id=rid,
+        trace_id=result.trace_id,
     )
 
 

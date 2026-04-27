@@ -121,23 +121,16 @@ def post_draft(
     user_agent: str = Header("unknown"),
 ) -> DraftResponseBody:
     from loci.api.routes.anchors import get_active_anchors
-    from loci.draft import DraftRequest, draft
+    from loci.retrieve.effects import pending_effects_from_reflect
+    from loci.usecases.draft import run_draft
 
     anchors = list(body.anchors) if body.anchors is not None else get_active_anchors(project.id)
-
-    req = DraftRequest(
-        project_id=project.id,
-        session_id=body.session_id,
-        instruction=body.instruction,
-        context_md=body.context_md,
-        anchors=anchors,
-        style=body.style,  # type: ignore[arg-type]
-        cite_density=body.cite_density,  # type: ignore[arg-type]
-        hyde=body.hyde,
-        k=body.k,
-        client=user_agent,
+    result = run_draft(
+        conn, project_id=project.id, instruction=body.instruction,
+        context_md=body.context_md, anchors=anchors, style=body.style,
+        cite_density=body.cite_density, hyde=body.hyde, k=body.k,
+        session_id=body.session_id, client=user_agent,
     )
-    result = draft(conn, req)
     routing_loci_out = [
         RoutingLocusOut(
             id=rl.node_id, subkind=rl.subkind, title=rl.title,
@@ -151,16 +144,11 @@ def post_draft(
         for rl in result.routing_loci
     ]
     publish_trace_run(
-        project.id,
-        response_id=result.response_id,
-        session_id=body.session_id,
-        query=body.instruction,
-        ts=now_iso(),
+        project.id, response_id=result.response_id, session_id=body.session_id,
+        query=body.instruction, ts=now_iso(),
         routing_loci=[loc.model_dump() for loc in routing_loci_out],
-        trace_table=result.trace_table,
-        k=body.k,
+        trace_table=result.trace_table, k=body.k,
     )
-    from loci.retrieve.effects import pending_effects_from_reflect
     pending = [
         PendingEffectOut(**e)
         for e in pending_effects_from_reflect(result.reflect_job_id, trigger="draft")
@@ -203,16 +191,15 @@ async def post_draft_stream(
     user_agent: str = Header("unknown"),
 ) -> StreamingResponse:
     from loci.api.routes.anchors import get_active_anchors
-    from loci.draft import DraftRequest, draft
+    from loci.usecases.draft import run_draft
 
     anchors = list(body.anchors) if body.anchors is not None else get_active_anchors(project.id)
-    req = DraftRequest(
-        project_id=project.id, session_id=body.session_id,
-        instruction=body.instruction, context_md=body.context_md,
-        anchors=anchors, style=body.style, cite_density=body.cite_density,
-        hyde=body.hyde, k=body.k, client=user_agent,
+    result = run_draft(
+        conn, project_id=project.id, instruction=body.instruction,
+        context_md=body.context_md, anchors=anchors, style=body.style,
+        cite_density=body.cite_density, hyde=body.hyde, k=body.k,
+        session_id=body.session_id, client=user_agent,
     )
-    result = draft(conn, req)
     _routing_loci_dicts_s = [
         {
             "id": rl.node_id, "subkind": rl.subkind, "title": rl.title,

@@ -185,9 +185,6 @@ UNICODE_MAP = {
     "\\u200b": "", "\\ufeff": "",
 }
 
-def _normalize_unicode(s):
-    return "".join(UNICODE_MAP.get(c, c) for c in s)
-
 def _fuzzy_find_original(content, pattern):
     if pattern in content:
         return pattern, None
@@ -208,8 +205,8 @@ def _fuzzy_find_original(content, pattern):
         n_lines = p_st.count("\\n") + 1
         matched = "\\n".join(c_lines[start_line:start_line + n_lines])
         return matched, "(matched after trimming whitespace)"
-    c_norm = _normalize_unicode(c_st)
-    p_norm = _normalize_unicode(p_st)
+    c_norm = "".join(UNICODE_MAP.get(c, c) for c in c_st)
+    p_norm = "".join(UNICODE_MAP.get(c, c) for c in p_st)
     if p_norm in c_norm:
         idx = c_norm.index(p_norm)
         start_line = c_norm[:idx].count("\\n")

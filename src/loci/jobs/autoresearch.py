@@ -93,7 +93,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     job_id = payload.get("__job_id")  # optional progress hook (worker doesn't pass this)
 
     if job_id:
-        set_progress(conn, job_id, 0.05, message="starting research agent")
+        set_progress(conn, job_id, 0.05)
 
     def _on_step(tool_name: str, msg: str) -> None:
         if job_id:
@@ -126,7 +126,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
         }
 
     if job_id:
-        set_progress(conn, job_id, 0.7, message="ingesting artifacts")
+        set_progress(conn, job_id, 0.7)
 
     # The agent has written artifacts under `output_dir`. Re-scan the workspace
     # so the new files become raw nodes; existing files are deduped by content
@@ -157,7 +157,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     artifact_node_ids: list[str] = [r["id"] for r in rows]
 
     if job_id:
-        set_progress(conn, job_id, 0.85, message="creating summary locus")
+        set_progress(conn, job_id, 0.85)
 
     summary_locus_id: str | None = None
     if report.summary_md and artifact_node_ids:
@@ -179,7 +179,7 @@ def run(conn: sqlite3.Connection, project_id: str | None, payload: dict) -> dict
     )
 
     if job_id:
-        set_progress(conn, job_id, 1.0, message="done")
+        set_progress(conn, job_id, 1.0)
 
     return {
         "output_dir": str(output_dir),

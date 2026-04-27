@@ -31,7 +31,11 @@ def test_full_loop_scan_retrieve_pin(loci_dir, fake_embedder, tmp_path):
         r = c.post("/projects", json={"slug": "p", "name": "P", "profile_md": ""})
         pid = r.json()["id"]
 
-        r = c.post(f"/projects/{pid}/sources/scan", json={"root": str(src)})
+        ws = c.post("/workspaces", json={"slug": "ws-p", "name": "P"}).json()
+        ws_id = ws["id"]
+        c.post(f"/workspaces/{ws_id}/sources", json={"root": str(src)})
+        c.post(f"/projects/{pid}/workspaces/{ws_id}", json={"role": "primary"})
+        r = c.post(f"/workspaces/{ws_id}/scan")
         assert r.status_code == 200
         assert r.json()["new_raw"] == 1
 
@@ -79,7 +83,11 @@ def test_response_expansion(loci_dir, fake_embedder, tmp_path):
     (src / "a.md").write_text("hello world")
     with TestClient(create_app()) as c:
         pid = c.post("/projects", json={"slug": "p", "name": "P", "profile_md": ""}).json()["id"]
-        c.post(f"/projects/{pid}/sources/scan", json={"root": str(src)})
+        ws = c.post("/workspaces", json={"slug": "ws-p", "name": "P"}).json()
+        ws_id = ws["id"]
+        c.post(f"/workspaces/{ws_id}/sources", json={"root": str(src)})
+        c.post(f"/projects/{pid}/workspaces/{ws_id}", json={"role": "primary"})
+        c.post(f"/workspaces/{ws_id}/scan")
         r = c.post(f"/projects/{pid}/retrieve", json={"query": "hello", "k": 1})
         rid = r.json()["trace_id"]
         # Expand the response

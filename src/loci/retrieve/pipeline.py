@@ -46,10 +46,8 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from loci.embed.local import Embedder, get_embedder
-from loci.graph.edges import EdgeRepository
+from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
 from loci.graph.models import NodeKind, Subkind
-from loci.graph.nodes import NodeRepository
-from loci.graph.projects import ProjectRepository
 from loci.retrieve import hyde as hyde_mod
 from loci.retrieve import lex as lex_mod
 from loci.retrieve import ppr as ppr_mod

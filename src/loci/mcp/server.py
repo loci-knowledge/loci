@@ -16,7 +16,7 @@ Tools:
     loci_accept_proposal(proposal_id)
     loci_research(query, workspace, project?, hf_owner?, hardware?, sandbox?)
     loci_research_status(job_id)
-    loci_absorb(project?)
+    loci_reflect(project?, absorb?)
     loci_feedback(response_id, edited_markdown)
     loci_workspace_create(slug, name, kind?, description_md?)
     loci_workspace_list()
@@ -42,21 +42,12 @@ from loci.citations import CitationTracker
 from loci.config import get_settings
 from loci.db import migrate
 from loci.db.connection import get_connection
-from loci.draft import DraftRequest
-from loci.draft import draft as run_draft
 from loci.embed.local import get_embedder
 from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
 from loci.graph.models import InterpretationNode, Workspace, WorkspaceKind, now_iso
 from loci.graph.workspaces import WorkspaceRepository
 from loci.jobs import enqueue
 from loci.mcp.resolve import ProjectNotFound, resolve_project_id
-from loci.retrieve import RetrievalRequest, Retriever
-from loci.retrieve.effects import (
-    maybe_enqueue_retrieve_reflect as _maybe_enqueue_reflect,
-)
-from loci.retrieve.effects import (
-    pending_effects_from_reflect as _pending_effects_from_reflect,
-)
 
 log = logging.getLogger(__name__)
 
@@ -145,59 +136,46 @@ def build_mcp_server() -> FastMCP:
         hyde: bool = False,
         verbose: bool = False,
     ) -> dict[str, Any]:
+        from loci.usecases.retrieve import run_retrieve
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
             return {"error": str(e)}
-        retriever = Retriever(conn)
-        resp = retriever.retrieve(RetrievalRequest(
-            project_id=project_id, query=query, k=k,
-            anchors=anchors or [], hyde=hyde,
-        ))
-        rid = CitationTracker(conn).write_response(
-            __record_for(project_id, query, k, hyde, trace_table=resp.trace_table),
-            retrieved_node_ids=[n.node_id for n in resp.nodes],
+        result = run_retrieve(
+            conn, project_id=project_id, query=query, k=k,
+            anchors=anchors, hyde=hyde, session_id="mcp", client="mcp",
         )
+        resp = result.response
         routing_loci_payload = [
             _routing_locus_dict(ri, verbose=verbose) for ri in resp.routing_interps
         ]
         _broadcast_trace_run(project_id, {
-            "response_id": rid,
-            "session_id": "mcp",
-            "query": query,
-            "ts": now_iso(),
-            "k": k,
-            "routing_loci": routing_loci_payload,
-            "trace_table": resp.trace_table,
+            "response_id": result.trace_id, "session_id": "mcp",
+            "query": query, "ts": now_iso(), "k": k,
+            "routing_loci": routing_loci_payload, "trace_table": resp.trace_table,
         })
-        reflect_job_id = _maybe_enqueue_reflect(conn, project_id, rid)
-        pending_effects = _pending_effects_from_reflect(reflect_job_id, trigger="retrieve")
         out: dict[str, Any] = {
             "nodes": [
                 {
                     "id": n.node_id, "kind": n.kind, "subkind": n.subkind,
                     "title": n.title, "snippet": n.snippet, "score": n.score,
                     "why": n.why,
-                    "trace": [
-                        {"id": h.src, "edge": h.edge_type, "to": h.dst}
-                        for h in n.trace
-                    ],
+                    "trace": [{"id": h.src, "edge": h.edge_type, "to": h.dst} for h in n.trace],
                 }
                 for n in resp.nodes
             ],
             "routing_loci": routing_loci_payload,
             "trace_table": resp.trace_table,
             "trace_narrative": resp.trace_narrative,
-            "pending_effects": pending_effects,
-            "trace_id": rid,
+            "pending_effects": result.pending_effects,
+            "trace_id": result.trace_id,
         }
         if verbose:
             out["pruned_loci"] = [
                 {
                     "id": pl.node_id, "subkind": pl.subkind, "title": pl.title,
-                    "score": pl.score, "reason": pl.reason,
-                    "channel_ranks": pl.channel_ranks,
+                    "score": pl.score, "reason": pl.reason, "channel_ranks": pl.channel_ranks,
                 }
                 for pl in resp.pruned_loci
             ]
@@ -230,47 +208,38 @@ def build_mcp_server() -> FastMCP:
         hyde: bool = False,
         verbose: bool = False,
     ) -> dict[str, Any]:
+        from loci.retrieve.effects import pending_effects_from_reflect
+        from loci.usecases.draft import run_draft as _uc_draft
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
             return {"error": str(e)}
-        result = run_draft(conn, DraftRequest(
-            project_id=project_id, session_id="mcp",
-            instruction=instruction, context_md=context_md,
-            anchors=anchors or [],
-            style=style,  # type: ignore[arg-type]
-            cite_density=cite_density,  # type: ignore[arg-type]
-            k=k, hyde=hyde, client="mcp",
-        ))
-        _routing_loci_dicts = [
-            _routing_locus_dict(rl, verbose=verbose) for rl in result.routing_loci
-        ]
-        _broadcast_trace_run(project_id, {
-            "response_id": result.response_id,
-            "session_id": "mcp",
-            "query": instruction,
-            "ts": now_iso(),
-            "k": k,
-            "routing_loci": _routing_loci_dicts,
-            "trace_table": result.trace_table,
-        })
-        pending_effects = _pending_effects_from_reflect(
-            result.reflect_job_id, trigger="draft",
+        result = _uc_draft(
+            conn, project_id=project_id, instruction=instruction,
+            context_md=context_md, anchors=anchors, style=style,
+            cite_density=cite_density, k=k, hyde=hyde,
+            session_id="mcp", client="mcp",
         )
+        routing_loci_dicts = [_routing_locus_dict(rl, verbose=verbose) for rl in result.routing_loci]
+        _broadcast_trace_run(project_id, {
+            "response_id": result.response_id, "session_id": "mcp",
+            "query": instruction, "ts": now_iso(), "k": k,
+            "routing_loci": routing_loci_dicts, "trace_table": result.trace_table,
+        })
+        pending_effects = pending_effects_from_reflect(result.reflect_job_id, trigger="draft")
         out: dict[str, Any] = {
             "output_md": result.output_md,
             "citations": [
                 {
                     "node_id": c.node_id, "kind": c.kind, "subkind": c.subkind,
-                    "title": c.title, "why_cited": c.why_cited,
-                    "routed_by": c.routed_by,
+                    "title": c.title, "why_cited": c.why_cited, "routed_by": c.routed_by,
                     "chunk_id": c.chunk_id, "chunk_section": c.chunk_section,
                     "verdict": c.verdict, "verdict_reason": c.verdict_reason,
                 }
                 for c in result.citations
             ],
-            "routing_loci": _routing_loci_dicts,
+            "routing_loci": routing_loci_dicts,
             "trace_table": result.trace_table,
             "trace_narrative": result.trace_narrative,
             "pending_effects": pending_effects,
@@ -514,16 +483,22 @@ def build_mcp_server() -> FastMCP:
         return job
 
     @mcp.tool(
-        name="loci_absorb",
-        description="Enqueue an absorb checkpoint job for the project. Returns a job_id; poll via the REST /jobs/:id endpoint.",
+        name="loci_reflect",
+        description=(
+            "Enqueue a reflect job for the project. "
+            "Pass absorb=True to also run an absorb checkpoint first. "
+            "Returns a job_id; poll via the REST /jobs/:id endpoint."
+        ),
     )
-    def loci_absorb(project: str | None = None) -> dict[str, Any]:
+    def loci_reflect(project: str | None = None, absorb: bool = False) -> dict[str, Any]:
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
             return {"error": str(e)}
-        job_id = enqueue(conn, kind="absorb", project_id=project_id)
+        if absorb:
+            enqueue(conn, kind="absorb", project_id=project_id)
+        job_id = enqueue(conn, kind="reflect", project_id=project_id)
         return {"job_id": job_id, "status": "queued"}
 
     @mcp.tool(
@@ -903,21 +878,6 @@ def build_mcp_server() -> FastMCP:
         return {"deleted": True, "node_id": node_id}
 
     return mcp
-
-
-def __record_for(
-    project_id: str, query: str, k: int, hyde: bool,
-    *, trace_table: list[dict] | None = None,
-):
-    """Build a ResponseRecord for a retrieve-only call (no output)."""
-    from loci.citations import ResponseRecord
-    return ResponseRecord(
-        project_id=project_id, session_id="mcp",
-        request={"query": query, "k": k, "hyde": hyde},
-        output="", cited_node_ids=[],
-        trace_table=trace_table or [],
-        client="mcp",
-    )
 
 
 def _routing_locus_dict(ri, *, verbose: bool) -> dict[str, Any]:

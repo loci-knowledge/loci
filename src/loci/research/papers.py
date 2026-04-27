@@ -222,12 +222,6 @@ def _find_section(sections: list[dict], query: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _clean_description(text: str) -> str:
-    text = re.sub(r"[\t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    return text.strip()
-
-
 def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
@@ -719,7 +713,9 @@ async def find_datasets(arxiv_id: str, sort: str = "downloads", limit: int = DEF
         ds_id = ds.get("id", "unknown")
         downloads = ds.get("downloads", 0)
         likes = ds.get("likes", 0)
-        desc = _truncate(_clean_description(ds.get("description") or ""), MAX_SUMMARY_LEN)
+        raw_desc = ds.get("description") or ""
+        clean_desc = re.sub(r"\n{2,}", "\n", re.sub(r"[\t]+", " ", raw_desc)).strip()
+        desc = _truncate(clean_desc, MAX_SUMMARY_LEN)
         tags = [t for t in (ds.get("tags") or []) if not t.startswith(("arxiv:", "region:"))][:5]
         lines.append(f"**{i}. [{ds_id}](https://huggingface.co/datasets/{ds_id})**")
         lines.append(f"   Downloads: {downloads:,} | Likes: {likes}")
