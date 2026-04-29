@@ -3,7 +3,7 @@
 # Works on macOS and Linux. Requires Python 3.12+.
 set -e
 
-PACKAGE="loci"
+PACKAGE="loci-wiki"
 MIN_PYTHON="3.12"
 
 err() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }

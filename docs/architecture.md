@@ -1,430 +1,178 @@
 # Architecture
 
-The mental model in one sentence: **loci is a single-process server that owns
-a SQLite database and an embedding model, and serves a uniform citation
-contract over MCP, REST, and a CLI.**
+A short tour of how loci is wired together.
 
-## The three layers, restated
+## Three things to remember
 
-PLAN §What loci is defines three layers. They are *all stored in SQLite*
-(not on disk in your vault); markdown export is a derived view, not the
-substrate.
+1. **Sources are leaves.** Each source is content-addressed (sha256), chunked,
+   and embedded. SQLite holds metadata + FTS + vectors; raw blobs live on disk.
+2. **Aspects are tags.** Every source carries one or more aspect labels
+   (`methodology`, `knowledge-graph`, …). Aspects come from three places:
+   the folder it lives in, the LLM classifier, and the user.
+3. **Concept edges are the graph.** Typed edges connect sources:
+   citations (extracted from BibTeX), wikilinks (extracted from markdown),
+   `co_aspect` (sources sharing aspects), `co_folder` (sources sharing a
+   folder). Retrieval expands the query through this graph.
 
-### 1. Memory space — `RawNode`s
-
-Every file you ingest becomes one `RawNode`:
-
-| field             | meaning                                        |
-|-------------------|------------------------------------------------|
-| `content_hash`    | sha256[:16] of the file bytes — dedup key      |
-| `canonical_path`  | absolute path on disk                          |
-| `mime`, `size_bytes`, `subkind` (`pdf|md|code|html|transcript|txt|image`) | |
-| `body`            | extracted plain text — what FTS5 + the embedder see |
-| `source_of_truth` | `false` if the file at `canonical_path` is missing  |
-
-The original file bytes are also stored under `~/.loci/blobs/<hash[:2]>/<hash[2:]>` — content-addressed, deduped. This lets us re-extract later if we
-swap to a better PDF parser without re-reading the source file.
-
-### 1b. Information Workspaces
-
-An information workspace is a **named bag of source roots** that can be
-linked to one or more projects. Workspaces decouple *where you store files*
-from *which projects care about them*: a PDF library scanned once is
-available to every project that links its workspace, without re-embedding.
-
-| table | key columns | meaning |
-|---|---|---|
-| `information_workspaces` | `id`, `slug`, `name`, `description_md`, `kind` | Named source collection with an optional human-readable description |
-| `workspace_sources` | `id`, `workspace_id`, `root_path`, `label` | Source roots owned by a workspace; scan walks these paths |
-| `workspace_membership` | `workspace_id`, `node_id` | Which raw nodes belong to which workspace (populated by scan) |
-| `project_workspaces` | `project_id`, `workspace_id`, `role`, `weight` | M:N link; `role` ∈ `primary` / `reference` / `excluded` |
-
-The `project_effective_members` view is derived automatically:
-
-```sql
--- pseudocode
-(project_workspaces ⋈ workspace_membership WHERE role != 'excluded')
-  ∪ project_membership(role = 'included')
-  ∖ project_membership(role = 'excluded')
-```
-
-This means:
-- All raws reachable through a non-excluded workspace link are visible to
-  the project.
-- Explicit `project_membership` rows (pins, manual includes) layer on top
-  as overrides.
-- Explicit `excluded` membership rows act as a veto regardless of workspace
-  linkage.
-
-Projects no longer own source roots directly; source roots belong to
-workspaces. One workspace can serve N projects; a raw node scanned into a
-workspace becomes available to all linked projects without re-embedding.
-
-### 2. Interpretation DAG — loci of thought
-
-The interpretation layer is a strict directed acyclic graph. Each
-interpretation is a *locus of thought* — a pointer that says "the part of
-THIS source over here meets the part of THIS project over there, in this
-specific way." Loci do not summarise sources; they route retrieval to the
-parts of sources that matter.
-
-Every locus has three required slots:
-- `relation_md` — how the source(s) relate to *this project*
-- `overlap_md` — the concrete intersection (where they meet)
-- `source_anchor_md` — which part of which source carries the weight (quote, section, function, line range)
-
-Subkinds (the framing):
-- `philosophy` — first-principle belief the sources reveal the project should hold
-- `tension` — unresolved conflict between sources and project, or between two values the project must reconcile
-- `decision` — a concrete choice with explicit trade-offs
-- `relevance` — typed bridge across distinct sources; requires `angle` from a closed vocabulary; cite ≥2 raws
-
-Edge types (only two; both directed):
-- `cites` (interp → raw) — the locus points at the source it anchors. Raws
-  are leaves — they have no outgoing edges.
-- `derives_from` (interp → interp) — this locus builds on / specialises /
-  inherits routing from an upstream locus. Cycles are rejected at insert.
-
-There are **no symmetric edges**, no inverses, and no raw→raw edges. The
-absorb co-citation pass and the code-dependency extractor are gone — both
-violated either acyclicity or the raw-leaf rule.
-
-A node moves through a small state machine:
-
-    proposed → live          via accept gesture
-    live     → dirty         via edit (own, or one-hop neighbor)
-    dirty    → live          via re-derivation at retrieve / absorb
-    live     → stale         via support disappearance (audit)
-    *        → dismissed     via explicit dismiss (terminal)
-
-### 3. Project layer — `Project` + `ProjectMembership`
-
-A project is a *filter* over the global graph plus a profile. Adding a paper
-to a project doesn't move it; it asserts membership. Two projects sharing a
-paper share *that paper's node* — no duplication.
-
-`role`:
-- `included` — visible to retrieve/draft for this project (default).
-- `excluded` — explicitly hidden from this project.
-- `pinned`   — touchstone; boosted in retrieval, used as a default PPR anchor.
-
-The effective member set for a project is computed by
-`project_effective_members` (see "Information Workspaces" above). Explicit
-`project_membership` rows take precedence over workspace-derived membership.
-
-## New tables (v2)
-
-Three tables added alongside the original schema:
-
-| table | purpose |
-|-------|---------|
-| `node_revisions` | event-sourced history of every locus edit (`create`, `update_locus`, `update_body`, `set_angle`, `hard_delete`, `revert`). Tombstone rows capture full snapshots for hard deletes. |
-| `preference_pairs` | implicit preference signal: each `cited_kept × cited_dropped` pair from a draft response is stored here for future CrossEncoder fine-tuning. |
-
-A new module `src/loci/agent/refine.py` runs a self-refine loop (max 2 iters)
-after the verifier on every draft: if `unsupported` verdicts remain, it
-rewrites the draft against a citation rubric before returning. Each iteration
-is logged to `agent_reflections` with `trigger="draft_refine"`.
-
-## Storage layout on disk
+## Storage
 
 ```
 ~/.loci/
-  loci.sqlite               # the graph, FTS5 index, vec0 index, jobs, traces
-  loci.sqlite-wal           # WAL journal
-  blobs/                    # content-addressed raw file bytes
-    a1/b2c3...              #   <hash[:2]>/<hash[2:]>
-    ...
-  models/                   # sentence-transformers cache
-    BAAI--bge-small-en-v1.5/
+  loci.sqlite     SQLite database — single source of truth
+  blobs/          raw files, content-addressed: <sha256[:2]>/<sha256[2:]>
+  models/         embedding model cache (BAAI/bge-small-en-v1.5)
+  logs/           rotating application log
+  exports/        default graph.json / memo.md target
+  state/current   pinned project for MCP sessions
+  .env            provider keys (chmod 600)
+  config.toml     non-secret settings
 ```
 
-Override the data dir with `LOCI_DATA_DIR=/path`.
-
-The SQLite database holds *everything graph-related* — nodes, edges,
-projects, memberships, workspaces, FTS5 inverted index, vector index, jobs,
-traces, responses, proposals, communities. Backing up loci is `cp loci.sqlite*
-backup/`. Moving to a new machine is `rsync ~/.loci/`.
-
-## Request flow
-
-### A retrieve call (interpretation-routed)
+Per-repo:
 
 ```
-POST /projects/:id/retrieve { query, k, anchors?, hyde? }
-   │
-   ▼
-loci.retrieve.Retriever  ── 5-stage interpretation-routed pipeline
-   │
-   ├─ STAGE 1: score loci of thought
-   │     lex.search(kind=interpretation)         BM25 over locus titles + slots
-   │     vec.search_text(kind=interpretation)    ANN over locus embeddings
-   │     hyde.hypothesize() → vec  (optional)
-   │     ppr.run(anchors)   sparse PPR over the derives_from DAG
-   │           anchors = caller ∪ pinned ∪ top-vec interp hits
-   │     RRF-fuse → top-K_interp routing loci
-   │
-   ├─ STAGE 2: route from loci to raws
-   │     for each top locus L (score s):
-   │       for each cites L→R:                   raw R += s · GAIN
-   │       for each derives_from L→U:            (depth 2)
-   │         for each cites U→R:                 raw R += s · DECAY · GAIN
-   │     trace[R] += hops along the way
-   │
-   ├─ STAGE 3: score raws directly
-   │     lex.search(kind=raw) + vec.search_text(kind=raw) + hyde
-   │     RRF-fuse → direct raw scores
-   │
-   ├─ STAGE 4: merge
-   │     final[R] = direct[R] + min(BONUS_CAP, routed[R])
-   │
-   └─ STAGE 5: filter (default include=raw) + materialise
-   │
-   ▼
-update access_count, last_accessed_at →
-write Response (with trace_table JSON) + per-node Trace rows →
-enqueue lightweight reflect (if MCP, with 5-min cooldown) →
-return {
-  nodes[]:           ranked raws (each with per-node trace)
-  routing_loci[]:    the loci used as routers (UI side panel)
-  trace_table[]:     per-raw interp path (for the user-visible provenance)
-  trace_id
-}
+<repo>/.loci/
+  project.toml    { slug, created_at }
+  session.toml    optional: workspaces bound for this session
 ```
 
-Loci are not citable content. They are returned alongside raws as routing
-context, never as the answer.
+## Schema
 
-### Revision endpoints
+`src/loci/db/schema.sql` is the single canonical schema. It is applied
+idempotently on every connect via `init_schema()` — every statement uses
+`CREATE … IF NOT EXISTS`. There is no migration history. When the schema
+changes we rewrite the file and consumers run `loci reset`.
 
-```
-GET  /nodes/:id/revisions?limit=50   → ordered revision history for a node
-POST /nodes/:id/revisions/:rid/revert → re-apply prior_values (writes new revision row)
-```
+Core tables:
 
-Every write to a locus slot (`update_locus`, `update_body`, `set_angle`,
-`hard_delete`) is captured atomically inside the same transaction via
-`graph/revisions.py`. The `actor` and `source_tool` fields distinguish user
-edits (API/graph-UI), MCP tool calls, and agent reflection actions.
+| table | purpose |
+|-------|---------|
+| `nodes` / `raw_nodes` | source rows (id, title, sha256, blob path, …) |
+| `raw_chunks` | chunked text (one row per chunk, with offsets) |
+| `chunks_fts` / `chunk_vec` | FTS5 + sqlite-vec virtual tables over chunks |
+| `nodes_fts` / `node_vec` | document-level FTS + vec for whole-source matches |
+| `aspect_vocab` / `resource_aspects` | aspect taxonomy + per-resource tags |
+| `concept_edges` | typed edges (cites, wikilink, co_aspect, co_folder) |
+| `resource_provenance` | url, folder, saved_via, captured_at, context_text |
+| `resource_usage_log` | one row per `loci_*` MCP tool call (for ranking signals) |
+| `projects` / `project_membership` | project + membership rows |
+| `information_workspaces` / `workspace_sources` / `project_workspaces` | workspace plumbing |
+| `jobs` / `job_step_log` | background queue |
 
-### Graph UI route
-
-```
-GET /graph/:project_id   → the hosted D3 web UI (HTML)
-```
-
-See [graph-ui.md](./graph-ui.md) for the full feature reference.
-
-### Awareness endpoints
-
-Two endpoints expose the graph's live state for clients (VSCode extension, MCP):
+## Module layout
 
 ```
-GET /projects/:id/context
-   → project info + linked workspaces (with raw_count) + graph stats + last 10 accessed nodes
-
-GET /projects/:id/recent-nodes?hours=24&kind=interpretation
-   → nodes created or updated in the last N hours (max 168); kind filter optional
+src/loci/
+  ui/         CLI (cyclopts) + interactive wizard
+  api/        FastAPI app + REST routes + WebSocket
+  mcp/        MCP server (FastMCP) + project resolution
+  graph/      sources, aspects, concept_edges, projects, workspaces
+  retrieve/   lex, vec, hyde, concept_expand, pipeline
+  capture/    URL/file/text ingest, folder + aspect suggestion, link parsing
+  ingest/     walker, content-hash, extractors, chunker, chunks repo, pipeline
+  jobs/       queue, worker, handlers (classify_aspects, parse_links, log_usage, embed_missing)
+  embed/      sentence-transformers wrapper
+  llm/        pydantic-ai wrapper (Anthropic, OpenAI, OpenRouter)
+  db/         schema.sql + connection helpers
+  config.py   Settings + ~/.loci/ paths
 ```
 
-These are the primary feed for the frontend "what's active" panel and the
-`loci_context` MCP tool. The VSCode extension subscribes to the WebSocket
-`project:{id}` channel for push updates, and polls `recent-nodes` to show
-what the agent has been adding or modifying.
+Each subpackage owns one concern end-to-end. Imports flow inward: `ui` and
+`mcp` and `api` may import from `graph` / `retrieve` / `capture` / `jobs`,
+but never the other way.
 
-### A draft call
-
-```
-POST /projects/:id/draft { instruction, context_md?, style, cite_density }
-   │
-   ▼
-Retriever.retrieve()             # interpretation-routed pipeline, k=12 default
-   │
-   ▼
-build candidate block — RAWS ONLY:
-    [C1] kind=raw/pdf title="…" why-retrieved="matched the query directly"
-         <= 800 chars body
-    ROUTING-CONTEXT (loci that point at this raw — DO NOT CITE):
-      - [philosophy] CLI bridges loki-frontend and loci-backend (angle=…)
-        relation: …
-        anchor:   …
-    [C2] kind=raw/md title="…" …
-    …
-   │
-   ▼
-pydantic-ai Agent (Settings.rag_model, instructions=SYSTEM_PROMPT cached)
-   │  user msg: instruction + context_md? + candidate block + style/density
-   │  output: markdown with [Cn] markers — citations land on RAWS only
-   ▼
-parse [Cn] markers → drop unknown handles (anti-fabrication) →
-build citations[] (raws + their routed_by interp ids) +
-       routing_loci[] (deduped loci side panel) +
-       trace_table[] (per-raw interp path) →
-write Response (with trace_table JSON) + traces:
-       cited (per cited raw)
-       retrieved (per surfaced raw)
-       routed_via (per locus that served a cited raw)
-       route_target (per cited raw, for absorb statistics) →
-ENQUEUE reflect job (non-blocking — see "Reflection cycle" below) →
-return { output_md, citations[], routing_loci[], trace_table[], response_id }
-```
-
-A draft never cites a locus. Loci are routing context only — the LLM sees
-them so it understands *why* a raw is the right anchor, but the citation
-lands on the raw because the raw is the actual evidence.
-
-### Reflection cycle (silent, agentic, after every draft)
-
-This is the heart of the interpretation layer's evolution. See
-[agent.md](./agent.md) for the full surface.
+## Save flow
 
 ```
-worker thread claims `reflect` job →
-loci.agent.interpreter.reflect():
-   1. _build_context:
-      - fetch project profile + pinned interps (voice anchor)
-      - fetch the draft response: instruction + cited_node_ids
-      - fetch retrieved-but-not-cited nodes (from traces)
-      - roll up citation feedback (cited_kept / cited_dropped / cited_replaced)
-        if the user has submitted any
-      - fetch linked workspaces (name, kind, description, 6 sample raw titles)
-        and render WORKSPACE CONTEXT block for the synthesis prompt
-   2. SYNTHESISE (interpretation_model):
-      → propose Action[] = create | reinforce | soften | link | update_angle
-      (subkind chosen from candidates actually observed, not defaulted to relevance)
-   3. SELF-CRITIQUE (interpretation_model):
-      → keep[] / drop[] indices + reason
-   4. APPLY surviving actions:
-      - creates: write InterpretationNode at conf 0.40, origin=agent_synthesis
-      - reinforces / softens: confidence += 0.05 (signed)
-      - links: edges via EdgeRepository.create (with symmetry/inverse)
-      - update_angle: update angle + rationale_md on existing relevance node in place
-   5. log to agent_reflections (deliberation_md + actions_json)
+loci_save("https://arxiv.org/abs/...", context="...")
+  ├─ ingest_url   → fetch, extract text, sha256
+  │                  raw_nodes + blob written
+  ├─ chunker      → raw_chunks (with offsets)
+  ├─ embedder     → chunk_vec + node_vec
+  ├─ folder_suggest (rapidfuzz against existing folders)
+  ├─ aspect_suggest (KeyBERT over first chunks → aspect_vocab match)
+  ├─ MCP elicitation form: folder radio + aspect checkboxes + context text
+  │                  resource_provenance + resource_aspects written
+  ├─ project_membership.add
+  └─ enqueue jobs:
+       classify_aspects   (LLM-driven aspect refinement)
+       parse_links        (wikilinks + BibTeX citations → concept_edges)
 ```
 
-Trigger sources for the reflect job: `draft` (auto), `feedback`
-(citation-level diff), `kickoff`, `manual`, `relevance` (workspace linkage
-events — focused single-pass, no self-critique stage).
-
-### Linkage events
-
-Workspace linkage and scan events generate both synchronous and asynchronous
-effects:
-
-| Event | Sync | Async |
-|---|---|---|
-| Link W→P | insert `project_workspaces` join row | enqueue `relevance(scope=link)` |
-| Unlink W from P | remove `project_workspaces` join row | enqueue `sweep_orphans` — finds live interpretation nodes whose all cited raws are no longer in `project_effective_members`, flips them to `dirty`, files `forget` proposals |
-| Workspace gains raw (during scan) | insert `workspace_membership` | for each linked project where role != `excluded`: enqueue `relevance(scope=incremental)`, deduped via fingerprint |
-| Profile change | update project profile | optional `relevance(scope=profile_refresh)`, gated by config |
-
-### A scan call
+## Recall flow
 
 ```
-POST /projects/:id/sources/scan-all
-   │
-   ▼
-For each registered source root:
-    walk(root)                      # filtered by ext, skip dotdirs/binaries
-    for each path:
-        sha256 → trunc[:16]
-        if hash already in raw_nodes: add membership only (dedup)
-        else: extract → batch with siblings
-    flush_batch:
-        embedder.encode_batch(batch)  # one model call per N files
-        for each: store_blob, INSERT raw_node + membership + node_vec
-   ▼
-return summary { scanned, new_raw, deduped, skipped, members_added, errors }
+loci_recall("how does PPR work")
+  ├─ concept_expand:
+  │    KeyBERT(query) → seed concepts → traverse concept_edges
+  │    → expanded aspect set
+  ├─ HyDE: rag_model produces a hypothetical answer for vec embedding
+  ├─ BM25 over chunks_fts (query + expanded aspect filter)
+  ├─ ANN over chunk_vec  (HyDE-embedded query)
+  ├─ RRF merge → candidate chunks
+  ├─ Graph rerank:
+  │    boost chunks whose source shares aspects with the seed concepts
+  │    pull in chunks reachable via cites / wikilink edges from top hits
+  └─ return ranked chunks with per-chunk "why surfaced":
+       "matched aspects [methodology, ppr]; reached via co_aspect from
+        HippoRAG → PPR paper"
 ```
 
-### An absorb call (background, housekeeping only)
+## Background jobs
 
-After Phase F's silent agentic pivot, absorb is a periodic *housekeeping*
-pass — the per-draft reflect cycle handles the work that absorb used to do
-in batch (creating + reinforcing interpretations from new evidence).
-Absorb still runs the slow, graph-wide checks:
+The worker (`loci worker`, also embedded inside `loci server`) drains the
+`jobs` table. Handlers are registered in `jobs/worker.py`:
+
+| handler | trigger | what it does |
+|---------|---------|--------------|
+| `embed_missing` | scan, save | embed any chunks lacking vectors |
+| `classify_aspects` | save | call `rag_model` to refine aspect tags + confidence |
+| `parse_links` | save | extract wikilinks (obsidiantools) + BibTeX citations (pybtex) → write `concept_edges` |
+| `log_usage` | every `loci_*` MCP call | append to `resource_usage_log` |
+
+## MCP surface
+
+Six tools, all stdio:
 
 ```
-POST /projects/:id/absorb        # enqueue
-worker thread picks it up and runs jobs.absorb.run():
-   1. fs_audit             : flip source_of_truth for missing/restored raws
-   2. replay_traces        : roll up remaining cited traces → access_count, confidence
-   3. detect_orphans       : interp nodes with 0 edges → status='dirty'
-   4. detect_broken_supports: interps citing dead raws → 'broken' proposals; mark 'stale' if all gone
-   5. detect_aliases       : cosine > 0.92 between interps → 'alias' proposals
-   6. detect_forgetting    : low conf + no access N days → dismiss proposals
-   7. contradiction_pass   : (LLM) for each new raw, classify against top-3 interps; tensions / reinforces
-   8. communities          : (igraph) Leiden over the derives_from interp DAG
+loci_save        ingest + elicit folder/aspects + write
+loci_recall      concept-expanded retrieval
+loci_aspects     list/edit aspects (action="list"|"add"|"remove"|"edit")
+loci_browse      list resources, filterable by folder / aspect / query
+loci_context     project profile + counts + top aspects
+loci_research    paper-search sub-agent (deferred to v1.1)
 ```
 
-The old co-citation pass (semantic edges) and code-dependency extractor
-(actual edges) are removed: they violated the DAG topology. Shared evidence
-between loci is now expressed by overlapping `cites` fan-outs, and any
-locus-to-locus relationship goes through `derives_from` (added by the
-interpreter agent or the user, not by post-hoc co-citation).
+Three resource templates for `@`-mention in Claude Code:
 
-The proposals from absorb are the *only* surface where the user is asked
-to make explicit decisions: file moves, near-duplicate merges, stale
-interps. Day-to-day interpretation construction happens silently via the
-reflect cycle.
+```
+loci:source://{resource_id}
+loci:folder://{folder_path}
+loci:aspect://{label}
+```
 
-Every step records its summary into the job's `result` JSON. Each step is
-idempotent and graceful: missing LLM key → step skips with a reason.
+## LLMs
 
-## How interpretations evolve
+`llm/` is a thin wrapper over pydantic-ai. Each task has its own model spec:
 
-The interpretation graph isn't built up-front; it accretes from your work
-through three stacked mechanisms:
+- `rag_model` — strong instruction following (aspect classification, HyDE
+  rewriting). Default `openrouter:anthropic/claude-opus-4.7`.
+- `hyde_model` — fast, throwaway hypothetical answers.
+  Default `openrouter:deepseek/deepseek-v4-flash`.
 
-1. **Per-draft reflection** (continuous, silent, agentic) — every `loci
-   draft` triggers a background reflect cycle that may create / reinforce
-   / soften interpretation nodes based on the task and the citations the
-   draft chose.
-2. **Citation-level feedback** (per user edit) — when you submit your
-   edited markdown via `loci feedback`, we diff `[Cn]` markers and emit
-   `cited_kept` / `cited_dropped` / `cited_replaced` traces. The next
-   reflect cycle reads these and aligns accordingly.
-3. **Absorb housekeeping** (periodic, batch) — the slow graph-wide
-   checks (orphans, alias merges, forgetting, contradiction).
+Provider keys live in `~/.loci/.env`; loci falls back through
+`OPENROUTER_API_KEY` → `OPENROUTER_API_KEY_BACKUP` if the primary looks
+invalid.
 
-Updated signal table:
+## Extending loci
 
-| signal                  | from                          | server action                       |
-|-------------------------|-------------------------------|-------------------------------------|
-| `RETRIEVED`             | any retrieve/draft call       | `Trace(kind=retrieved)` per node    |
-| `CITED`                 | any draft call                | `Trace(kind=cited)`; access_count++ |
-| `cited_kept`            | `loci feedback`               | trace; reinforces in next reflect   |
-| `cited_dropped`         | `loci feedback`               | trace; softens in next reflect      |
-| `cited_replaced`        | `loci feedback`               | trace; informs next reflect's synthesis |
-| `requery`               | retrieve within window        | trace; signals previous answer was insufficient |
-| `agent_synthesised`     | reflect cycle                 | new node at conf 0.40, origin=agent_synthesis |
-| `agent_reinforced`      | reflect cycle                 | confidence +0.05                    |
-| `agent_softened`        | reflect cycle                 | confidence −0.05                    |
-| `ACCEPT_EXPLICIT`       | `POST /nodes/:id/accept`      | confidence +0.15 (rare; mostly housekeeping proposals) |
-| `REJECT`                | `POST /nodes/:id/dismiss`     | status → dismissed                  |
-| `CORRECT_AND_CREATE`    | client detects correction     | new interpretation node, conf 0.8   |
-| `PIN`                   | `POST /nodes/:id/pin`         | role=pinned in project              |
-| `EDIT`                  | `PATCH /nodes/:id`            | bump updated_at; one-hop dirty      |
-| `INVOKE_ABSORB`         | `POST /projects/:id/absorb`   | enqueue housekeeping checkpoint     |
+- **New aspect source?** Implement a job handler that writes to
+  `resource_aspects` with `source='inferred'` (or your own tag) and queue it
+  from `capture/ingest.py`.
+- **New edge type?** Append to `concept_edges` with a new `edge_type` value;
+  update the rerank weights in `retrieve/pipeline.py`.
+- **New extractor?** Add to `ingest/extractors.py` keyed by mimetype/extension.
+- **New CLI command?** Add to `ui/cli.py` under the `app` cyclopts namespace.
 
-Bright lines:
-
-- The agent **synthesises silently**. No proposal queue gates new nodes.
-- The agent **never deletes**. Only `dismiss` (explicit user gesture) does.
-- The user's **citation behaviour is the alignment signal**. Pin what
-  matters, drop what didn't, and the layer aligns.
-
-## What changes the model never does on its own
-
-- It never fabricates interpretations on day 1 (kickoff produces *questions*,
-  not statements).
-- It never deletes a node — only the user's `dismiss` gesture does that.
-- It never auto-merges two near-duplicate interpretations — it proposes the
-  alias edge and waits.
-- It never silently invents a citation in `loci draft` — handles that don't
-  map to candidates are stripped.
-
-Day-to-day interpretation construction is the silent reflect cycle (no
-queue). The user-driven proposal queue is only used by absorb's
-housekeeping suggestions — alias merges, broken-support flags, forgetting
-candidates — never for new interpretations on the hot path.
+The schema rule of thumb: if it changes the canonical model, edit
+`db/schema.sql` and bump the loci version. Otherwise keep changes in code.

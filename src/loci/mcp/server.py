@@ -1,970 +1,872 @@
-"""FastMCP server exposing the curated loci tools.
+"""FastMCP server — new 6-tool surface for loci (concept-graph edition).
 
-The graph is now a directed acyclic graph: raws are leaves, interpretations
-("loci of thought") are inner nodes connected by `derives_from`, and `cites`
-edges run from a locus to the raw it points at. Retrieval routes the query
-through loci to surface raws + a per-raw trace; drafts cite the raws (never
-the loci) and ship a routing-locus side panel for the user to inspect.
+The interpretation / DAG layer has been dropped. Resources are raw nodes tagged
+with aspects and organised into folders. The six public tools are:
 
-Tools:
-    loci_retrieve(query, project?, k?, anchors?, hyde?)
-    loci_draft(instruction, project?, context_md?, style?, cite_density?, k?)
-    loci_expand_citation(response_id)
-    loci_expand_node(node_id)
-    loci_propose_node(subkind, title, relation_md, overlap_md, source_anchor_md,
-                      angle?, body?, project?, cites?, derives_from?)
-    loci_accept_proposal(proposal_id)
-    loci_research(query, workspace, project?, hf_owner?, hardware?, sandbox?)
-    loci_research_status(job_id)
-    loci_reflect(project?, absorb?)
-    loci_feedback(response_id, edited_markdown)
-    loci_workspace_create(slug, name, kind?, description_md?)
-    loci_workspace_list()
-    loci_workspace_link(workspace, project?)
-    loci_workspace_unlink(workspace, project?)
-    loci_workspace_add_source(workspace, root_path, label?)
-    loci_current_project()
-    loci_context(project?, hours?)
+    loci_save      — ingest a URL, file, or text snippet
+    loci_recall    — concept-graph-driven retrieval
+    loci_aspects   — list / edit aspect labels on a resource or the project vocab
+    loci_browse    — tabular browse with folder / aspect / keyword filters
+    loci_context   — project summary (counts, folders, top aspects)
+    loci_research  — stub (paper research coming in v1.1)
 
-All tools accept an optional `project` argument. When omitted, the project is
-auto-resolved via: LOCI_PROJECT env → .loci/project file walk-up from cwd.
+Three MCP resource templates expose @-mention deep-links:
+
+    loci:source://{resource_id}  — full text of a resource
+    loci:folder://{folder_path}  — resource list for a folder
+    loci:aspect://{label}        — resources tagged with an aspect
+
+Project auto-resolution is unchanged — see loci.mcp.resolve.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
-from loci.citations import CitationTracker
 from loci.config import get_settings
-from loci.db import migrate
+from loci.db import init_schema
 from loci.db.connection import get_connection
-from loci.embed.local import get_embedder
-from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
-from loci.graph.models import InterpretationNode, Workspace, now_iso
+from loci.graph.aspects import AspectRepository
+from loci.graph.models import new_id, now_iso
+from loci.graph.projects import ProjectRepository
+from loci.graph.sources import SourceRepository
 from loci.graph.workspaces import WorkspaceRepository
-from loci.jobs import enqueue
 from loci.mcp.resolve import ProjectNotFound, resolve_project_id
 
 log = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# IPC bridge: publish trace_run events to the HTTP server's WS bus.
-# The MCP server is a separate process; it can't reach the in-process bus
-# directly. We fire-and-forget a POST to the HTTP server's broadcast endpoint.
+# Usage logging helper
 # ---------------------------------------------------------------------------
 
-_LOCI_API_URL = "http://127.0.0.1:7077"
+
+async def _log_usage(
+    resource_id: str,
+    tool_call_type: str,
+    conn,
+    session_hash: str | None = None,
+) -> None:
+    """Insert a row into resource_usage_log. Best-effort — never raises."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO resource_usage_log
+                (id, resource_id, session_hash, tool_call_type, used_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (new_id(), resource_id, session_hash, tool_call_type, now_iso()),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
 
 
-def _broadcast_trace_run(project_id: str, payload: dict[str, Any]) -> None:
-    """Fire-and-forget: ship the trace-run payload to the HTTP server."""
-    import threading
-    import urllib.request
-
-    def _post() -> None:
-        try:
-            data = json.dumps(payload).encode()
-            req = urllib.request.Request(
-                f"{_LOCI_API_URL}/projects/{project_id}/mcp/publish-trace",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=2)  # noqa: S310
-        except Exception:
-            pass  # best-effort; don't crash MCP on broadcast failure
-
-    threading.Thread(target=_post, daemon=True).start()
+# ---------------------------------------------------------------------------
+# Server factory
+# ---------------------------------------------------------------------------
 
 
 def build_mcp_server() -> FastMCP:
-    """Construct a FastMCP server with all loci tools registered."""
-    # Migrations applied on construction so a fresh data dir works.
+    """Construct and return a FastMCP server with all loci tools and resources."""
     settings = get_settings()
     settings.ensure_dirs()
-    migrate()
+    init_schema()
 
     mcp = FastMCP(
         name="loci",
         instructions=(
-            "loci is a personal memory DAG. Raws are leaves (the user's actual "
-            "sources); interpretations are 'loci of thought' — pointers that "
-            "say which part of which source matters and why. Use `retrieve` to "
-            "route a query through loci to the raws they point at; the "
-            "response includes raws, the loci that routed to them, a "
-            "`trace_table` (per-raw interp path), a `trace_narrative` "
-            "(markdown story of the routing — show this to the user), and "
-            "`pending_effects` (graph mutations the call triggered, e.g. a "
-            "reflect job). Pass `verbose=True` to also see `pruned_loci` "
-            "(loci that scored but routed nothing) and per-channel rank "
-            "breakdowns on each routing locus. Use `draft` to write text — "
-            "citations land on raws only (never on loci), with the same "
-            "routing/narrative/effects panel. Use `expand_citation` to "
-            "recover a past response, `propose_node` to add a locus, and "
-            "`accept_proposal` to promote it. Prefer `draft` when the user "
-            "wants writing — it includes the trace and citation block they "
-            "need."
+            "loci is a personal knowledge store. Resources (URLs, files, text) are "
+            "saved with folder labels and aspect tags. Use `loci_save` to capture "
+            "new resources, `loci_recall` to search, `loci_browse` to explore by "
+            "folder or aspect, and `loci_aspects` to view or edit tags. "
+            "Reference a specific resource with @loci:source://{id}. "
+            "Call `loci_context` at the start of a session to see what is available."
         ),
     )
 
+    # -----------------------------------------------------------------------
+    # Tool 1: loci_save
+    # -----------------------------------------------------------------------
+
     @mcp.tool(
-        name="loci_retrieve",
+        name="loci_save",
         description=(
-            "Route a query through the user's loci-of-thought graph and "
-            "return the raw sources those loci point at. The response has: "
-            "`nodes` (ranked raws with per-node trace), `routing_loci` (the "
-            "loci that routed retrieval, with relation/overlap/source_anchor — "
-            "for context, NOT for citing), `trace_table` (per-raw interp "
-            "path), `trace_narrative` (markdown story of the routing), and "
-            "`pending_effects` (graph mutations this call triggered, e.g. a "
-            "reflect job).\n\n"
-            "Pass `verbose=True` to also receive `pruned_loci` (loci that "
-            "scored but routed nothing) and per-channel rank/score breakdown "
-            "on each `routing_loci` entry. `project` is optional when "
-            "LOCI_PROJECT is set or a .loci/project file exists."
+            "Save a resource (URL, local file path, or plain-text snippet) into loci. "
+            "If folder or aspects are omitted, loci will suggest them and — when the "
+            "client supports it — show an interactive form for confirmation. "
+            "Returns a markdown summary of what was saved."
         ),
     )
-    def loci_retrieve(
-        query: str,
+    async def loci_save(
+        url_or_path: str,
+        ctx: Context,
+        context_text: str | None = None,
+        folder: str | None = None,
+        aspects: list[str] | None = None,
         project: str | None = None,
-        k: int = 10,
-        anchors: list[str] | None = None,
-        hyde: bool = False,
-        verbose: bool = False,
-    ) -> dict[str, Any]:
-        from loci.usecases.retrieve import run_retrieve
+    ) -> str:
+        from loci.capture.ingest import ingest_file, ingest_text, ingest_url
+
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
-            return {"error": str(e)}
-        result = run_retrieve(
-            conn, project_id=project_id, query=query, k=k,
-            anchors=anchors, hyde=hyde, session_id="mcp", client="mcp",
-        )
-        resp = result.response
-        routing_loci_payload = [
-            _routing_locus_dict(ri, verbose=verbose) for ri in resp.routing_interps
-        ]
-        _broadcast_trace_run(project_id, {
-            "response_id": result.trace_id, "session_id": "mcp",
-            "query": query, "ts": now_iso(), "k": k,
-            "routing_loci": routing_loci_payload, "trace_table": resp.trace_table,
-        })
-        out: dict[str, Any] = {
-            "nodes": [
-                {
-                    "id": n.node_id, "kind": n.kind, "subkind": n.subkind,
-                    "title": n.title, "snippet": n.snippet, "score": n.score,
-                    "why": n.why,
-                    "trace": [{"id": h.src, "edge": h.edge_type, "to": h.dst} for h in n.trace],
-                }
-                for n in resp.nodes
-            ],
-            "routing_loci": routing_loci_payload,
-            "trace_table": resp.trace_table,
-            "trace_narrative": resp.trace_narrative,
-            "pending_effects": result.pending_effects,
-            "trace_id": result.trace_id,
-        }
-        if verbose:
-            out["pruned_loci"] = [
-                {
-                    "id": pl.node_id, "subkind": pl.subkind, "title": pl.title,
-                    "score": pl.score, "reason": pl.reason, "channel_ranks": pl.channel_ranks,
-                }
-                for pl in resp.pruned_loci
-            ]
-        return out
+            return f"Error: {e}"
 
-    @mcp.tool(
-        name="loci_draft",
-        description=(
-            "Write a markdown draft for a project. Citations land on RAW "
-            "sources only — loci of thought are surfaced separately as "
-            "routing context, not as citable content.\n\n"
-            "Returns `output_md`, `citations` (raws with their routing "
-            "trace), `routing_loci` (loci that pointed at the cited raws), "
-            "`trace_table` (per-raw interp path), `trace_narrative` "
-            "(markdown story of the routing), and `pending_effects` (graph "
-            "mutations this call triggered, e.g. a reflect job).\n\n"
-            "Pass `verbose=True` to also receive `pruned_loci` and "
-            "per-channel rank/score breakdown on each `routing_loci` entry. "
-            "Pass `context_md` if the user has draft text already."
-        ),
-    )
-    def loci_draft(
-        instruction: str,
-        project: str | None = None,
-        context_md: str | None = None,
-        anchors: list[str] | None = None,
-        style: str = "prose",
-        cite_density: str = "normal",
-        k: int = 12,
-        hyde: bool = False,
-        verbose: bool = False,
-    ) -> dict[str, Any]:
-        from loci.retrieve.effects import pending_effects_from_reflect
-        from loci.usecases.draft import run_draft as _uc_draft
-        conn = get_connection()
+        # --- Detect input type and ingest ---
+        import re
+        from pathlib import Path
+
+        input_str = url_or_path.strip()
+        is_url = bool(re.match(r"^https?://", input_str))
+        is_path = not is_url and Path(input_str).exists()
+
         try:
-            project_id = resolve_project_id(conn, project)
-        except ProjectNotFound as e:
-            return {"error": str(e)}
-        result = _uc_draft(
-            conn, project_id=project_id, instruction=instruction,
-            context_md=context_md, anchors=anchors, style=style,
-            cite_density=cite_density, k=k, hyde=hyde,
-            session_id="mcp", client="mcp",
-        )
-        routing_loci_dicts = [_routing_locus_dict(rl, verbose=verbose) for rl in result.routing_loci]
-        _broadcast_trace_run(project_id, {
-            "response_id": result.response_id, "session_id": "mcp",
-            "query": instruction, "ts": now_iso(), "k": k,
-            "routing_loci": routing_loci_dicts, "trace_table": result.trace_table,
-        })
-        pending_effects = pending_effects_from_reflect(result.reflect_job_id, trigger="draft")
-        out: dict[str, Any] = {
-            "output_md": result.output_md,
-            "citations": [
-                {
-                    "node_id": c.node_id, "kind": c.kind, "subkind": c.subkind,
-                    "title": c.title, "why_cited": c.why_cited, "routed_by": c.routed_by,
-                    "chunk_id": c.chunk_id, "chunk_section": c.chunk_section,
-                    "verdict": c.verdict, "verdict_reason": c.verdict_reason,
-                }
-                for c in result.citations
-            ],
-            "routing_loci": routing_loci_dicts,
-            "trace_table": result.trace_table,
-            "trace_narrative": result.trace_narrative,
-            "pending_effects": pending_effects,
-            "response_id": result.response_id,
-            "verdicts": [
-                {"handle": v.handle, "sentence_index": v.sentence_index,
-                 "verdict": v.verdict, "reason": v.reason}
-                for v in result.verdicts
-            ],
-        }
-        if verbose:
-            out["pruned_loci"] = result.pruned_loci
-        return out
+            if is_url:
+                result = await ingest_url(input_str, context_text, project_id, conn)
+            elif is_path:
+                result = await ingest_file(Path(input_str), context_text, project_id, conn)
+            else:
+                # Treat as raw text snippet; use first ~60 chars as title.
+                title = input_str[:60].split("\n")[0].strip() or "Untitled snippet"
+                result = await ingest_text(input_str, title, context_text, project_id, conn)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("loci_save: ingest failed for %r", input_str)
+            return f"Error during ingest: {exc}"
 
-    @mcp.tool(
-        name="loci_expand_citation",
-        description="Look up a previous loci response by id. Returns the original request, output, and the node ids it cited.",
-    )
-    def loci_expand_citation(response_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        rec = CitationTracker(conn).get_response(response_id)
-        if rec is None:
-            return {"error": "response not found", "response_id": response_id}
-        return rec
+        # --- Resolve folder and aspects ---
+        if result.is_duplicate:
+            confirmed_folder = folder or result.existing_folder
+            confirmed_aspects = aspects if aspects is not None else result.existing_aspects
+        else:
+            if folder is None or aspects is None:
+                # Try elicitation when either value is missing.
+                confirmed_folder, confirmed_aspects = await _elicit_folder_and_aspects(
+                    ctx=ctx,
+                    result=result,
+                    caller_folder=folder,
+                    caller_aspects=aspects,
+                )
+            else:
+                confirmed_folder = folder
+                confirmed_aspects = aspects
 
-    @mcp.tool(
-        name="loci_expand_node",
-        description="Fetch a single node + its outgoing/incoming edges. Useful when a citation points at a node id.",
-    )
-    def loci_expand_node(node_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        n = NodeRepository(conn).get(node_id)
-        if n is None:
-            return {"error": "node not found", "node_id": node_id}
-        out_edges = EdgeRepository(conn).from_node(node_id)
-        return {
-            "node": n.model_dump(),
-            "edges_out": [e.model_dump() for e in out_edges],
-        }
+        # --- Write provenance folder update ---
+        if confirmed_folder:
+            conn.execute(
+                "UPDATE resource_provenance SET folder = ? WHERE resource_id = ?",
+                (confirmed_folder, result.resource_id),
+            )
+            conn.commit()
 
-    @mcp.tool(
-        name="loci_propose_node",
-        description=(
-            "Propose a new locus of thought (interpretation node) for the "
-            "user's graph. A locus must have the three slots: relation_md "
-            "(how the source(s) relate to the project), overlap_md (the "
-            "concrete intersection), source_anchor_md (which part of which "
-            "source carries the weight). The locus lands as `proposed` until "
-            "the user accepts or dismisses it. `subkind` ∈ {tension, "
-            "decision, philosophy, relevance}; for `relevance` set `angle` "
-            "from the closed vocabulary. `cites` lists raw node ids the "
-            "locus points at; `derives_from` lists upstream loci this one "
-            "builds on."
-        ),
-    )
-    def loci_propose_node(
-        subkind: str,
-        title: str,
-        relation_md: str,
-        overlap_md: str,
-        source_anchor_md: str,
-        body: str = "",
-        angle: str | None = None,
-        project: str | None = None,
-        cites: list[str] | None = None,
-        derives_from: list[str] | None = None,
-    ) -> dict[str, Any]:
-        conn = get_connection()
-        try:
-            project_id = resolve_project_id(conn, project)
-        except ProjectNotFound as e:
-            return {"error": str(e)}
-        from loci.graph.edges import EdgeError
+        # --- Write aspect tags ---
+        if confirmed_aspects:
+            aspect_repo = AspectRepository(conn)
+            aspect_repo.tag_resource(result.resource_id, confirmed_aspects, source="user")
+            conn.commit()
 
-        nodes_repo = NodeRepository(conn)
-        edges_repo = EdgeRepository(conn)
-        node = InterpretationNode(
-            subkind=subkind,  # type: ignore[arg-type]
-            title=title, body=body,
-            relation_md=relation_md, overlap_md=overlap_md,
-            source_anchor_md=source_anchor_md,
-            angle=angle,  # type: ignore[arg-type]
-            origin="proposal_accepted",
-            status="proposed",
-            confidence=0.5,
-        )
-        emb_text = "\n\n".join(p for p in [
-            title, relation_md, overlap_md, source_anchor_md,
-        ] if p).strip()
-        emb = get_embedder().encode(emb_text) if emb_text else None
-        nodes_repo.create_interpretation(node, embedding=emb)
-        ProjectRepository(conn).add_member(project_id, node.id, role="included")
+        # --- Add to project membership ---
+        proj_repo = ProjectRepository(conn)
+        proj_repo.add_member(project_id, result.resource_id, role="included")
+        conn.commit()
 
-        edge_errors: list[str] = []
-        for raw_id in (cites or []):
-            try:
-                edges_repo.create(node.id, raw_id, type="cites")
-            except EdgeError as exc:
-                edge_errors.append(f"cites→{raw_id}: {exc}")
-        for upstream in (derives_from or []):
-            try:
-                edges_repo.create(node.id, upstream, type="derives_from")
-            except EdgeError as exc:
-                edge_errors.append(f"derives_from→{upstream}: {exc}")
-        result = {"node_id": node.id, "status": "proposed"}
-        if edge_errors:
-            result["edge_errors"] = edge_errors
-        return result
-
-    @mcp.tool(
-        name="loci_accept_proposal",
-        description="Accept a proposal by id. Promotes the proposed node to `live` and bumps confidence.",
-    )
-    def loci_accept_proposal(proposal_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT id, project_id, kind, payload, status FROM proposals WHERE id = ?",
-            (proposal_id,),
+        # --- Count chunks ---
+        chunk_count_row = conn.execute(
+            "SELECT COUNT(*) FROM raw_chunks WHERE node_id = ?",
+            (result.resource_id,),
         ).fetchone()
-        if row is None:
-            return {"error": "proposal not found"}
-        if row["status"] != "pending":
-            return {"error": f"proposal not pending (status={row['status']})"}
-        conn.execute(
-            "UPDATE proposals SET status = 'accepted', resolved_at = datetime('now') WHERE id = ?",
-            (proposal_id,),
+        chunk_count = chunk_count_row[0] if chunk_count_row else 0
+
+        dup_note = " (already existed)" if result.is_duplicate else ""
+        aspects_str = ", ".join(confirmed_aspects) if confirmed_aspects else "(none)"
+        folder_str = confirmed_folder or "(none)"
+        return (
+            f"Saved: {result.title}{dup_note}\n"
+            f"ID: {result.resource_id}\n"
+            f"Folder: {folder_str}\n"
+            f"Aspects: {aspects_str}\n"
+            f"Chunks: {chunk_count}"
         )
-        if row["kind"] == "node":
-            payload = json.loads(row["payload"])
-            nid = payload.get("about_node_id")
-            if nid:
-                conn.execute(
-                    "UPDATE nodes SET status = 'live' WHERE id = ?", (nid,)
-                )
-                conn.execute(
-                    """UPDATE nodes SET confidence = MIN(1.0, confidence + 0.15)
-                       WHERE id = ?""",
-                    (nid,),
-                )
-        return {"proposal_id": proposal_id, "status": "accepted"}
+
+    # -----------------------------------------------------------------------
+    # Tool 2: loci_recall
+    # -----------------------------------------------------------------------
 
     @mcp.tool(
-        name="loci_research",
+        name="loci_recall",
         description=(
-            "Start a paper-discovery research run for a loci project. "
-            "A sub-agent searches HuggingFace Papers, Semantic Scholar, and "
-            "arXiv, reads relevant sections, traces citation graphs, and saves "
-            "paper notes + a SUMMARY.md as artifacts in the workspace. On "
-            "completion the artifacts become raw nodes and a `relevance` locus "
-            "is created, so future `loci_retrieve` / `loci_draft` calls route "
-            "to them.\n\n"
-            "sandbox defaults to False (paper-only, no HF account needed). "
-            "Set sandbox=True + hf_owner to also run code in an HF Spaces "
-            "environment (requires HF_TOKEN env var).\n\n"
-            "Returns {job_id}. After calling this, poll "
-            "`loci_research_status(job_id)` every 10–15 seconds and display "
-            "the `progress_display` field to the user until status is 'done' "
-            "or 'failed'. The display shows a live progress bar and the most "
-            "recent agent steps (which papers were searched/read/saved)."
+            "Retrieve resources relevant to a query using concept-graph-driven "
+            "retrieval (BM25 + ANN + aspect expansion + graph reranking). "
+            "Returns ranked sources with the reason each was surfaced."
         ),
     )
-    def loci_research(
+    async def loci_recall(
         query: str,
-        workspace: str,
+        n: int = 5,
+        filter_aspects: list[str] | None = None,
+        filter_folder: str | None = None,
         project: str | None = None,
-        hf_owner: str | None = None,
-        hardware: str = "cpu-basic",
-        sandbox: bool = False,
-        max_iterations: int = 30,
-    ) -> dict[str, Any]:
+    ) -> str:
+        from loci.retrieve.pipeline import retrieve
+
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
-            return {"error": str(e)}
-        ws_repo = WorkspaceRepository(conn)
-        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
-        if ws is None:
-            return {"error": f"workspace not found: {workspace}"}
-        if not ws_repo.list_sources(ws.id):
-            return {
-                "error": (
-                    f"workspace {ws.slug!r} has no source roots. "
-                    "Add one with `loci_workspace_add_source` first."
-                ),
-            }
-        job_id = enqueue(
-            conn, kind="autoresearch", project_id=project_id,
-            payload={
-                "query": query,
-                "workspace_id": ws.id,
-                "hf_owner": hf_owner,
-                "hardware": hardware,
-                "sandbox": sandbox,
-                "max_iterations": max_iterations,
-            },
-        )
-        return {
-            "job_id": job_id, "status": "queued",
-            "workspace_id": ws.id, "project_id": project_id,
-        }
+            return f"Error: {e}"
+
+        try:
+            results = await retrieve(
+                query=query,
+                project_id=project_id,
+                conn=conn,
+                n=n,
+                filter_aspects=filter_aspects,
+                filter_folder=filter_folder,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("loci_recall: retrieve failed")
+            return f"Error during retrieval: {exc}"
+
+        if not results:
+            return f'## Recall: "{query}"\n\nNo results found.'
+
+        # Log usage for each returned resource.
+        for r in results:
+            await _log_usage(r.resource_id, "loci_recall", conn)
+
+        lines: list[str] = [f'## Recall: "{query}"\n']
+        for i, r in enumerate(results, start=1):
+            folder_tag = f" [{r.folder}]" if r.folder else ""
+            aspects_str = ", ".join(r.aspects) if r.aspects else "—"
+            top_text = ""
+            if r.chunks:
+                raw_text = r.chunks[0].text[:300]
+                top_text = raw_text.replace("\n", " ").strip()
+                if len(r.chunks[0].text) > 300:
+                    top_text += "..."
+
+            lines.append(f"### {i}. {r.title}{folder_tag}")
+            lines.append(f"**ID**: `{r.resource_id}`")
+            lines.append(f"**Aspects**: {aspects_str}")
+            lines.append(f"**Why surfaced**: {r.why_surfaced}")
+            if top_text:
+                lines.append(f"\n> {top_text}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # Tool 3: loci_aspects
+    # -----------------------------------------------------------------------
 
     @mcp.tool(
-        name="loci_research_status",
+        name="loci_aspects",
         description=(
-            "Poll a research (or any) job's status. Returns "
-            "{status, progress, progress_display, step_log, result, error}. "
-            "`progress_display` is a pre-formatted string with a progress bar "
-            "and the last 12 agent steps — show it directly to the user while "
-            "polling. `step_log` is the raw array of {t, tool, msg} entries. "
-            "When status='done', `result` has summary_md, artifact paths, "
-            "used_papers, and the summary_locus_id. "
-            "Poll every 10–15s while status is 'queued' or 'running'."
+            "List or edit aspect labels for a resource or the whole project vocabulary.\n\n"
+            'action="list": show current aspects for the resource, or the full vocab if no resource_id.\n'
+            'action="add": add aspect labels to a resource (requires resource_id + labels).\n'
+            'action="remove": remove aspect labels from a resource (requires resource_id + labels).\n'
+            'action="edit": open an interactive form to edit aspects (elicitation, requires resource_id).'
         ),
     )
-    def loci_research_status(job_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        from loci.jobs import get_job
-        job = get_job(conn, job_id)
-        if job is None:
-            return {"error": "job not found", "job_id": job_id}
-
-        step_log: list[dict] = job.get("step_log") or []
-        recent = step_log[-12:]
-        pct = int((job.get("progress") or 0.0) * 100)
-        filled = pct // 10
-        bar = "█" * filled + "░" * (10 - filled)
-        status = job.get("status", "unknown")
-        lines = [f"[{bar}] {pct}%  {status}"]
-        for entry in recent:
-            lines.append(f"  {entry.get('msg', entry.get('tool', '?'))}")
-        if status == "done":
-            result = job.get("result") or {}
-            n_artifacts = len(result.get("artifacts") or [])
-            n_papers = len(result.get("used_papers") or [])
-            lines.append(f"  ✓ done — {n_papers} papers, {n_artifacts} artifacts")
-        elif status == "failed":
-            lines.append(f"  ✗ {(job.get('error') or '')[:120]}")
-
-        job["progress_display"] = "\n".join(lines)
-        return job
-
-    @mcp.tool(
-        name="loci_reflect",
-        description=(
-            "Enqueue a reflect job for the project. "
-            "Pass absorb=True to also run an absorb checkpoint first. "
-            "Returns a job_id; poll via the REST /jobs/:id endpoint."
-        ),
-    )
-    def loci_reflect(project: str | None = None, absorb: bool = False) -> dict[str, Any]:
+    async def loci_aspects(
+        ctx: Context,
+        resource_id: str | None = None,
+        action: str = "list",
+        labels: list[str] | None = None,
+        project: str | None = None,
+    ) -> str:
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
-            return {"error": str(e)}
-        if absorb:
-            enqueue(conn, kind="absorb", project_id=project_id)
-        job_id = enqueue(conn, kind="reflect", project_id=project_id)
-        return {"job_id": job_id, "status": "queued"}
+            return f"Error: {e}"
+
+        aspect_repo = AspectRepository(conn)
+
+        if action == "list":
+            if resource_id is None:
+                # Return the full project vocabulary with usage counts.
+                top = aspect_repo.top_aspects(project_id, limit=100)
+                if not top:
+                    return "No aspects in this project yet."
+                lines = ["## Project Aspect Vocabulary\n"]
+                for label, count in top:
+                    lines.append(
+                        f"- **{label}** ({count} resource{'s' if count != 1 else ''})"
+                    )
+                return "\n".join(lines)
+            else:
+                # Return aspects for the specific resource.
+                resource_aspects = aspect_repo.aspects_for(resource_id)
+                if not resource_aspects:
+                    return f"No aspects for resource `{resource_id}`."
+                lines = [f"## Aspects for `{resource_id}`\n"]
+                for ra in resource_aspects:
+                    label_row = conn.execute(
+                        "SELECT label FROM aspect_vocab WHERE id = ?", (ra.aspect_id,)
+                    ).fetchone()
+                    label = label_row["label"] if label_row else ra.aspect_id
+                    lines.append(
+                        f"- **{label}** (confidence: {ra.confidence:.2f}, source: {ra.source})"
+                    )
+                return "\n".join(lines)
+
+        elif action == "add":
+            if resource_id is None:
+                return "Error: resource_id is required for action='add'."
+            if not labels:
+                return "Error: labels is required for action='add'."
+            aspect_repo.tag_resource(resource_id, labels, source="user")
+            conn.commit()
+            return f"Added aspects to `{resource_id}`: {', '.join(labels)}"
+
+        elif action == "remove":
+            if resource_id is None:
+                return "Error: resource_id is required for action='remove'."
+            if not labels:
+                return "Error: labels is required for action='remove'."
+            aspect_repo.untag_resource(resource_id, labels)
+            conn.commit()
+            return f"Removed aspects from `{resource_id}`: {', '.join(labels)}"
+
+        elif action == "edit":
+            if resource_id is None:
+                return "Error: resource_id is required for action='edit'."
+
+            # Get current aspects.
+            current_aspects = aspect_repo.aspects_for(resource_id)
+            current_labels: list[str] = []
+            for ra in current_aspects:
+                label_row = conn.execute(
+                    "SELECT label FROM aspect_vocab WHERE id = ?", (ra.aspect_id,)
+                ).fetchone()
+                if label_row:
+                    current_labels.append(label_row["label"])
+
+            chosen_labels = current_labels[:]
+
+            # Try elicitation with a simple text field (comma-separated).
+            try:
+                from pydantic import BaseModel
+
+                class AspectEditForm(BaseModel):
+                    aspects_csv: str = ", ".join(current_labels)
+                    additional: str = ""
+
+                elicit_result = await ctx.elicit(
+                    message=(
+                        f"Edit aspects for `{resource_id}`.\n"
+                        f"Current: {', '.join(current_labels) or '(none)'}"
+                    ),
+                    schema=AspectEditForm,
+                )
+                if (
+                    elicit_result.action == "accept"
+                    and elicit_result.data is not None
+                ):
+                    data = elicit_result.data
+                    csv = (data.aspects_csv or "").strip()
+                    extras = (data.additional or "").strip()
+                    chosen_labels = [
+                        lbl.strip() for lbl in csv.split(",") if lbl.strip()
+                    ]
+                    if extras:
+                        for lbl in extras.split(","):
+                            lbl = lbl.strip()
+                            if lbl and lbl not in chosen_labels:
+                                chosen_labels.append(lbl)
+            except Exception:  # noqa: BLE001
+                # Elicitation not supported — keep current labels.
+                pass
+
+            # Replace all aspects.
+            aspect_repo.clear_resource_aspects(resource_id)
+            if chosen_labels:
+                aspect_repo.tag_resource(resource_id, chosen_labels, source="user")
+            conn.commit()
+            return (
+                f"Updated aspects for `{resource_id}`:\n"
+                + (", ".join(chosen_labels) if chosen_labels else "(none)")
+            )
+
+        else:
+            return (
+                f"Error: unknown action {action!r}. "
+                "Use 'list', 'add', 'remove', or 'edit'."
+            )
+
+    # -----------------------------------------------------------------------
+    # Tool 4: loci_browse
+    # -----------------------------------------------------------------------
 
     @mcp.tool(
-        name="loci_feedback",
+        name="loci_browse",
         description=(
-            "Submit feedback on a previous loci response. Pass the response_id "
-            "from a prior retrieve/draft call and your edited markdown. This "
-            "queues a reflect job so the graph learns from your edits."
+            "Browse saved resources, optionally filtered by folder, aspect label, "
+            "or keyword (title/body substring). Returns a markdown table of matching "
+            "resources with Title, ID, Folder, Aspects, and Saved date."
         ),
     )
-    def loci_feedback(
-        response_id: str,
-        edited_markdown: str,
-    ) -> dict[str, Any]:
-        conn = get_connection()
-        rec = CitationTracker(conn).get_response(response_id)
-        if rec is None:
-            return {"error": "response not found", "response_id": response_id}
-        project_id = rec.get("project_id")
-        if not project_id:
-            return {"error": "response has no project_id"}
-        # Write the edited text as a follow-up response so the reflect cycle
-        # can diff against the original and learn citation feedback.
-        from loci.citations import ResponseRecord
-        follow_up = ResponseRecord(
-            project_id=project_id, session_id="mcp",
-            request={"edited_from": response_id},
-            output=edited_markdown,
-            cited_node_ids=rec.get("cited_node_ids", []),
-            client="mcp_feedback",
-        )
-        frid = CitationTracker(conn).write_response(follow_up, retrieved_node_ids=[])
-        job_id = enqueue(
-            conn, kind="reflect", project_id=project_id,
-            payload={"response_id": frid, "trigger": "user_feedback"},
-        )
-        return {"feedback_response_id": frid, "reflect_job_id": job_id, "status": "queued"}
-
-    @mcp.tool(
-        name="loci_current_project",
-        description=(
-            "Return the project that would be auto-resolved for the current "
-            "working directory. Useful for confirming which project loci tools "
-            "will target when `project` is omitted."
-        ),
-    )
-    def loci_current_project() -> dict[str, Any]:
+    async def loci_browse(
+        folder: str | None = None,
+        aspect: str | None = None,
+        query: str | None = None,
+        limit: int = 20,
+        project: str | None = None,
+    ) -> str:
         conn = get_connection()
         try:
-            project_id = resolve_project_id(conn)
+            project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
-            return {"error": str(e), "resolved": False}
-        proj = ProjectRepository(conn).get(project_id)
-        if proj is None:
-            return {"error": "resolved id not found", "resolved": False}
-        return {
-            "resolved": True,
-            "id": proj.id,
-            "slug": proj.slug,
-            "name": proj.name,
-        }
+            return f"Error: {e}"
+
+        # Build query with optional aspect subquery filter.
+        where_parts = ["pm.project_id = ?"]
+        params: list[Any] = [project_id]
+
+        if aspect:
+            where_parts.append(
+                """
+                n.id IN (
+                    SELECT ra2.resource_id
+                    FROM resource_aspects ra2
+                    JOIN aspect_vocab av2 ON av2.id = ra2.aspect_id
+                    WHERE av2.label = ?
+                )
+                """
+            )
+            params.append(aspect)
+
+        if folder:
+            where_parts.append("(rp.folder = ? OR rp.folder LIKE ?)")
+            params.extend([folder, f"{folder}/%"])
+
+        if query:
+            where_parts.append("(n.title LIKE ? OR n.body LIKE ?)")
+            params.extend([f"%{query}%", f"%{query}%"])
+
+        sql = f"""
+            SELECT
+                n.id,
+                n.title,
+                n.created_at,
+                rp.folder,
+                GROUP_CONCAT(av.label, ', ') AS aspects
+            FROM nodes n
+            JOIN project_effective_members pm ON pm.node_id = n.id
+            LEFT JOIN resource_provenance rp ON rp.resource_id = n.id
+            LEFT JOIN resource_aspects ra ON ra.resource_id = n.id
+            LEFT JOIN aspect_vocab av ON av.id = ra.aspect_id
+            WHERE {" AND ".join(where_parts)}
+            GROUP BY n.id
+            ORDER BY n.created_at DESC
+            LIMIT ?
+        """
+        params.append(limit)
+
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("loci_browse: SQL failed")
+            return f"Error during browse: {exc}"
+
+        if not rows:
+            filters = []
+            if folder:
+                filters.append(f"folder={folder!r}")
+            if aspect:
+                filters.append(f"aspect={aspect!r}")
+            if query:
+                filters.append(f"keyword={query!r}")
+            filter_str = ", ".join(filters) or "no filters"
+            return f"No resources found ({filter_str})."
+
+        lines = ["## Resources\n"]
+        lines.append("| Title | ID | Folder | Aspects | Saved |")
+        lines.append("|-------|-----|--------|---------|-------|")
+        for row in rows:
+            title = (row["title"] or "Untitled")[:50]
+            rid = row["id"]
+            folder_cell = row["folder"] or "—"
+            aspects_cell = row["aspects"] or "—"
+            if len(aspects_cell) > 40:
+                aspects_cell = aspects_cell[:37] + "..."
+            saved = (row["created_at"] or "")[:10]
+            lines.append(
+                f"| {title} | `{rid}` | {folder_cell} | {aspects_cell} | {saved} |"
+            )
+
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # Tool 5: loci_context
+    # -----------------------------------------------------------------------
 
     @mcp.tool(
         name="loci_context",
         description=(
-            "Return full situational context for the current project: project info, "
-            "linked information workspaces, graph stats, recently accessed nodes, and "
-            "interpretation nodes created or updated in the last N hours. Call this at "
-            "the start of a session to understand what knowledge is available and what "
-            "has changed recently. `hours` controls the recency window for updated nodes "
-            "(default 24)."
+            "Return a summary of the current loci project: resource count, folder "
+            "structure, top aspects, and workspace links. Call at the start of a "
+            "session to understand what knowledge is available."
         ),
     )
-    def loci_context(
-        project: str | None = None,
-        hours: int = 24,
-    ) -> dict[str, Any]:
+    async def loci_context(project: str | None = None) -> str:
         conn = get_connection()
         try:
             project_id = resolve_project_id(conn, project)
         except ProjectNotFound as e:
-            return {"error": str(e)}
+            return f"Error: {e}"
+
         proj = ProjectRepository(conn).get(project_id)
         if proj is None:
-            return {"error": "project not found"}
+            return "Error: project not found."
 
-        ws_repo = WorkspaceRepository(conn)
-        links = ws_repo.linked_workspaces(project_id)
-        workspaces = []
-        for ws, link in links:
-            if link.role == "excluded":
-                continue
-            raw_count = conn.execute(
-                "SELECT COUNT(*) FROM nodes n JOIN workspace_membership wm ON wm.node_id = n.id "
-                "WHERE wm.workspace_id = ? AND n.kind = 'raw'",
-                (ws.id,),
-            ).fetchone()[0]
-            workspaces.append({
-                "id": ws.id, "slug": ws.slug, "name": ws.name,
-                "kind": ws.kind, "role": link.role,
-                "raw_count": raw_count,
-                "description_md": ws.description_md,
-            })
-
-        stats_row = conn.execute(
+        # Resource count.
+        count_row = conn.execute(
             """
-            SELECT
-                SUM(CASE n.kind WHEN 'raw' THEN 1 ELSE 0 END) AS raw_nodes,
-                SUM(CASE n.kind WHEN 'interpretation' THEN 1 ELSE 0 END) AS interpretation_nodes,
-                SUM(CASE n.status WHEN 'live' THEN 1 ELSE 0 END) AS live_nodes
-            FROM nodes n
-            JOIN project_effective_members pm ON pm.node_id = n.id
-            WHERE pm.project_id = ?
+            SELECT COUNT(*) AS cnt
+            FROM project_effective_members pm
+            JOIN nodes n ON n.id = pm.node_id
+            WHERE pm.project_id = ? AND n.kind = 'raw'
             """,
             (project_id,),
         ).fetchone()
+        resource_count = count_row["cnt"] if count_row else 0
 
-        recent_accessed = conn.execute(
+        # Folder tree.
+        folder_rows = conn.execute(
             """
-            SELECT n.id, n.title, n.kind, n.subkind, n.last_accessed_at, n.confidence
-            FROM nodes n
-            JOIN project_effective_members pm ON pm.node_id = n.id
-            WHERE pm.project_id = ? AND n.last_accessed_at IS NOT NULL
-            ORDER BY n.last_accessed_at DESC LIMIT 8
+            SELECT rp.folder, COUNT(*) AS cnt
+            FROM resource_provenance rp
+            JOIN project_effective_members pm ON pm.node_id = rp.resource_id
+            WHERE pm.project_id = ?
+              AND rp.folder IS NOT NULL
+              AND rp.folder != ''
+            GROUP BY rp.folder
+            ORDER BY cnt DESC
             """,
             (project_id,),
         ).fetchall()
 
-        from datetime import UTC, datetime, timedelta
-        since = (datetime.now(UTC) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        recent_nodes = conn.execute(
-            """
-            SELECT n.id, n.kind, n.subkind, n.title, n.body, n.confidence, n.status,
-                   n.created_at, n.updated_at
-            FROM nodes n
-            JOIN project_effective_members pm ON pm.node_id = n.id
-            WHERE pm.project_id = ? AND n.kind = 'interpretation'
-              AND (n.created_at >= ? OR n.updated_at >= ?)
-            ORDER BY n.updated_at DESC LIMIT 20
-            """,
-            (project_id, since, since),
-        ).fetchall()
+        # Top 10 aspects.
+        aspect_repo = AspectRepository(conn)
+        top_aspects = aspect_repo.top_aspects(project_id, limit=10)
 
-        from loci.agent.memo import build_project_memo
-        project_memo = build_project_memo(conn, project_id)
+        # Workspaces.
+        ws_repo = WorkspaceRepository(conn)
+        ws_links = ws_repo.linked_workspaces(project_id)
 
-        return {
-            "project": {
-                "id": proj.id, "slug": proj.slug, "name": proj.name,
-                "last_active_at": proj.last_active_at,
-            },
-            "workspaces": workspaces,
-            "stats": {
-                "raw_nodes": stats_row["raw_nodes"] or 0,
-                "interpretation_nodes": stats_row["interpretation_nodes"] or 0,
-                "live_nodes": stats_row["live_nodes"] or 0,
-            },
-            "recent_activity": [
-                {"id": r["id"], "title": r["title"], "kind": r["kind"],
-                 "subkind": r["subkind"], "last_accessed_at": r["last_accessed_at"],
-                 "confidence": r["confidence"]}
-                for r in recent_accessed
-            ],
-            "recently_updated": [
-                {"id": r["id"], "kind": r["kind"], "subkind": r["subkind"],
-                 "title": r["title"], "body": (r["body"] or "")[:300],
-                 "confidence": r["confidence"], "status": r["status"],
-                 "created_at": r["created_at"], "updated_at": r["updated_at"]}
-                for r in recent_nodes
-            ],
-            "since": since,
-            "project_memo": project_memo,
-        }
+        lines: list[str] = []
+        lines.append(f"## loci project: {proj.name or proj.slug}")
+        lines.append(f"**ID**: `{proj.id}`  **Slug**: `{proj.slug}`")
+        lines.append(f"**Resources**: {resource_count}")
+        lines.append("")
+
+        if folder_rows:
+            lines.append("### Folders")
+            for row in folder_rows:
+                cnt = row["cnt"]
+                lines.append(
+                    f"- `{row['folder']}` ({cnt} resource{'s' if cnt != 1 else ''})"
+                )
+            lines.append("")
+
+        if top_aspects:
+            lines.append("### Top aspects")
+            for label, cnt in top_aspects:
+                lines.append(f"- **{label}** ({cnt})")
+            lines.append("")
+
+        if ws_links:
+            lines.append("### Workspaces")
+            for ws, link in ws_links:
+                if link.role == "excluded":
+                    continue
+                lines.append(f"- **{ws.name or ws.slug}** (role: {link.role})")
+            lines.append("")
+
+        lines.append("### Usage hints")
+        lines.append("- `loci_recall` — semantic search over resources")
+        lines.append("- `loci_save` — capture a URL, file, or text snippet")
+        lines.append("- `loci_browse` — filter by folder or aspect")
+        lines.append(
+            "- `@loci:source://{id}` — reference a specific resource in context"
+        )
+
+        return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # Tool 6: loci_research (stub — v1.1)
+    # -----------------------------------------------------------------------
 
     @mcp.tool(
-        name="loci_workspace_create",
-        description="Create a new information workspace (a labeled bag of source roots).",
+        name="loci_research",
+        description=(
+            "Start a paper-discovery research run. "
+            "(Paper research is coming in loci v1.1 — this tool is a stub.)"
+        ),
     )
-    def loci_workspace_create(
-        slug: str,
-        name: str,
-        kind: str = "mixed",
-        description_md: str = "",
-    ) -> dict[str, Any]:
-        conn = get_connection()
-        ws = Workspace(slug=slug, name=name, kind=kind, description_md=description_md)  # type: ignore[arg-type]
-        WorkspaceRepository(conn).create(ws)
-        return {"workspace_id": ws.id, "slug": ws.slug}
+    async def loci_research(
+        query: str,
+        project: str | None = None,
+    ) -> str:
+        return (
+            "Paper research is coming in loci v1.1. "
+            "In the meantime, use `loci_save` to capture a URL or PDF "
+            "and `loci_recall` to search your existing library."
+        )
+
+    # -----------------------------------------------------------------------
+    # Workspace list (kept for compatibility)
+    # -----------------------------------------------------------------------
 
     @mcp.tool(
         name="loci_workspace_list",
         description="List all information workspaces.",
     )
-    def loci_workspace_list() -> dict[str, Any]:
+    async def loci_workspace_list() -> str:
         conn = get_connection()
-        ws_repo = WorkspaceRepository(conn)
-        workspaces = ws_repo.list()
-        return {
-            "workspaces": [
-                {"id": ws.id, "slug": ws.slug, "name": ws.name, "kind": ws.kind}
-                for ws in workspaces
-            ]
-        }
+        workspaces = WorkspaceRepository(conn).list()
+        if not workspaces:
+            return "No workspaces found."
+        lines = ["## Workspaces\n"]
+        lines.append("| Slug | Name | Kind |")
+        lines.append("|------|------|------|")
+        for ws in workspaces:
+            lines.append(f"| {ws.slug} | {ws.name} | {ws.kind} |")
+        return "\n".join(lines)
 
-    @mcp.tool(
-        name="loci_workspace_link",
-        description=(
-            "Link an information workspace to a project. Enqueues a relevance "
-            "pass so the graph gains typed bridge interpretations. "
-            "`workspace` is the workspace slug or id."
-        ),
-    )
-    def loci_workspace_link(
-        workspace: str,
-        project: str | None = None,
-        role: str = "reference",
-    ) -> dict[str, Any]:
+    # -----------------------------------------------------------------------
+    # MCP Resources — @-mention deep links
+    # -----------------------------------------------------------------------
+
+    @mcp.resource("loci:source://{resource_id}")
+    async def get_source(resource_id: str) -> str:
+        """Full text of a resource by ID."""
         conn = get_connection()
+        src_repo = SourceRepository(conn)
+        node = src_repo.get(resource_id)
+        if node is None:
+            return f"Resource not found: {resource_id}"
+
+        await _log_usage(resource_id, "resource_get_source", conn)
+
+        # Fetch provenance.
+        prov_row = conn.execute(
+            """
+            SELECT folder, source_url, context_text
+            FROM resource_provenance
+            WHERE resource_id = ?
+            """,
+            (resource_id,),
+        ).fetchone()
+        folder = prov_row["folder"] if prov_row else None
+        source_url = prov_row["source_url"] if prov_row else None
+
+        # Fetch aspects.
+        aspect_repo = AspectRepository(conn)
+        resource_aspects = aspect_repo.aspects_for(resource_id)
+        aspect_labels: list[str] = []
+        for ra in resource_aspects:
+            label_row = conn.execute(
+                "SELECT label FROM aspect_vocab WHERE id = ?", (ra.aspect_id,)
+            ).fetchone()
+            if label_row:
+                aspect_labels.append(label_row["label"])
+
+        header_parts = [f"# {node.title}"]
+        if folder:
+            header_parts.append(f"**Folder**: {folder}")
+        if source_url:
+            header_parts.append(f"**Source**: {source_url}")
+        if aspect_labels:
+            header_parts.append(f"**Aspects**: {', '.join(aspect_labels)}")
+        header_parts.append(f"**ID**: `{resource_id}`")
+        header_parts.append("")
+        header_parts.append(node.body or "(no content)")
+
+        return "\n".join(header_parts)
+
+    @mcp.resource("loci:folder://{folder_path}")
+    async def get_folder(folder_path: str) -> str:
+        """List of resources in a folder."""
+        conn = get_connection()
+
         try:
-            project_id = resolve_project_id(conn, project)
-        except ProjectNotFound as e:
-            return {"error": str(e)}
-        ws_repo = WorkspaceRepository(conn)
-        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
-        if ws is None:
-            return {"error": f"workspace not found: {workspace}"}
-        ws_repo.link_project(project_id, ws.id, role=role)  # type: ignore[arg-type]
-        job_id = enqueue(conn, kind="relevance", project_id=project_id,
-                         payload={"workspace_id": ws.id, "scope": "link"})
-        return {"workspace_id": ws.id, "project_id": project_id,
-                "role": role, "relevance_job_id": job_id}
+            project_id = resolve_project_id(conn)
+        except ProjectNotFound:
+            project_id = None
 
-    @mcp.tool(
-        name="loci_workspace_unlink",
-        description=(
-            "Unlink a workspace from a project. Queues sweep_orphans to mark "
-            "interpretations that depended on that workspace's sources as dirty."
-        ),
-    )
-    def loci_workspace_unlink(
-        workspace: str,
-        project: str | None = None,
-    ) -> dict[str, Any]:
-        conn = get_connection()
-        try:
-            project_id = resolve_project_id(conn, project)
-        except ProjectNotFound as e:
-            return {"error": str(e)}
-        ws_repo = WorkspaceRepository(conn)
-        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
-        if ws is None:
-            return {"error": f"workspace not found: {workspace}"}
-        ws_repo.unlink_project(project_id, ws.id)
-        job_id = enqueue(conn, kind="sweep_orphans", project_id=project_id,
-                         payload={"workspace_id": ws.id})
-        return {"workspace_id": ws.id, "project_id": project_id,
-                "sweep_job_id": job_id}
-
-    @mcp.tool(
-        name="loci_workspace_add_source",
-        description="Register a root directory as a source for a workspace.",
-    )
-    def loci_workspace_add_source(
-        workspace: str,
-        root_path: str,
-        label: str | None = None,
-    ) -> dict[str, Any]:
-        conn = get_connection()
-        from pathlib import Path
-        ws_repo = WorkspaceRepository(conn)
-        ws = ws_repo.get_by_slug(workspace) or ws_repo.get(workspace)
-        if ws is None:
-            return {"error": f"workspace not found: {workspace}"}
-        ws_src = ws_repo.add_source(ws.id, Path(root_path), label=label)
-        return {"source_id": ws_src.id, "workspace_id": ws.id, "root_path": root_path}
-
-    @mcp.tool(
-        name="loci_edit_locus",
-        description=(
-            "Edit a locus of thought's belief slots directly — relation_md, "
-            "overlap_md, source_anchor_md, and/or angle. The node is re-embedded "
-            "and the change is published immediately. Only provide the slots you "
-            "want to change; omitted slots are preserved."
-        ),
-    )
-    def loci_edit_locus(
-        node_id: str,
-        relation_md: str | None = None,
-        overlap_md: str | None = None,
-        source_anchor_md: str | None = None,
-        angle: str | None = None,
-    ) -> dict[str, Any]:
-        conn = get_connection()
-        n = NodeRepository(conn).get(node_id)
-        if n is None:
-            return {"error": "node not found", "node_id": node_id}
-        if n.kind != "interpretation":
-            return {"error": "loci_edit_locus only applies to interpretation nodes"}
-        rel = relation_md if relation_md is not None else getattr(n, "relation_md", "")
-        ovl = overlap_md if overlap_md is not None else getattr(n, "overlap_md", "")
-        anc = source_anchor_md if source_anchor_md is not None else getattr(n, "source_anchor_md", "")
-        emb_text = "\n\n".join(p for p in [n.title, rel, ovl, anc] if p).strip()
-        new_emb = get_embedder().encode(emb_text) if emb_text else None
-        NodeRepository(conn).update_locus(
-            node_id,
-            relation_md=relation_md, overlap_md=overlap_md,
-            source_anchor_md=source_anchor_md, angle=angle,
-            new_embedding=new_emb,
-            actor="user", source_tool="mcp.loci_edit_locus",
-        )
-        from loci.api.publishers import publish_node_upsert
-        updated = NodeRepository(conn).get(node_id)
-        if updated is not None:
-            publish_node_upsert(conn, updated)
-        return {"updated": True, "node_id": node_id}
-
-    @mcp.tool(
-        name="loci_node_history",
-        description=(
-            "Return the revision history for a single interpretation node — "
-            "every create, edit, and delete event in reverse chronological order."
-        ),
-    )
-    def loci_node_history(node_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        conn = get_connection()
-        try:
+        if project_id:
             rows = conn.execute(
                 """
-                SELECT id, node_id, ts, actor, source_tool, op, reason,
-                       prior_values, new_values, parent_revision_id
-                FROM node_revisions WHERE node_id = ? ORDER BY ts DESC LIMIT ?
+                SELECT n.id, n.title, n.created_at
+                FROM nodes n
+                JOIN project_effective_members pm ON pm.node_id = n.id
+                JOIN resource_provenance rp ON rp.resource_id = n.id
+                WHERE pm.project_id = ?
+                  AND (rp.folder = ? OR rp.folder LIKE ?)
+                ORDER BY n.created_at DESC
+                LIMIT 50
                 """,
-                (node_id, limit),
+                (project_id, folder_path, f"{folder_path}/%"),
             ).fetchall()
-        except Exception:  # noqa: BLE001 — table absent on old DBs
-            return []
-        return [dict(r) for r in rows]
+        else:
+            rows = conn.execute(
+                """
+                SELECT n.id, n.title, n.created_at
+                FROM nodes n
+                JOIN resource_provenance rp ON rp.resource_id = n.id
+                WHERE rp.folder = ? OR rp.folder LIKE ?
+                ORDER BY n.created_at DESC
+                LIMIT 50
+                """,
+                (folder_path, f"{folder_path}/%"),
+            ).fetchall()
 
-    @mcp.tool(
-        name="loci_revert_node",
-        description=(
-            "Revert an interpretation node's locus slots to their state at a given "
-            "revision. Provide the node_id and the revision_id to revert to. "
-            "This creates a new revision row (so the revert is itself undoable)."
-        ),
-    )
-    def loci_revert_node(node_id: str, revision_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT * FROM node_revisions WHERE id = ? AND node_id = ?",
-            (revision_id, node_id),
-        ).fetchone()
-        if row is None:
-            return {"error": "revision not found", "revision_id": revision_id}
-        import json as _json
-        prior = _json.loads(row["prior_values"])
-        kwargs = {k: prior[k] for k in ("relation_md", "overlap_md", "source_anchor_md", "angle")
-                  if k in prior and prior[k] is not None}
-        if not kwargs:
-            return {"error": "no reversible slot values in this revision"}
-        from loci.embed.local import get_embedder as _get_embedder
-        n = NodeRepository(conn).get(node_id)
-        if n is None:
-            return {"error": "node not found", "node_id": node_id}
-        title = n.title
-        emb_text = "\n\n".join(p for p in [title,
-                                             kwargs.get("relation_md", ""),
-                                             kwargs.get("overlap_md", ""),
-                                             kwargs.get("source_anchor_md", "")] if p).strip()
-        new_emb = _get_embedder().encode(emb_text) if emb_text else None
-        NodeRepository(conn).update_locus(
-            node_id, **kwargs, new_embedding=new_emb,
-            actor="user", source_tool="mcp.loci_revert_node",
-            reason=f"revert to revision {revision_id}",
-        )
-        from loci.api.publishers import publish_node_upsert
-        updated = NodeRepository(conn).get(node_id)
-        if updated is not None:
-            publish_node_upsert(conn, updated)
-        return {"reverted": True, "node_id": node_id, "from_revision": revision_id}
+        if not rows:
+            return f"No resources in folder: {folder_path}"
 
-    @mcp.tool(
-        name="loci_add_citation",
-        description="Add a `cites` edge from a locus of thought to a raw source node.",
-    )
-    def loci_add_citation(locus_id: str, raw_id: str) -> dict[str, Any]:
+        lines = [f"# Folder: {folder_path}\n"]
+        for row in rows:
+            saved = (row["created_at"] or "")[:10]
+            title = row["title"] or "Untitled"
+            lines.append(
+                f"- [{title}](@loci:source://{row['id']}) — {saved}"
+            )
+
+        return "\n".join(lines)
+
+    @mcp.resource("loci:aspect://{label}")
+    async def get_aspect_resources(label: str) -> str:
+        """Resources tagged with this aspect."""
         conn = get_connection()
-        from loci.api.publishers import publish_edge_upsert
-        from loci.graph.edges import EdgeError
+
         try:
-            edge = EdgeRepository(conn).create(locus_id, raw_id, type="cites")
-        except EdgeError as exc:
-            return {"error": str(exc)}
-        publish_edge_upsert(conn, edge)
-        return {"edge_id": edge.id, "src": locus_id, "dst": raw_id}
+            project_id = resolve_project_id(conn)
+        except ProjectNotFound:
+            project_id = None
 
-    @mcp.tool(
-        name="loci_remove_citation",
-        description="Delete a `cites` edge by edge id (remove a citation from a locus to a raw source).",
-    )
-    def loci_remove_citation(edge_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        from loci.api.publishers import projects_for_edge, publish_edge_delete
-        repo = EdgeRepository(conn)
-        existing = repo.get(edge_id)
-        if existing is None:
-            return {"error": "edge not found", "edge_id": edge_id}
-        src, dst = existing.src, existing.dst
-        pids = projects_for_edge(conn, src, dst)
-        repo.delete(edge_id)
-        publish_edge_delete(conn, edge_id, src=src, dst=dst, project_ids=pids)
-        return {"deleted": True, "edge_id": edge_id}
-
-    @mcp.tool(
-        name="loci_delete_node",
-        description=(
-            "Hard-delete an interpretation node and all its incident edges. "
-            "Permanent — cannot be undone. "
-            "Use `loci_remove_citation` to delete a single citation edge instead."
-        ),
-    )
-    def loci_delete_node(node_id: str) -> dict[str, Any]:
-        conn = get_connection()
-        from loci.api.publishers import (
-            projects_for_edge,
-            projects_for_node,
-            publish_edge_delete,
-            publish_node_delete,
+        aspect_repo = AspectRepository(conn)
+        resource_ids = aspect_repo.resources_for_aspect(
+            label, project_id=project_id, limit=50
         )
-        n = NodeRepository(conn).get(node_id)
-        if n is None:
-            return {"error": "node not found", "node_id": node_id}
-        if n.kind == "raw":
-            return {"error": "raw nodes cannot be deleted via this tool"}
-        edge_rows = conn.execute(
-            "SELECT id, src, dst FROM edges WHERE src = ? OR dst = ?", (node_id, node_id)
-        ).fetchall()
-        edge_fan = [
-            (r["id"], r["src"], r["dst"], projects_for_edge(conn, r["src"], r["dst"]))
-            for r in edge_rows
-        ]
-        node_project_ids = projects_for_node(conn, node_id)
-        NodeRepository(conn).hard_delete(node_id, actor="user", source_tool="mcp.loci_delete_node")
-        for eid, src, dst, pids in edge_fan:
-            publish_edge_delete(conn, eid, src=src, dst=dst, project_ids=pids)
-        publish_node_delete(conn, node_id, project_ids=node_project_ids)
-        return {"deleted": True, "node_id": node_id}
+
+        if not resource_ids:
+            return f"No resources tagged with aspect: {label}"
+
+        src_repo = SourceRepository(conn)
+        nodes = src_repo.get_many(resource_ids)
+
+        lines = [f"# Aspect: {label}\n"]
+        for node in nodes:
+            prov_row = conn.execute(
+                "SELECT folder FROM resource_provenance WHERE resource_id = ?",
+                (node.id,),
+            ).fetchone()
+            folder = prov_row["folder"] if prov_row else None
+            folder_tag = f" [{folder}]" if folder else ""
+            title = node.title or "Untitled"
+            lines.append(
+                f"- [{title}](@loci:source://{node.id}){folder_tag}"
+            )
+
+        return "\n".join(lines)
 
     return mcp
 
 
-def _routing_locus_dict(ri, *, verbose: bool) -> dict[str, Any]:
-    """Serialise a routing locus (RoutingInterp or DraftRoutingLocus). When
-    `verbose=True`, also include channel_ranks / channel_scores / anchor_source
-    so the caller can see WHY a locus scored high and which channel fired."""
-    base = {
-        "id": ri.node_id, "subkind": ri.subkind, "title": ri.title,
-        "relation_md": ri.relation_md, "overlap_md": ri.overlap_md,
-        "source_anchor_md": ri.source_anchor_md,
-        "angle": ri.angle, "score": ri.score,
-    }
-    if verbose:
-        base["channel_ranks"] = getattr(ri, "channel_ranks", {}) or {}
-        base["channel_scores"] = getattr(ri, "channel_scores", {}) or {}
-        base["anchor_source"] = getattr(ri, "anchor_source", None)
-    return base
+# ---------------------------------------------------------------------------
+# Elicitation helper
+# ---------------------------------------------------------------------------
+
+
+async def _elicit_folder_and_aspects(
+    ctx: Context,
+    result: Any,
+    caller_folder: str | None,
+    caller_aspects: list[str] | None,
+) -> tuple[str | None, list[str]]:
+    """Try to elicit folder and aspect choices from the user via MCP elicitation.
+
+    Falls back gracefully to top suggestions when elicitation is not supported
+    or when the user declines.
+
+    Args:
+        ctx: The FastMCP Context object for this tool call.
+        result: A CaptureResult with folder_suggestions and aspect_suggestions.
+        caller_folder: Folder value passed by the caller (may be None).
+        caller_aspects: Aspects list passed by the caller (may be None).
+
+    Returns:
+        (confirmed_folder, confirmed_aspects) tuple.
+    """
+    # Determine suggestion-based defaults.
+    top_folder = caller_folder
+    if top_folder is None and result.folder_suggestions:
+        top_folder = result.folder_suggestions[0][0]
+
+    top_aspects: list[str] = []
+    if caller_aspects is not None:
+        top_aspects = list(caller_aspects)
+    elif result.aspect_suggestions:
+        top_aspects = result.aspect_suggestions[:3]
+
+    try:
+        from pydantic import BaseModel, Field
+
+        # Determine default folder string.
+        folder_default = top_folder or ""
+        folder_options_note = ""
+        if result.folder_suggestions:
+            options = [f[0] for f in result.folder_suggestions]
+            folder_options_note = f" (suggestions: {', '.join(options)})"
+
+        aspects_default = ", ".join(top_aspects)
+
+        class SaveConfirmForm(BaseModel):
+            folder: str = Field(
+                default=folder_default,
+                description=f"Folder label for this resource{folder_options_note}",
+            )
+            aspects: str = Field(
+                default=aspects_default,
+                description="Comma-separated aspect labels for this resource",
+            )
+
+        elicit_result = await ctx.elicit(
+            message=f"Confirm folder and aspects for: {result.title!r}",
+            schema=SaveConfirmForm,
+        )
+
+        if (
+            elicit_result.action == "accept"
+            and elicit_result.data is not None
+        ):
+            data = elicit_result.data
+            chosen_folder = (data.folder or "").strip() or top_folder
+            aspects_raw = (data.aspects or "").strip()
+            chosen_aspects = [
+                lbl.strip() for lbl in aspects_raw.split(",") if lbl.strip()
+            ]
+            return chosen_folder, chosen_aspects
+
+    except Exception:  # noqa: BLE001
+        # Elicitation not supported or failed — fall through to defaults.
+        pass
+
+    return top_folder, top_aspects
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def run_stdio() -> None:

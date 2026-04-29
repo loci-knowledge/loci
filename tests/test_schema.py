@@ -1,18 +1,21 @@
-"""Schema + migration tests."""
+"""Schema bring-up tests."""
 
 from __future__ import annotations
 
 
-def test_migrate_creates_all_tables(conn):
+def test_init_schema_creates_all_tables(conn):
     rows = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
     ).fetchall()
     names = {r["name"] for r in rows}
     expected = {
-        "_migrations", "nodes", "raw_nodes", "interpretation_nodes",
-        "node_tags", "edges", "projects", "project_membership",
-        "responses", "traces", "proposals", "jobs", "communities",
-        "nodes_fts",  # FTS5 also creates internal `nodes_fts_*` shadow tables
+        "nodes", "raw_nodes", "raw_chunks",
+        "node_tags", "projects", "project_membership",
+        "information_workspaces", "workspace_sources", "workspace_membership",
+        "project_workspaces", "jobs",
+        "aspect_vocab", "resource_aspects", "concept_edges",
+        "resource_provenance", "resource_usage_log",
+        "nodes_fts", "chunks_fts",
     }
     missing = expected - names
     assert not missing, f"missing tables: {missing}"
@@ -74,10 +77,8 @@ def test_check_constraint_status_enum(conn):
         )
 
 
-def test_idempotent_migrate(loci_dir):
-    """Running migrate twice should be a no-op the second time."""
-    from loci.db import migrate
-    first = migrate()
-    second = migrate()
-    assert first  # at least 0001 applied
-    assert second == []  # nothing to apply
+def test_init_schema_idempotent(loci_dir):
+    """Running init_schema twice is a clean no-op (no errors, no duplicate tables)."""
+    from loci.db import init_schema
+    init_schema()
+    init_schema()

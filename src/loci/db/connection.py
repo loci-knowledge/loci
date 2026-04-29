@@ -13,7 +13,7 @@ Why a wrapper exists at all:
    We expose `connect()` (always-fresh, caller manages lifetime) and
    `get_connection()` (thread-local cached) for the two patterns.
 
-The schema is owned by `loci.db.migrate`; this module is purely about getting
+The schema is owned by `loci.db.schema`; this module is purely about getting
 a usable connection.
 """
 

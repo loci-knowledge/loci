@@ -4,9 +4,9 @@
 factory=True)` and by the CLI's `loci server` command. Tests construct a fresh
 app per test by calling `create_app()` directly.
 
-App lifespan: at startup we run migrations (idempotent) so a fresh data dir
-just works, and we hand the running asyncio loop to the pubsub bus so sync
-route handlers can schedule WS publishes onto it. Shutdown is a no-op —
+App lifespan: at startup we apply the canonical schema (idempotent) so a fresh
+data dir just works, and we hand the running asyncio loop to the pubsub bus so
+sync route handlers can schedule WS publishes onto it. Shutdown is a no-op —
 connections are closed by Python's atexit.
 """
 
@@ -21,21 +21,17 @@ from fastapi import FastAPI
 from loci import __version__
 from loci.api.pubsub import bus
 from loci.config import get_settings
-from loci.db import migrate
+from loci.db import init_schema
 
 log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Run migrations + warm caches before serving traffic."""
+    """Apply the schema + warm caches before serving traffic."""
     settings = get_settings()
     settings.ensure_dirs()
-    applied = migrate()
-    if applied:
-        log.info("Applied migrations: %s", applied)
-    # Hand the running loop to pubsub so sync route handlers can schedule
-    # `bus.publish(...)` from the threadpool via `run_coroutine_threadsafe`.
+    init_schema()
     bus.attach_loop(asyncio.get_running_loop())
     yield
 
@@ -45,8 +41,8 @@ def create_app() -> FastAPI:
         title="loci",
         version=__version__,
         description=(
-            "Personal memory graph server. Three layers (raw / interpretation / "
-            "project), one citation contract."
+            "Personal memory graph server. Two layers (raw sources / projects), "
+            "aspect-tagged retrieval."
         ),
         lifespan=_lifespan,
     )
@@ -54,50 +50,18 @@ def create_app() -> FastAPI:
     # Routers are imported here (not at module top) so app construction is
     # cheap and tests can swap implementations.
     from loci.api.routes import (
-        anchors,
-        context,
-        draft,
-        edges,
-        feedback,
-        graph_ui,
-        graph_view,
+        aspects,
         jobs,
-        nodes,
         projects,
-        proposals,
-        responses,
-        retrieve,
-        revisions,
+        sources,
         workspaces,
     )
 
     app.include_router(projects.router)
-    app.include_router(anchors.router)
-    app.include_router(context.router)
     app.include_router(workspaces.router)
-    app.include_router(retrieve.router)
-    app.include_router(draft.router)
-    app.include_router(feedback.router)
-    app.include_router(nodes.router)
-    app.include_router(edges.router)
-    app.include_router(proposals.router)
-    app.include_router(graph_view.router)
     app.include_router(jobs.router)
-    app.include_router(responses.router)
-    app.include_router(revisions.router)
-    app.include_router(graph_ui.router)
-
-    from pathlib import Path
-
-    from fastapi.staticfiles import StaticFiles
-
-    _graph_ui_dir = Path(__file__).parent / "static" / "graph_ui"
-    if _graph_ui_dir.exists():
-        app.mount(
-            "/graph/static",
-            StaticFiles(directory=str(_graph_ui_dir)),
-            name="graph_static",
-        )
+    app.include_router(aspects.router)
+    app.include_router(sources.router)
 
     # WebSocket routes are registered directly on the app.
     from loci.api.websocket import register_ws

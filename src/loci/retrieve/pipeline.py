@@ -1,729 +1,362 @@
-"""Retrieval orchestrator — interpretation-routed.
+"""Concept-graph-driven retrieval pipeline.
 
-The new model: interpretations are LOCI OF THOUGHT, not retrieval targets.
-A query never returns interpretation bodies as content. Interpretations route
-the query to raws via their `cites` and `derives_from` edges, and the
-response surfaces those raws together with the trace path that reached them.
+Replaces the old interpretation-routed / PPR pipeline. The new model queries
+raw chunks directly, uses the concept graph (aspect labels + co_aspect /
+cites edges) to expand and rerank, and returns resource-grouped results.
 
 Pipeline:
 
-    1. INTERP STAGE
-       - Score interpretations against the query (lex + vec) over the project.
-       - PPR over the derives_from DAG, anchored on (caller anchors ∪ pinned
-         ∪ top-vec-interp anchors), to weight loci by graph centrality.
-       - Fuse via RRF → top-K_interp interpretation handles.
+    1. expand_query_aspects()  → expanded aspect label list from concept graph
+    2. HyDE                    → hypothetical document, embed it
+    3. search_lex(query, filter_aspects=expanded_aspects)
+    4. search_vec(hyde_vec, filter_aspects=expanded_aspects)
+    5. RRF fusion              → merged chunk ranking (k=60)
+    6. Graph rerank            → boost resources connected by co_aspect / cites
+                                  edges to the current top-5
+    7. Group by resource_id    → take top chunks per resource
+    8. Build RetrievalResult   → with why_surfaced strings
+    9. Return top n resources
 
-    2. ROUTE STAGE
-       - For each top interp, walk:
-           cites          → directly anchored raws       (depth 1)
-           derives_from·cites → raws of upstream loci    (depth 2, downweighted)
-       - Accumulate per-raw provenance: list of (interp_id, edge_type) hops.
-
-    3. DIRECT STAGE
-       - Also score raws directly (lex + vec) — if a raw is the right answer
-         even without a routing locus, we don't want to miss it.
-
-    4. MERGE
-       - Combine routed + direct raw scores. Routed raws get a multiplicative
-         provenance bonus proportional to how many top loci point at them and
-         how strong those loci scored. The bonus is capped — we don't want
-         the agent's loci to drown out raws that genuinely match the query.
-
-    5. RESPONSE
-       - `nodes`: ranked raws (no interpretations).
-       - `traces`: per-raw, the ordered list of interp hops that routed to it.
-       - `routing_interps`: deduplicated interpretation handles used in stage 2,
-         carried separately for UI display ("we considered these loci").
-
-Score fusion: same RRF as before within a stage; cross-stage merge uses
-weighted sum because the route-bonus is multiplicative and asymmetric.
+Score conventions
+-----------------
+- lex scores from BM25 are negative (smaller = better). We negate them before
+  feeding into RRF so that rank 1 = best.
+- vec scores are L2 distances (smaller = better). We negate them too.
+- RRF formula: 1 / (k + rank), higher = better. k=60 is the canonical default.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+import numpy as np
 
 from loci.embed.local import Embedder, get_embedder
-from loci.graph import EdgeRepository, NodeRepository, ProjectRepository
-from loci.graph.models import NodeKind, Subkind
+from loci.graph.aspects import AspectRepository
+from loci.graph.concept_edges import ConceptEdgeRepository
 from loci.retrieve import hyde as hyde_mod
-from loci.retrieve import lex as lex_mod
-from loci.retrieve import ppr as ppr_mod
-from loci.retrieve import vec as vec_mod
+from loci.retrieve.concept_expand import build_why_surfaced, expand_query_aspects
+from loci.retrieve.lex import search_lex
+from loci.retrieve.vec import search_vec
 
 log = logging.getLogger(__name__)
 
-# Reciprocal-Rank-Fusion smoothing constant. 60 is the canonical IR default.
-RRF_K = 60
+# RRF smoothing constant (canonical IR default).
+_RRF_K = 60
 
-# Channel weights for the interp-stage RRF fusion. Vec leads because the
-# locus's relation/overlap/anchor text encodes the bridge semantically; lex
-# catches exact-term loci; PPR brings DAG centrality.
-# NOTE: "personal" weight is 0.0 here as a placeholder; the actual weight is
-# read from settings at runtime (personalization_weight) and injected during
-# the retrieve() call.
-INTERP_WEIGHTS: dict[str, float] = {
-    "lex": 1.0,
-    "vec": 1.5,
-    "hyde": 0.8,
-    "ppr": 0.7,
-    "personal": 0.0,
-}
+# Graph rerank: consider edges from the top-N resources.
+_GRAPH_RERANK_TOP_N = 5
 
-# Channel weights for the direct-raw RRF fusion. Lex weighs higher than for
-# interps because raws are long documents with verbatim terminology.
-# NOTE: same placeholder pattern — "personal" weight is injected at runtime.
-DIRECT_WEIGHTS: dict[str, float] = {
-    "lex": 1.2,
-    "vec": 1.2,
-    "hyde": 0.6,
-    "personal": 0.0,
-}
+# Graph rerank multiplicative score boost for a neighbor resource.
+_GRAPH_RERANK_BOOST = 1.2
 
-# Routing parameters — how much the interp layer biases raw retrieval.
-ROUTE_DEPTH = 2          # 1 = only direct cites; 2 = cites of upstream loci too
-ROUTE_DECAY = 0.5        # multiplicative downweight per derives_from hop
-ROUTE_BONUS_CAP = 1.0    # max additive bonus a single raw can receive
-ROUTE_BONUS_GAIN = 0.6   # how much of the interp's score becomes a route bonus
+# Edge types used for graph reranking.
+_GRAPH_EDGE_TYPES = ["co_aspect", "cites"]
+
+# Maximum chunks to keep per resource in the final result.
+_MAX_CHUNKS_PER_RESOURCE = 3
 
 
 @dataclass
-class RetrievalRequest:
-    project_id: str
-    query: str
-    k: int = 10
-    anchors: list[str] = field(default_factory=list)
-    # Filter: caller may restrict to {raw}, {interpretation}, or specific
-    # subkinds. Default None = raws only (the new contract — interpretations
-    # are routing context, not results). Set explicitly to surface loci.
-    include: list[NodeKind | Subkind] | None = None
-    hyde: bool = False
-    # Channel widths.
-    k_lex: int = 30
-    k_vec: int = 30
-    k_hyde: int = 20
-    # Stage-1 (interp) breadth.
-    k_interps: int = 20
-    # Stage-3 (direct raw) breadth.
-    k_direct: int = 30
+class ChunkResult:
+    """A single chunk included in a RetrievalResult."""
+
+    chunk_id: str
+    text: str
+    lex_score: float    # raw BM25 score (negative; closer to 0 = better)
+    vec_score: float    # raw L2 distance (lower = better); 0.0 if not hit by vec
+    section: str | None
 
 
 @dataclass
-class RouteHop:
-    """One step in a retrieval trace.
+class RetrievalResult:
+    """A retrieved resource with its top chunks and provenance metadata."""
 
-    For a `derives_from` step, src and dst are both interp ids.
-    For a `cites` step (the terminal hop), src is interp, dst is the raw.
+    resource_id: str
+    title: str
+    folder: str | None
+    aspects: list[str]
+    chunks: list[ChunkResult]
+    why_surfaced: str
+    total_score: float   # higher = better; RRF-fused and graph-boosted
+
+
+async def retrieve(
+    query: str,
+    project_id: str,
+    conn: sqlite3.Connection,
+    n: int = 5,
+    filter_aspects: list[str] | None = None,
+    filter_folder: str | None = None,
+    embedder: Embedder | None = None,
+) -> list[RetrievalResult]:
+    """Run the concept-graph retrieval pipeline.
+
+    Parameters
+    ----------
+    query:
+        The user's search query.
+    project_id:
+        The project to search within.
+    conn:
+        An open SQLite connection.
+    n:
+        Number of top resources to return.
+    filter_aspects:
+        Optional caller-supplied aspect labels to restrict the search.
+        These are merged with the query-expanded aspects.
+    filter_folder:
+        Optional folder prefix filter (joined via resource_provenance.folder).
+    embedder:
+        Optional pre-loaded Embedder. If None, the process-global one is used.
     """
-    src: str
-    dst: str
-    edge_type: str           # 'derives_from' | 'cites'
-    interp_score: float = 0.0  # the routing locus's interp-stage score
+    emb = embedder or get_embedder()
 
-
-@dataclass
-class RetrievedNode:
-    node_id: str
-    kind: NodeKind
-    subkind: Subkind
-    title: str
-    snippet: str
-    score: float
-    why: str
-    channel_ranks: dict[str, int] = field(default_factory=dict)
-    # Trace through the interp DAG that reached this node. For a raw retrieved
-    # via routing, this is the path of hops; for a directly-scored raw, empty.
-    trace: list[RouteHop] = field(default_factory=list)
-    # When the raw was reached via a chunk-level hit (vec or lex on chunks_fts),
-    # these point at the winning span. None for interp hits or for raws that
-    # were only routed-via (no direct chunk match) — in that case the snippet
-    # falls back to a head truncation of the body.
-    chunk_id: str | None = None
-    chunk_text: str | None = None
-    chunk_section: str | None = None
-
-
-@dataclass
-class RoutingInterp:
-    """An interpretation node that was used as a router (not returned as a result)."""
-    node_id: str
-    subkind: Subkind
-    title: str
-    relation_md: str
-    overlap_md: str
-    source_anchor_md: str
-    angle: str | None
-    score: float
-    # Per-channel rank (1-based) for this locus. None / missing channel = the
-    # locus did not appear in that channel's top-K. Verbose-mode field.
-    channel_ranks: dict[str, int] = field(default_factory=dict)
-    # Per-channel RRF contribution (already weighted). Sums to ≤ `score`.
-    channel_scores: dict[str, float] = field(default_factory=dict)
-    # If this locus was used as a PPR anchor, where did the anchor come from?
-    # 'caller' (passed in), 'pinned' (project pin), 'top_vec_interp' (auto).
-    # None when the locus wasn't itself an anchor.
-    anchor_source: str | None = None
-
-
-@dataclass
-class PrunedLocus:
-    """A locus that scored above zero but did NOT route any raw.
-
-    Reasons:
-      - 'below_top_k': scored but ranked below `k_interps` cutoff
-      - 'no_routing_edges': made the top-K but has neither cites nor
-                            derives_from·cites edges, so its walk yielded nothing
-    """
-    node_id: str
-    subkind: Subkind
-    title: str
-    score: float
-    reason: str
-    channel_ranks: dict[str, int] = field(default_factory=dict)
-
-
-@dataclass
-class RetrievalResponse:
-    nodes: list[RetrievedNode]
-    routing_interps: list[RoutingInterp]
-    # Compact provenance summary: one row per returned raw with interp ids.
-    trace_table: list[dict] = field(default_factory=list)
-    # Loci that scored but didn't route a raw — useful for verbose UIs that
-    # want to show "we considered this but it had no path to evidence."
-    pruned_loci: list[PrunedLocus] = field(default_factory=list)
-    # Pre-rendered markdown narrative of the trace — see narrative.py.
-    trace_narrative: str = ""
-
-
-class Retriever:
-    def __init__(self, conn: sqlite3.Connection, embedder: Embedder | None = None) -> None:
-        self.conn = conn
-        self.embedder = embedder or get_embedder()
-        self.nodes_repo = NodeRepository(conn)
-        self.edges_repo = EdgeRepository(conn)
-        self.projects_repo = ProjectRepository(conn)
-
-    def retrieve(self, req: RetrievalRequest) -> RetrievalResponse:
-        # --------------------------------------------------------------
-        # Stage 1: score interpretations
-        # --------------------------------------------------------------
-        interp_lex = lex_mod.search(
-            self.conn, req.project_id, req.query, k=req.k_lex, kind="interpretation",
-        )
-        interp_vec = vec_mod.search_text(
-            self.conn, req.project_id, req.query, k=req.k_vec,
-            embedder=self.embedder, kind="interpretation",
-        )
-        interp_hyde: list[vec_mod.VecHit] = []
-        if req.hyde:
-            hypothetical = hyde_mod.hypothesize(req.query)
-            if hypothetical and hypothetical != req.query:
-                interp_hyde = vec_mod.search_text(
-                    self.conn, req.project_id, hypothetical,
-                    k=req.k_hyde, embedder=self.embedder, kind="interpretation",
-                )
-
-        # PPR over the derives_from DAG of interpretations.
-        anchors_tagged = self._resolve_anchors_tagged(req, interp_vec)
-        anchor_source_by_id: dict[str, str] = {a: src for a, src in anchors_tagged}
-        anchors = [a for a, _src in anchors_tagged]
-
-        # Build anchor weights for PPR: pinned nodes and recently cited_kept
-        # nodes receive 2x personalisation mass (only when personalization is on).
-        from loci.config import get_settings as _get_settings
-        _personal_weight = _get_settings().personalization_weight
-        anchor_weights: dict[str, float] | None = None
-        if _personal_weight > 0 and anchors:
-            anchor_weights = self._build_anchor_weights(req.project_id, anchors)
-
-        ppr_result = ppr_mod.run(
-            self.conn, req.project_id, anchors, anchor_weights=anchor_weights,
-        )
-        ppr_ranked = sorted(ppr_result.scores.items(), key=lambda kv: -kv[1])
-
-        # Personalization channel for interpretations.
-        # NOTE: personalization_weight should be kept <= 0.3 to avoid
-        # double-boosting pinned nodes that are also PPR anchor seeds.
-        from loci.retrieve.affinity import compute_affinity as _compute_affinity
-        interp_candidate_ids = list({
-            h.node_id for h in interp_lex
-        } | {
-            h.node_id for h in interp_vec
-        } | {
-            h.node_id for h in interp_hyde
-        } | {
-            nid for nid, _ in ppr_ranked
-        })
-        interp_affinity = (
-            _compute_affinity(self.conn, req.project_id, interp_candidate_ids)
-            if _personal_weight > 0 and interp_candidate_ids
-            else {}
-        )
-        interp_personal_ranked = sorted(
-            interp_affinity.keys(),
-            key=lambda nid: interp_affinity.get(nid, 0.0),
-            reverse=True,
-        )
-
-        # Build runtime interp weights with the personalization channel live.
-        _interp_weights = dict(INTERP_WEIGHTS)
-        _interp_weights["personal"] = _personal_weight
-
-        interp_scores, interp_channel_scores, interp_channel_ranks = (
-            self._fuse_with_breakdown(
-                channels=[
-                    ("lex", [h.node_id for h in interp_lex]),
-                    ("vec", [h.node_id for h in interp_vec]),
-                    ("hyde", [h.node_id for h in interp_hyde]),
-                    ("ppr", [nid for nid, _ in ppr_ranked]),
-                    ("personal", interp_personal_ranked),
-                ],
-                weights=_interp_weights,
-            )
-        )
-        # Full ranking — keep the tail so we can report "considered but pruned"
-        # loci to verbose callers.
-        full_interp_ranking = sorted(
-            interp_scores.items(), key=lambda kv: -kv[1],
-        )
-        top_interps = full_interp_ranking[: req.k_interps]
-        below_top_k = full_interp_ranking[req.k_interps :]
-        interp_score_map = dict(top_interps)
-
-        # --------------------------------------------------------------
-        # Stage 2: route through cites / derives_from to raws
-        # --------------------------------------------------------------
-        routed_scores: dict[str, float] = {}
-        per_raw_trace: dict[str, list[RouteHop]] = {}
-        for interp_id, locus_score in top_interps:
-            self._walk_routes(
-                interp_id=interp_id,
-                interp_score=locus_score,
-                routed_scores=routed_scores,
-                per_raw_trace=per_raw_trace,
-            )
-
-        # --------------------------------------------------------------
-        # Stage 3: directly score raws against the query
-        # --------------------------------------------------------------
-        raw_lex = lex_mod.search(
-            self.conn, req.project_id, req.query, k=req.k_direct, kind="raw",
-        )
-        raw_vec = vec_mod.search_text(
-            self.conn, req.project_id, req.query, k=req.k_direct,
-            embedder=self.embedder, kind="raw",
-        )
-        raw_hyde: list[vec_mod.VecHit] = []
-        if req.hyde and interp_hyde is not None:
-            hyp = hyde_mod.hypothesize(req.query)
-            if hyp and hyp != req.query:
-                raw_hyde = vec_mod.search_text(
-                    self.conn, req.project_id, hyp,
-                    k=req.k_hyde, embedder=self.embedder, kind="raw",
-                )
-        # Personalization channel for direct raws.
-        raw_candidate_ids = list({
-            h.node_id for h in raw_lex
-        } | {
-            h.node_id for h in raw_vec
-        } | {
-            h.node_id for h in raw_hyde
-        })
-        raw_affinity = (
-            _compute_affinity(self.conn, req.project_id, raw_candidate_ids)
-            if _personal_weight > 0 and raw_candidate_ids
-            else {}
-        )
-        raw_personal_ranked = sorted(
-            raw_affinity.keys(),
-            key=lambda nid: raw_affinity.get(nid, 0.0),
-            reverse=True,
-        )
-
-        # Build runtime direct weights with the personalization channel live.
-        _direct_weights = dict(DIRECT_WEIGHTS)
-        _direct_weights["personal"] = _personal_weight
-
-        direct_scores = self._fuse(
-            channels=[
-                ("lex", [h.node_id for h in raw_lex]),
-                ("vec", [h.node_id for h in raw_vec]),
-                ("hyde", [h.node_id for h in raw_hyde]),
-                ("personal", raw_personal_ranked),
-            ],
-            weights=_direct_weights,
-        )
-
-        # --------------------------------------------------------------
-        # Stage 4: merge routed + direct
-        # --------------------------------------------------------------
-        merged: dict[str, float] = {}
-        for nid, s in direct_scores.items():
-            merged[nid] = merged.get(nid, 0.0) + s
-        for nid, s in routed_scores.items():
-            merged[nid] = merged.get(nid, 0.0) + min(ROUTE_BONUS_CAP, s)
-
-        # --------------------------------------------------------------
-        # Stage 5: materialise + filter
-        # --------------------------------------------------------------
-        ranked = sorted(merged.items(), key=lambda kv: -kv[1])
-
-        # Per-raw winning chunk: prefer the lex chunk hit (it has snippet
-        # markers from FTS), then fall back to the vec chunk hit. Both carry
-        # `chunk_id` + `chunk_text` only when the underlying index returned
-        # span-level rows.
-        snippet_by_id: dict[str, str] = {}
-        chunk_by_id: dict[str, tuple[str | None, str | None, str | None]] = {}
-        for h in raw_lex:
-            snippet_by_id.setdefault(h.node_id, h.snippet)
-            if h.chunk_id and h.node_id not in chunk_by_id:
-                chunk_by_id[h.node_id] = (h.chunk_id, h.chunk_text, h.chunk_section)
-        for h in raw_vec:
-            if h.chunk_id and h.node_id not in chunk_by_id:
-                chunk_by_id[h.node_id] = (h.chunk_id, h.chunk_text, h.chunk_section)
-
-        node_ids_to_load = [nid for nid, _ in ranked[: req.k * 4]]
-        nodes_by_id = {n.id: n for n in self.nodes_repo.get_many(node_ids_to_load)}
-
-        # Default include: raws only — interpretations are routing context.
-        include = req.include if req.include else ["raw"]
-
-        materialised: list[RetrievedNode] = []
-        for nid, score in ranked:
-            node = nodes_by_id.get(nid)
-            if node is None:
-                continue
-            if not _kind_match(node, include):
-                continue
-            why = self._why(
-                node=node,
-                routed=nid in routed_scores,
-                direct=nid in direct_scores,
-                trace=per_raw_trace.get(nid, []),
-            )
-            chunk_id, chunk_text, chunk_section = chunk_by_id.get(nid, (None, None, None))
-            # Snippet preference: FTS snippet (with ⟪…⟫ markers) > raw chunk
-            # text > head-truncated body fallback.
-            snippet = snippet_by_id.get(nid)
-            if not snippet and chunk_text:
-                snippet = _snippet_fallback(chunk_text)
-            if not snippet:
-                snippet = _snippet_fallback(node.body)
-            materialised.append(RetrievedNode(
-                node_id=nid, kind=node.kind, subkind=node.subkind,
-                title=node.title, snippet=snippet,
-                score=score, why=why, channel_ranks={},
-                trace=per_raw_trace.get(nid, []),
-                chunk_id=chunk_id, chunk_text=chunk_text,
-                chunk_section=chunk_section,
-            ))
-            self.nodes_repo.bump_access(nid)
-            if len(materialised) >= req.k:
-                break
-
-        # --------------------------------------------------------------
-        # Build the routing-interp side panel + trace table
-        # --------------------------------------------------------------
-        used_interp_ids: set[str] = set()
-        for r in materialised:
-            for hop in r.trace:
-                if hop.edge_type == "cites":
-                    used_interp_ids.add(hop.src)
-                else:
-                    used_interp_ids.add(hop.src)
-                    used_interp_ids.add(hop.dst)
-        routing_interps = self._materialise_routing_interps(
-            list(used_interp_ids), interp_score_map,
-            channel_scores_by_id=interp_channel_scores,
-            channel_ranks_by_id=interp_channel_ranks,
-            anchor_source_by_id=anchor_source_by_id,
-        )
-        trace_table = [
-            {
-                "raw_id": r.node_id,
-                "raw_title": r.title,
-                "interp_path": [
-                    {"id": hop.src, "edge": hop.edge_type, "to": hop.dst}
-                    for hop in r.trace
-                ],
-            }
-            for r in materialised
-            if r.kind == "raw"
-        ]
-
-        # Pruned loci: top-K loci whose walk yielded zero hops, plus the
-        # top scorers immediately below the K_interp cutoff. Verbose-mode
-        # output — the renderer trims to the highest-scoring slice.
-        pruned_loci = self._materialise_pruned_loci(
-            top_interps=top_interps,
-            below_top_k=below_top_k,
-            used_interp_ids=used_interp_ids,
-            interp_channel_ranks=interp_channel_ranks,
-        )
-
-        # Build a per-raw markdown narrative once so both retrieve and draft
-        # ship the same human-readable trace.
-        from loci.retrieve.narrative import render_trace_narrative
-        narrative = render_trace_narrative(
-            nodes=materialised, routing_interps=routing_interps,
-        )
-
-        return RetrievalResponse(
-            nodes=materialised,
-            routing_interps=routing_interps,
-            trace_table=trace_table,
-            pruned_loci=pruned_loci,
-            trace_narrative=narrative,
-        )
-
-    # -----------------------------------------------------------------------
-    # Internals
-    # -----------------------------------------------------------------------
-
-    def _build_anchor_weights(
-        self, project_id: str, anchor_ids: list[str],
-    ) -> dict[str, float]:
-        """Assign weight 2.0 to anchors that are pinned or recently cited_kept.
-
-        Used by PPR to give heavier personalisation mass to nodes the user has
-        explicitly favoured.  All other anchors get the default weight 1.0.
-        """
-        if not anchor_ids:
-            return {}
-        placeholders = ",".join("?" * len(anchor_ids))
-        rows = self.conn.execute(
-            f"""
-            SELECT DISTINCT n.id
-            FROM nodes n
-            LEFT JOIN project_membership pm
-                ON pm.node_id = n.id AND pm.project_id = ?
-            LEFT JOIN traces t
-                ON t.node_id = n.id AND t.project_id = ? AND t.kind = 'cited_kept'
-            WHERE n.id IN ({placeholders})
-              AND (pm.role = 'pinned' OR t.id IS NOT NULL)
-            """,
-            (project_id, project_id, *anchor_ids),
-        ).fetchall()
-        boosted = {r[0] for r in rows}
-        return {a: (2.0 if a in boosted else 1.0) for a in anchor_ids}
-
-    def _resolve_anchors(
-        self, req: RetrievalRequest, interp_vec: list[vec_mod.VecHit],
-    ) -> list[str]:
-        return [a for a, _src in self._resolve_anchors_tagged(req, interp_vec)]
-
-    def _resolve_anchors_tagged(
-        self, req: RetrievalRequest, interp_vec: list[vec_mod.VecHit],
-    ) -> list[tuple[str, str]]:
-        """Caller anchors ∪ project pinned ∪ top-vec interp hits, tagged with
-        the source of each anchor so verbose mode can show 'why this locus
-        seeded the PPR pass'."""
-        if req.anchors:
-            return [(a, "caller") for a in req.anchors]
-        pinned = self.projects_repo.members(req.project_id, roles=["pinned"])
-        top_vec_anchors = [h.node_id for h in interp_vec[:5]]
-        out: list[tuple[str, str]] = []
+    # ------------------------------------------------------------------
+    # Step 1: expand query into aspect labels via the concept graph
+    # ------------------------------------------------------------------
+    expanded_aspects = expand_query_aspects(
+        query=query,
+        project_id=project_id,
+        conn=conn,
+        embedder=emb,
+        top_k_aspects=5,
+    )
+    # Merge caller-supplied aspects with graph-expanded ones.
+    merged_aspects: list[str] | None = None
+    if filter_aspects or expanded_aspects:
         seen: set[str] = set()
-        for a in pinned:
-            if a not in seen:
-                out.append((a, "pinned"))
-                seen.add(a)
-        for a in top_vec_anchors:
-            if a not in seen:
-                out.append((a, "top_vec_interp"))
-                seen.add(a)
-        return out
+        merged_aspects = []
+        for label in (filter_aspects or []) + expanded_aspects:
+            if label not in seen:
+                seen.add(label)
+                merged_aspects.append(label)
 
-    def _walk_routes(
-        self,
-        *,
-        interp_id: str,
-        interp_score: float,
-        routed_scores: dict[str, float],
-        per_raw_trace: dict[str, list[RouteHop]],
-    ) -> None:
-        """From `interp_id`, walk cites and (optionally) derives_from·cites,
-        accumulating route bonuses on raws and recording the trace path.
+    log.debug(
+        "retrieve: query=%r project=%s expanded_aspects=%s",
+        query, project_id, expanded_aspects,
+    )
 
-        Depth 1: direct cites. Depth 2: derives_from then cites — captures the
-        case where the locus inherits routing from upstream loci. ROUTE_DEPTH
-        controls the cap; ROUTE_DECAY downweights deeper hops.
-        """
-        # Depth 1: direct cites
-        cites = self.edges_repo.from_node(interp_id, types=["cites"])
-        for e in cites:
-            bonus = interp_score * ROUTE_BONUS_GAIN
-            routed_scores[e.dst] = routed_scores.get(e.dst, 0.0) + bonus
-            hop = RouteHop(
-                src=interp_id, dst=e.dst, edge_type="cites",
-                interp_score=interp_score,
-            )
-            per_raw_trace.setdefault(e.dst, []).append(hop)
+    # ------------------------------------------------------------------
+    # Step 2: HyDE — generate a hypothetical doc and embed it
+    # ------------------------------------------------------------------
+    hyde_vec: np.ndarray | None = None
+    try:
+        hypothetical = hyde_mod.hypothesize(query)
+        if hypothetical and hypothetical != query:
+            hyde_vec = emb.encode(hypothetical)
+        else:
+            hyde_vec = emb.encode(query)
+    except Exception:
+        log.warning("HyDE failed; falling back to direct query embedding", exc_info=True)
+        try:
+            hyde_vec = emb.encode(query)
+        except Exception:
+            log.error("Query embedding failed; vec search disabled", exc_info=True)
+            hyde_vec = None
 
-        if ROUTE_DEPTH < 2:
-            return
+    # ------------------------------------------------------------------
+    # Step 3 & 4: BM25 + ANN search
+    # ------------------------------------------------------------------
+    lex_results = search_lex(
+        query=query,
+        project_id=project_id,
+        conn=conn,
+        limit=20,
+        filter_aspects=merged_aspects,
+        filter_folder=filter_folder,
+    )
 
-        # Depth 2: walk derives_from forward, then cites
-        upstream = self.edges_repo.from_node(interp_id, types=["derives_from"])
-        for d in upstream:
-            decayed = interp_score * ROUTE_DECAY
-            up_cites = self.edges_repo.from_node(d.dst, types=["cites"])
-            for e in up_cites:
-                bonus = decayed * ROUTE_BONUS_GAIN
-                routed_scores[e.dst] = routed_scores.get(e.dst, 0.0) + bonus
-                # Record both hops so the trace shows the derivation path.
-                per_raw_trace.setdefault(e.dst, []).extend([
-                    RouteHop(src=interp_id, dst=d.dst, edge_type="derives_from",
-                             interp_score=interp_score),
-                    RouteHop(src=d.dst, dst=e.dst, edge_type="cites",
-                             interp_score=decayed),
-                ])
+    vec_results: list[dict] = []
+    if hyde_vec is not None:
+        vec_results = search_vec(
+            query_vec=hyde_vec,
+            project_id=project_id,
+            conn=conn,
+            limit=20,
+            filter_aspects=merged_aspects,
+            filter_folder=filter_folder,
+        )
 
-    def _fuse(
-        self,
-        channels: list[tuple[str, list[str]]],
-        weights: dict[str, float],
-    ) -> dict[str, float]:
-        return self._fuse_with_breakdown(channels, weights)[0]
+    # ------------------------------------------------------------------
+    # Step 5: RRF fusion
+    # ------------------------------------------------------------------
+    # BM25 is already ordered smallest-first (most negative = best).
+    # vec is ordered smallest-first (lowest distance = best).
+    # RRF rank 1 = best, so we use them in their natural order.
 
-    def _fuse_with_breakdown(
-        self,
-        channels: list[tuple[str, list[str]]],
-        weights: dict[str, float],
-    ) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, dict[str, int]]]:
-        """Same fusion as `_fuse`, also returning per-node-per-channel rank
-        and weighted contribution. The breakdown is what the verbose MCP
-        flag surfaces as `channel_scores` / `channel_ranks` on each locus."""
-        totals: dict[str, float] = {}
-        per_channel_scores: dict[str, dict[str, float]] = {}
-        per_channel_ranks: dict[str, dict[str, int]] = {}
-        for channel, ranked_ids in channels:
-            w = weights.get(channel, 1.0)
-            for rank, nid in enumerate(ranked_ids, start=1):
-                contrib = w / (RRF_K + rank)
-                totals[nid] = totals.get(nid, 0.0) + contrib
-                per_channel_scores.setdefault(nid, {})[channel] = contrib
-                per_channel_ranks.setdefault(nid, {})[channel] = rank
-        return totals, per_channel_scores, per_channel_ranks
+    # Build a combined index keyed by chunk_id.
+    # Store per-chunk: resource_id, text, section, raw lex/vec scores.
+    chunk_index: dict[str, dict] = {}
 
-    def _why(
-        self, *, node, routed: bool, direct: bool, trace: list[RouteHop],
-    ) -> str:
-        parts: list[str] = []
-        if direct:
-            parts.append("matched the query directly")
-        if routed and trace:
-            n_loci = len({hop.src for hop in trace})
-            parts.append(f"routed via {n_loci} locus(es) of thought")
-        return "; ".join(parts) if parts else "in the project"
+    for rank, hit in enumerate(lex_results, start=1):
+        cid = hit["chunk_id"]
+        if cid not in chunk_index:
+            chunk_index[cid] = {
+                "chunk_id": cid,
+                "resource_id": hit["resource_id"],
+                "text": hit["text"],
+                "section": hit.get("section"),
+                "lex_score": hit["score"],
+                "vec_score": 0.0,
+                "rrf": 0.0,
+            }
+        chunk_index[cid]["lex_score"] = hit["score"]
+        chunk_index[cid]["rrf"] += 1.0 / (_RRF_K + rank)
 
-    def _materialise_routing_interps(
-        self,
-        interp_ids: list[str],
-        score_map: dict[str, float],
-        *,
-        channel_scores_by_id: dict[str, dict[str, float]] | None = None,
-        channel_ranks_by_id: dict[str, dict[str, int]] | None = None,
-        anchor_source_by_id: dict[str, str] | None = None,
-    ) -> list[RoutingInterp]:
-        if not interp_ids:
-            return []
-        cs = channel_scores_by_id or {}
-        cr = channel_ranks_by_id or {}
-        anchors = anchor_source_by_id or {}
-        placeholders = ",".join("?" * len(interp_ids))
-        rows = self.conn.execute(
-            f"""
-            SELECT n.id, n.subkind, n.title,
-                   i.relation_md, i.overlap_md, i.source_anchor_md, i.angle
-            FROM nodes n
-            JOIN interpretation_nodes i ON i.node_id = n.id
-            WHERE n.id IN ({placeholders})
-            """,
-            tuple(interp_ids),
-        ).fetchall()
-        out = [
-            RoutingInterp(
-                node_id=r["id"], subkind=r["subkind"], title=r["title"],
-                relation_md=r["relation_md"] or "",
-                overlap_md=r["overlap_md"] or "",
-                source_anchor_md=r["source_anchor_md"] or "",
-                angle=r["angle"],
-                score=score_map.get(r["id"], 0.0),
-                channel_scores=cs.get(r["id"], {}),
-                channel_ranks=cr.get(r["id"], {}),
-                anchor_source=anchors.get(r["id"]),
-            )
-            for r in rows
+    for rank, hit in enumerate(vec_results, start=1):
+        cid = hit["chunk_id"]
+        if cid not in chunk_index:
+            chunk_index[cid] = {
+                "chunk_id": cid,
+                "resource_id": hit["resource_id"],
+                "text": hit["text"],
+                "section": hit.get("section"),
+                "lex_score": 0.0,
+                "vec_score": hit["score"],
+                "rrf": 0.0,
+            }
+        chunk_index[cid]["vec_score"] = hit["score"]
+        chunk_index[cid]["rrf"] += 1.0 / (_RRF_K + rank)
+
+    # Sort chunks by RRF score descending.
+    sorted_chunks = sorted(chunk_index.values(), key=lambda c: -c["rrf"])
+
+    # ------------------------------------------------------------------
+    # Step 6: Graph rerank
+    # ------------------------------------------------------------------
+    # Collect the top-N unique resources from the RRF ranking.
+    top_resource_ids: list[str] = []
+    seen_for_top: set[str] = set()
+    for c in sorted_chunks:
+        rid = c["resource_id"]
+        if rid not in seen_for_top:
+            seen_for_top.add(rid)
+            top_resource_ids.append(rid)
+        if len(top_resource_ids) >= _GRAPH_RERANK_TOP_N:
+            break
+
+    # Find neighbor resources connected via co_aspect / cites edges.
+    edge_repo = ConceptEdgeRepository(conn)
+    boosted_resources: set[str] = set()
+    for rid in top_resource_ids:
+        neighbors = edge_repo.neighbors(rid, edge_types=_GRAPH_EDGE_TYPES, depth=1)
+        boosted_resources.update(neighbors)
+    # Don't boost the top resources themselves — only their neighbors.
+    boosted_resources -= set(top_resource_ids)
+
+    # Apply boost: multiply the RRF score of chunks from boosted resources.
+    for chunk in chunk_index.values():
+        if chunk["resource_id"] in boosted_resources:
+            chunk["rrf"] *= _GRAPH_RERANK_BOOST
+
+    # Re-sort after boost.
+    sorted_chunks = sorted(chunk_index.values(), key=lambda c: -c["rrf"])
+
+    # ------------------------------------------------------------------
+    # Step 7: Group by resource, take top chunks per resource
+    # ------------------------------------------------------------------
+    resource_chunks: dict[str, list[dict]] = {}
+    resource_score: dict[str, float] = {}
+
+    for chunk in sorted_chunks:
+        rid = chunk["resource_id"]
+        bucket = resource_chunks.setdefault(rid, [])
+        if len(bucket) < _MAX_CHUNKS_PER_RESOURCE:
+            bucket.append(chunk)
+        # Resource score = sum of RRF scores of its top chunks.
+        resource_score[rid] = resource_score.get(rid, 0.0) + chunk["rrf"]
+
+    # Sort resources by their aggregate score descending.
+    ranked_resources = sorted(
+        resource_score.items(), key=lambda kv: -kv[1],
+    )
+
+    # ------------------------------------------------------------------
+    # Step 8: Build RetrievalResult list
+    # ------------------------------------------------------------------
+    aspect_repo = AspectRepository(conn)
+    results: list[RetrievalResult] = []
+
+    for resource_id, total_score in ranked_resources[:n]:
+        # Fetch resource metadata.
+        meta = _fetch_resource_meta(conn, resource_id)
+        if meta is None:
+            continue
+
+        # Fetch aspects for this resource.
+        resource_aspect_rows = aspect_repo.aspects_for(resource_id)
+        resource_aspect_labels = [
+            _lookup_label(ra.aspect_id, conn)
+            for ra in resource_aspect_rows
         ]
-        # Sort by score descending so the UI shows the strongest router first.
-        out.sort(key=lambda x: -x.score)
-        return out
+        resource_aspect_labels = [label for label in resource_aspect_labels if label]
 
-    def _materialise_pruned_loci(
-        self,
-        *,
-        top_interps: list[tuple[str, float]],
-        below_top_k: list[tuple[str, float]],
-        used_interp_ids: set[str],
-        interp_channel_ranks: dict[str, dict[str, int]],
-        max_below_k: int = 5,
-        max_no_edges: int = 5,
-    ) -> list[PrunedLocus]:
-        """Top-K loci that routed zero raws → 'no_routing_edges'.
-        Top scorers below K → 'below_top_k'. Capped — we only show the most
-        relevant pruned candidates, since the long tail is noise."""
-        no_edge_ids = [
-            (nid, score) for nid, score in top_interps
-            if nid not in used_interp_ids
-        ][:max_no_edges]
-        below_ids = below_top_k[:max_below_k]
+        # Build ChunkResult list.
+        chunk_results = [
+            ChunkResult(
+                chunk_id=c["chunk_id"],
+                text=c["text"],
+                lex_score=c["lex_score"],
+                vec_score=c["vec_score"],
+                section=c.get("section"),
+            )
+            for c in resource_chunks.get(resource_id, [])
+        ]
 
-        wanted = list(no_edge_ids) + list(below_ids)
-        if not wanted:
-            return []
+        # Build why_surfaced explanation using the winning chunk.
+        winning_chunk = resource_chunks.get(resource_id, [{}])[0]
+        why = build_why_surfaced(
+            chunk={"resource_id": resource_id, **winning_chunk},
+            matched_aspects=expanded_aspects,
+            conn=conn,
+        )
+        # Note if this resource was boosted by the graph.
+        if resource_id in boosted_resources:
+            why += " (surfaced via concept-graph neighbor)"
 
-        ids = [nid for nid, _ in wanted]
-        placeholders = ",".join("?" * len(ids))
-        rows = {
-            r["id"]: r for r in self.conn.execute(
-                f"""
-                SELECT n.id, n.subkind, n.title
-                FROM nodes n
-                WHERE n.id IN ({placeholders})
-                """,
-                tuple(ids),
-            ).fetchall()
-        }
+        results.append(RetrievalResult(
+            resource_id=resource_id,
+            title=meta["title"],
+            folder=meta.get("folder"),
+            aspects=resource_aspect_labels,
+            chunks=chunk_results,
+            why_surfaced=why,
+            total_score=total_score,
+        ))
 
-        out: list[PrunedLocus] = []
-        for nid, score in no_edge_ids:
-            r = rows.get(nid)
-            if r is None:
-                continue
-            out.append(PrunedLocus(
-                node_id=nid, subkind=r["subkind"], title=r["title"],
-                score=score, reason="no_routing_edges",
-                channel_ranks=interp_channel_ranks.get(nid, {}),
-            ))
-        for nid, score in below_ids:
-            r = rows.get(nid)
-            if r is None:
-                continue
-            out.append(PrunedLocus(
-                node_id=nid, subkind=r["subkind"], title=r["title"],
-                score=score, reason="below_top_k",
-                channel_ranks=interp_channel_ranks.get(nid, {}),
-            ))
-        return out
+    return results
 
 
-def _kind_match(node, include: list) -> bool:
-    return node.kind in include or node.subkind in include
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _snippet_fallback(body: str) -> str:
-    one_line = " ".join(body.split())
-    return one_line[:200] + ("…" if len(one_line) > 200 else "")
+def _fetch_resource_meta(
+    conn: sqlite3.Connection,
+    resource_id: str,
+) -> dict | None:
+    """Return {title, folder} for a resource, or None if not found."""
+    row = conn.execute(
+        """
+        SELECT n.title, rp.folder
+        FROM nodes n
+        LEFT JOIN resource_provenance rp ON rp.resource_id = n.id
+        WHERE n.id = ?
+        """,
+        (resource_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"title": row["title"], "folder": row["folder"]}
+
+
+def _lookup_label(aspect_id: str, conn: sqlite3.Connection) -> str | None:
+    """Look up an aspect label by id."""
+    row = conn.execute(
+        "SELECT label FROM aspect_vocab WHERE id = ?", (aspect_id,)
+    ).fetchone()
+    return row["label"] if row else None

@@ -29,7 +29,7 @@ import numpy as np
 
 from loci.embed.local import Embedder, get_embedder
 from loci.graph.models import RawNode
-from loci.graph.nodes import NodeRepository
+from loci.graph.sources import SourceRepository
 from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest.chunker import Chunk, chunk_doc
 from loci.ingest.content_hash import hash_file, store_blob
@@ -79,7 +79,7 @@ class IngestPipeline:
     ) -> None:
         self.conn = conn
         self.workspace_id = workspace_id
-        self.nodes = NodeRepository(conn)
+        self.nodes = SourceRepository(conn)
         self.workspaces = WorkspaceRepository(conn)
         self._embedder = embedder
         self.embed_batch_size = embed_batch_size
@@ -143,7 +143,7 @@ class IngestPipeline:
         # same directory scan don't cause a UNIQUE constraint failure on write.
         if batch_hashes is not None and trunc_hash in batch_hashes:
             return _DedupOutcome(added_membership=False)
-        existing = self.nodes.find_raw_by_hash(trunc_hash)
+        existing = self.nodes.get_by_hash(trunc_hash)
         if existing is not None:
             # Same content already known. Add to this workspace if not present.
             added = False
@@ -225,7 +225,7 @@ class IngestPipeline:
             mime=p.extracted.mime,
             size_bytes=p.size,
         )
-        self.nodes.create_raw(node, chunks=p.chunks, chunk_embeddings=chunk_vecs)
+        self.nodes.insert(node, chunks=p.chunks, chunk_embeddings=chunk_vecs)
         self.workspaces.add_member(self.workspace_id, node.id)
 
     @staticmethod

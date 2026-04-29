@@ -8,12 +8,11 @@ run it:
 - `start_worker_thread()` — spawns a daemon thread; used by the FastAPI app
   to colocate the worker with the HTTP server.
 
-Handlers:
-    absorb   → loci.jobs.absorb.run
-    kickoff  → seed initial questions for a new project
-    reembed  → re-embed all dirty interpretation nodes
-    reindex  → rebuild FTS / vec indices
-    export   → markdown export
+Handlers (v2 job types only):
+    classify_aspects → classify aspects for a newly-ingested resource
+    parse_links      → extract wikilinks + citations, write concept_edges
+    log_usage        → flush a usage event to resource_usage_log
+    embed_missing    → re-embed raw nodes that have no node_vec entry
 
 Worker uses its own SQLite connection so it doesn't fight the request handlers
 for the thread-local connection.
@@ -33,31 +32,29 @@ from loci.jobs.queue import claim_one, mark_done, mark_failed
 
 log = logging.getLogger(__name__)
 
-# Type for a handler: (conn, project_id, payload) -> result_dict
-HandlerFn = Callable[[sqlite3.Connection, str | None, dict], dict]
+# Type for a handler: (job, conn, settings) -> result_dict
+HandlerFn = Callable[[dict, sqlite3.Connection, object], dict]
 
 
 def _handlers() -> dict[str, HandlerFn]:
-    """Resolve handlers lazily so importing the worker doesn't pull in absorb
-    (which imports the embedder, which imports torch...)."""
-    from loci.jobs.absorb import run as run_absorb
-    from loci.jobs.autoresearch import run as run_autoresearch
-    from loci.jobs.kickoff import run as run_kickoff
-    from loci.jobs.reflect import run as run_reflect
-    from loci.jobs.relevance import run as run_relevance
-    from loci.jobs.sweep_orphans import run as run_sweep_orphans
+    """Resolve handlers lazily so importing the worker doesn't pull in the
+    embedder (which imports torch) until a job that needs it is actually claimed."""
+    from loci.jobs.classify_aspects import handle_classify_aspects
+    from loci.jobs.embed_missing import handle_embed_missing
+    from loci.jobs.log_usage import handle_log_usage
+    from loci.jobs.parse_links import handle_parse_links
     return {
-        "absorb": run_absorb,
-        "autoresearch": run_autoresearch,
-        "kickoff": run_kickoff,
-        "reflect": run_reflect,
-        "relevance": run_relevance,
-        "sweep_orphans": run_sweep_orphans,
+        "classify_aspects": handle_classify_aspects,
+        "parse_links": handle_parse_links,
+        "log_usage": handle_log_usage,
+        "embed_missing": handle_embed_missing,
     }
 
 
 def run_once(conn: sqlite3.Connection) -> bool:
     """Try to claim and run one job. Returns True if a job ran, False if queue empty."""
+    from loci.config import get_settings
+
     job = claim_one(conn)
     if job is None:
         return False
@@ -68,11 +65,12 @@ def run_once(conn: sqlite3.Connection) -> bool:
         mark_failed(conn, job["id"], f"no handler for kind={job['kind']}")
         return True
     try:
-        # Surface the job id to handlers that want to publish progress.
-        # Handlers that ignore the key (most of them) are unaffected.
-        payload = dict(job["payload"] or {})
-        payload.setdefault("__job_id", job["id"])
-        result = handler(conn, job["project_id"], payload)
+        import asyncio
+        import inspect
+        settings = get_settings()
+        raw = handler(job, conn, settings)
+        # New v2 handlers are async; old-style sync handlers return directly.
+        result = asyncio.run(raw) if inspect.isawaitable(raw) else raw
         mark_done(conn, job["id"], result=result)
         log.info("worker: job %s done", job["id"])
     except Exception as exc:  # noqa: BLE001 — never let a job crash the worker

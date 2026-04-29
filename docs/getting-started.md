@@ -1,362 +1,212 @@
 # Getting started
 
-Imagine you have a folder of mixed PDFs, code, and notes — you want loci to
-build a memory graph over them, then query it from the CLI or Claude Code.
-This walks you through a complete setup.
+This walks through the full loop: install → create a project → register MCP →
+save a source → recall it from Claude Code.
 
-We'll use a real example folder throughout: `~/Documents/codoc/` — three roots
-side-by-side under one parent:
+If you only want the headline, the loop is:
 
 ```
-~/Documents/codoc/
-  papers/   # PDFs of research I'm reading
-  code/     # open-source projects I'm studying
-  notes/    # my own working notes (markdown)
+save → tag → recall
 ```
 
-You can substitute your own folder anywhere you see `codoc`.
-
-## 0. Install loci
-
-loci requires Python 3.12+.
-
-### Recommended — isolated install via uv
+## 1. Install
 
 ```bash
-uv tool install loci
+# recommended — isolated environment via uv
+uv tool install loci-wiki
+
+# or with pipx
+pipx install loci-wiki
 ```
 
-Or with pipx / pip:
-
-```bash
-pipx install loci
-pip install --user loci
-```
-
-After install, `loci` is on your PATH. Verify with:
+Verify:
 
 ```bash
 loci --version
-loci doctor    # shows all resolved paths — useful for debugging
+loci --help
 ```
 
-### From source (development / contributor)
-
-```bash
-git clone https://github.com/loci-knowledge/loci.git
-cd loci
-uv sync
-# all commands below work with `uv run loci <cmd>` from the repo root
-```
-
-## 1. First-run setup
-
-Run the interactive setup wizard once:
+## 2. First-run setup
 
 ```bash
 loci config init
 ```
 
 This writes:
-- `~/.loci/.env` — your provider API keys (chmod 600, never committed)
-- `~/.loci/config.toml` — optional non-secret defaults (model IDs, weights)
 
-It walks you through adding at least one LLM provider key. loci works without
-keys for retrieval, scan, and FTS, but drafting, kickoff, and reflect need one.
+- `~/.loci/.env` — provider API keys (`chmod 600`). Add at least one of
+  `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `ANTHROPIC_API_KEY`.
+- `~/.loci/config.toml` — non-secret settings (model IDs, embedding device,
+  port).
 
-### Provider keys (manual)
-
-If you prefer to write the file yourself, `~/.loci/.env` format:
+Sanity-check paths and reachability:
 
 ```bash
-# At least one of these:
-OPENAI_API_KEY=sk-...
-OPENROUTER_API_KEY=sk-or-...
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional extras
-HF_TOKEN=hf_...          # needed for autoresearch sandbox
-S2_API_KEY=...           # raises Semantic Scholar rate limit
+loci doctor
 ```
 
-### Model overrides (optional)
+## 3. Create a project
 
-In `~/.loci/config.toml` or `~/.loci/.env`:
-
-```toml
-# ~/.loci/config.toml
-loci_interpretation_model = "openai:gpt-4o-mini"
-loci_rag_model = "openrouter:anthropic/claude-opus-4.7"
-loci_classifier_model = "openrouter:deepseek/deepseek-v4-flash"
-loci_hyde_model = "openrouter:deepseek/deepseek-v4-flash"
-```
-
-Full guide: [model-config.md](./model-config.md).
-
-## 2. Create your project
-
-A **project** is a *view* over the global graph: a profile, the set of nodes
-included, and the agent's voice anchor. One PDF can participate in many
-projects without duplication.
-
-### Interactive wizard (recommended)
+A *project* is a profile + membership view over your sources. Most users have
+one project per long-running area of work (a thesis, a product, a course).
 
 ```bash
-loci project create codoc
+loci project create my-research
 ```
 
-The wizard walks you through every step:
+The wizard asks for a title, description, and optional aspect seed labels.
+You can also use `loci project manage` later to edit any of it.
 
-```
-╭─────────────────────────────────╮
-│ loci — personal memory graph    │
-│ Interactive project setup       │
-╰─────────────────────────────────╯
-
-── Step 1  Project name ────────────────────────────
-  Project name [codoc]: Code-as-Document
-  Slug [code-as-document]: codoc
-
-── Step 2  Profile ─────────────────────────────────
-  Profile file (path to .md, or Enter to skip):
-
-── Step 3  Workspace ───────────────────────────────
-  Information workspace:
-  > Set up from a folder (recommended)
-    Link an existing workspace
-    Create a workspace manually
-    Skip for now
-
-  Workspace root folder: ~/Documents/codoc
-
-  Found 3 subfolders:
-  [x] papers/  (47 files)
-  [x] code/    (312 files)
-  [x] notes/   (14 files)
-
-  ✓ Created workspace codoc-ws (kind: mixed)
-  ✓ Added sources: papers, code, notes
-
-── Step 4  Review ──────────────────────────────────
-  Apply, or change something?
-  > Apply — create project and scan
-    ...
-
-── Applying ────────────────────────────────────────
-  ✓ Project codoc created
-  ✓ Workspace codoc-ws linked (primary)
-  ✓ Scan: 373 new, 0 deduped, 5 skipped
-  ✓ Kickoff: 6 observations written
-
-Next: loci server  →  then query with `loci retrieve codoc "..."`
-```
-
-The fastest path to a working project: supply your project folder as the
-workspace root and the wizard adds each subfolder as a labeled source.
-
-Other wizard entry points:
-- **Manage all projects**: `loci project manage` — arrow-key menu.
-
-### Non-interactive (scripted) setup
-
-Pass `--yes` to bypass the wizard:
+List projects:
 
 ```bash
-loci project create codoc \
-  --name "Code-as-Document" \
-  --profile /path/to/codoc-profile.md \
-  --yes
-# → created codoc (01KQ2AGY2T146QMDSF5QMFVJ7A)
+loci project list
 ```
 
-The profile is the seed for kickoff and the agent's "what are we doing
-here?" prompt. Keep it 50–300 words, written from your perspective — what you
-want from loci, not a description of the files.
+## 4. Register loci with Claude Code
 
-## 3. Create a workspace and add sources
-
-> **If you used the wizard** (step 2) and linked an existing workspace, you
-> can skip this step.
-
-A **workspace** is a named collection of source roots. The same scanned files
-can serve multiple projects without re-scanning.
-
-```bash
-loci workspace create codoc-ws --name "Codoc sources" --kind mixed
-```
-
-`kind` is one of `papers | codebase | notes | transcripts | web | mixed`.
-
-Register the roots:
-
-```bash
-loci workspace add-source codoc-ws ~/Documents/codoc/papers --label papers
-loci workspace add-source codoc-ws ~/Documents/codoc/code   --label code
-loci workspace add-source codoc-ws ~/Documents/codoc/notes  --label notes
-```
-
-Supported file types: PDF, Markdown, plain text, RST/org, HTML, transcripts
-(VTT/SRT), and ~30 source-code extensions. See [sources.md](./sources.md).
-
-## 4. Link the workspace to your project
-
-```bash
-loci workspace link codoc-ws codoc --role primary
-```
-
-Roles: `primary` (drives the project's context), `reference` (supplementary),
-or `excluded`. A project can link multiple workspaces.
-
-## 5. Scan
-
-```bash
-loci workspace scan codoc-ws
-```
-
-Walks every source root, content-hashes each file, deduplicates against the
-global store, extracts text, embeds, writes one `RawNode` per file.
-Re-run whenever you add files — it's idempotent.
-
-## 6. Kickoff: seed the interpretation graph
-
-```bash
-loci kickoff codoc --n 6
-```
-
-Reads your profile + a sample of the raws and generates 5–8 relationship
-observations (`relevance`, `philosophy`, `decision` nodes). They appear in
-retrieval immediately.
-
-## 7. Start the server
-
-```bash
-loci server
-# → worker thread started
-# → Uvicorn running on http://127.0.0.1:7077
-# → logs: ~/.loci/logs/loci.log
-```
-
-The HTTP API is at `http://127.0.0.1:7077/docs`.
-
-## 8. Retrieve and draft
-
-```bash
-# retrieval with routing trace
-loci retrieve codoc "what is the rotary embedding insight?"
-
-# cited markdown draft
-loci draft codoc \
-  "Synthesize what CoDoc and Knuth's literate programming say about
-   code and prose. Where do they agree?" \
-  --k 12
-```
-
-Draft output includes inline `[C1]`, `[C2]`, … citations that map to specific
-nodes, followed by a `citations[]` block. After each draft, a `reflect` job
-auto-enqueues silently.
-
-## 9. MCP integration (Claude Code)
-
-Register loci as a global MCP server once:
+One time, user-scope (works from every directory):
 
 ```bash
 claude mcp add loci --transport stdio --scope user -- loci mcp
 ```
 
-### Project auto-resolution
+Verify:
 
-MCP tools need to know which loci project to work on. Three options:
+```bash
+claude mcp get loci
+```
 
-**Option A — bind the directory** (git-trackable)
+## 5. Tell loci which project a directory belongs to
+
+So MCP tools know which slug to use, bind a directory to your project:
 
 ```bash
 cd ~/Documents/my-research
-loci project bind codoc   # writes .loci/project.toml here
+loci project bind my-research
 ```
 
-MCP tools walk up the directory tree to find `.loci/project.toml`.
+This writes `.loci/project.toml` in that directory. MCP tools walk up the tree
+to find it. Commit it if you want the binding tracked in git.
 
-**Option B — pin for the session**
+Alternative options (first match wins):
+
+- **Per-workspace `.mcp.json`** with `LOCI_PROJECT=<slug>` in `env`.
+- **Session pin**: `loci current set my-research` — applies to every MCP
+  session until you `loci current clear`.
+- **Inline**: pass `project="my-research"` in any tool call.
+
+## 6. Save your first source
+
+From Claude Code (preferred — uses the MCP elicitation form for folder +
+aspects):
+
+```
+Use loci_save to save https://arxiv.org/abs/1612.03975
+```
+
+loci will:
+
+1. Fetch the URL, extract text, hash, dedup, embed.
+2. Suggest a folder via fuzzy match against existing folders.
+3. Suggest aspects via KeyBERT over the first chunks.
+4. Show you a form: pick a folder, check the aspects you want, add a context
+   note. Hit save.
+5. Queue background jobs to refine aspects (LLM) and parse citations /
+   wikilinks into the concept graph.
+
+From the CLI:
 
 ```bash
-loci current set codoc    # writes ~/.loci/state/current
-loci current show         # verify
-loci current clear        # unpin
+loci save https://arxiv.org/abs/1612.03975 \
+  --folder papers/kb-construction \
+  --aspects methodology,knowledge-graph
 ```
 
-**Option C — per-workspace `.mcp.json`** (pin for a specific workspace)
-
-```json
-{
-  "mcpServers": {
-    "loci": {
-      "type": "stdio",
-      "command": "loci",
-      "args": ["mcp"],
-      "env": { "LOCI_PROJECT": "codoc" }
-    }
-  }
-}
-```
-
-Also works: pass `project=` explicitly per call, or set `LOCI_PROJECT` env var.
-
-## 10. Connect the VSCode extension (loki-frontend)
-
-Once `loci server` is running on `127.0.0.1:7077`, the loki-frontend VSCode
-extension connects automatically. Full guide: [frontend.md](./frontend.md).
-
-## 11. Maintenance: reflect + absorb
-
-Periodically run a reflect+absorb cycle to consolidate:
+Save a local file:
 
 ```bash
-loci reflect codoc --absorb
+loci save ~/Downloads/paper.pdf
 ```
 
-What absorb does:
-- replays trace logs into `access_count` / `confidence`
-- audits orphan nodes, broken citations, bloat
-- alias-detection (cosine > 0.92 → propose merge)
-- forgetting candidates (inactive + low confidence)
-- contradiction pass (LLM-mediated)
-- community detection (needs `loci[graph]` extra)
+Save a snippet:
 
-## Storage reference
-
-All user data lives under `~/.loci/`:
-
-```
-~/.loci/
-  loci.sqlite          # the graph (nodes, edges, projects, workspaces, jobs, traces)
-  blobs/               # content-addressed raw file bytes
-  models/              # embedding model (~130 MB, downloaded on first scan)
-  assets/              # D3 cache for graph export
-  logs/loci.log        # rotating application log (10 MB × 5)
-  exports/             # default `loci graph export` output
-  research/            # autoresearch artifacts (fallback)
-  state/current        # pinned project slug for MCP sessions
-  .env                 # provider keys (chmod 600)
-  config.toml          # non-secret defaults
-  version.json         # layout version stamp
+```bash
+loci save "Personalized PageRank with restart probability ~ 0.15..."
 ```
 
-Per-repo binding (committed to git if desired):
+## 7. Recall
+
+From Claude Code:
 
 ```
-<your-repo>/.loci/
-  project.toml         # { slug = "...", created_at = "..." }
-  .gitignore           # auto-generated
-  views/graph.json     # optional: loci export snapshot
-  views/memo.md        # optional: loci export snapshot
-  research/<run_id>/   # autoresearch artifacts (preferred over ~/.loci/research/)
+Use loci_recall to find sources about how PPR works in graph retrieval.
 ```
 
-## What's next
+The result includes the ranked sources, their aspects, and a *why surfaced*
+line that names the aspects / edges that promoted each one.
 
-- [frontend.md](./frontend.md) — the VSCode extension.
-- [agent.md](./agent.md) — what the silent reflection cycle does to your graph.
-- [architecture.md](./architecture.md) — the three layers; how files flow.
-- [model-config.md](./model-config.md) — picking provider/model per task.
-- [sources.md](./sources.md) — file format support, marker setup.
-- [session-lifecycle.md](./session-lifecycle.md) — months-later view.
+Or `@`-mention a specific resource directly:
+
+```
+@loci:source://<resource_id>
+@loci:folder://papers/kb-construction
+@loci:aspect://methodology
+```
+
+CLI:
+
+```bash
+loci recall "how does PPR work in graph retrieval"
+```
+
+## 8. Edit aspects
+
+Aspects drift. Two ways to fix them:
+
+```
+Use loci_aspects to edit aspects on resource <id>.
+```
+
+(Opens an MCP form with the current labels checked.)
+
+CLI:
+
+```bash
+loci aspects <resource_id> --add new-label --remove wrong-label
+loci aspects --list-vocab                 # see the full project vocabulary
+```
+
+## 9. Workspaces (optional)
+
+A *workspace* is a directory tree you scan in bulk. Useful for the "I have a
+folder of 200 PDFs" case.
+
+```bash
+loci workspace create literature ~/Documents/papers
+loci workspace link literature my-research
+loci workspace scan literature
+```
+
+Sources discovered during the scan land in your project automatically.
+
+## 10. Day-to-day commands
+
+```bash
+loci status [project]        # counts + top aspects
+loci use ws1 ws2             # bind workspaces for this session (.loci/session.toml)
+loci doctor                  # paths, migrations, embedder, API
+loci export [project]        # write graph.json + memo.md snapshots
+loci reset                   # nuke everything (asks for confirmation)
+```
+
+## Troubleshooting
+
+| symptom | fix |
+|---------|-----|
+| MCP tool returns `Error: project not found` | bind a project (`loci project bind <slug>`) or set `LOCI_PROJECT` in your `.mcp.json` env |
+| First scan is slow | the embedding model (`BAAI/bge-small-en-v1.5`, ~130 MB) downloads once into `~/.loci/models/` |
+| `loci_save` skips elicitation | the client doesn't advertise elicitation support — pass `folder` and `aspects` explicitly |
+| `loci doctor` flags a missing key | edit `~/.loci/.env` and `chmod 600 ~/.loci/.env` |
+
+For deeper reading, see [`architecture.md`](./architecture.md).

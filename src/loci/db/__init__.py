@@ -1,10 +1,10 @@
 """SQLite storage layer.
 
-PLAN §Storage commits us to SQLite as the single source of truth for the graph.
-The schema lives in `migrations/`; runtime connections come from `connection.py`.
+The schema lives in `schema.sql` (one canonical file, applied via
+`init_schema()`). Runtime connections come from `connection.py`.
 """
 
 from loci.db.connection import connect, get_connection
-from loci.db.migrate import migrate
+from loci.db.schema import init_schema
 
-__all__ = ["connect", "get_connection", "migrate"]
+__all__ = ["connect", "get_connection", "init_schema"]

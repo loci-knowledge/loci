@@ -1,21 +1,17 @@
-"""Job endpoints.
+"""Job endpoints (v2).
 
 Routes:
-    POST /projects/:id/absorb        enqueue absorb checkpoint
-    POST /projects/:id/reflect       enqueue reflect (optional ?absorb=true)
-    POST /projects/:id/autoresearch  enqueue autoresearch job
-    GET  /jobs/:id                   status
-
-The actual queue + worker live in `loci/jobs/`. This route handles HTTP submit + poll.
+    POST /projects/:id/classify-aspects   enqueue aspect classification for a resource
+    POST /projects/:id/parse-links        enqueue link parsing for a resource
+    GET  /jobs/:id                        status
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from loci.api.dependencies import db, project_by_id
@@ -24,67 +20,35 @@ from loci.graph.models import Project
 router = APIRouter(tags=["jobs"])
 
 
-@router.post("/projects/{project_id}/absorb", status_code=202)
-def enqueue_absorb(
+class ClassifyAspectsRequest(BaseModel):
+    resource_id: str
+
+
+@router.post("/projects/{project_id}/classify-aspects", status_code=202)
+def enqueue_classify_aspects(
+    body: ClassifyAspectsRequest,
     project: Project = Depends(project_by_id),
     conn: sqlite3.Connection = Depends(db),
 ) -> dict:
     from loci.jobs.queue import enqueue
-    job_id = enqueue(conn, kind="absorb", project_id=project.id, payload={})
+    job_id = enqueue(conn, kind="classify_aspects", project_id=project.id,
+                     payload={"resource_id": body.resource_id, "project_id": project.id})
     return {"job_id": job_id, "status": "queued"}
 
 
-@router.post("/projects/{project_id}/reflect", status_code=202)
-def enqueue_reflect(
-    project: Project = Depends(project_by_id),
-    conn: sqlite3.Connection = Depends(db),
-    absorb: bool = Query(False, description="Run absorb checkpoint before reflect"),
-) -> dict:
-    from loci.jobs.queue import enqueue
-    if absorb:
-        enqueue(conn, kind="absorb", project_id=project.id, payload={})
-    job_id = enqueue(conn, kind="reflect", project_id=project.id, payload={})
-    return {"job_id": job_id, "status": "queued"}
+class ParseLinksRequest(BaseModel):
+    resource_id: str
 
 
-class AutoresearchRequest(BaseModel):
-    query: str
-    workspace_id: str
-    hf_owner: str | None = None
-    hardware: str | None = None
-    sandbox: bool = False
-    max_iterations: int = 30
-
-
-@router.post("/projects/{project_id}/autoresearch", status_code=202)
-def enqueue_autoresearch(
-    body: AutoresearchRequest,
+@router.post("/projects/{project_id}/parse-links", status_code=202)
+def enqueue_parse_links(
+    body: ParseLinksRequest,
     project: Project = Depends(project_by_id),
     conn: sqlite3.Connection = Depends(db),
 ) -> dict:
     from loci.jobs.queue import enqueue
-    payload: dict[str, Any] = {
-        "query": body.query,
-        "workspace_id": body.workspace_id,
-        "hf_owner": body.hf_owner,
-        "hardware": body.hardware,
-        "sandbox": body.sandbox,
-        "max_iterations": body.max_iterations,
-    }
-    job_id = enqueue(conn, kind="autoresearch", project_id=project.id, payload=payload)
-    return {"job_id": job_id, "status": "queued"}
-
-
-@router.post("/projects/{project_id}/kickoff", status_code=202)
-def enqueue_kickoff(
-    project: Project = Depends(project_by_id),
-    conn: sqlite3.Connection = Depends(db),
-    n: int = 8,
-) -> dict:
-    """Enqueue the kickoff job — generate question proposals from the project
-    profile + a sample of registered raws."""
-    from loci.jobs.queue import enqueue
-    job_id = enqueue(conn, kind="kickoff", project_id=project.id, payload={"n": n})
+    job_id = enqueue(conn, kind="parse_links", project_id=project.id,
+                     payload={"resource_id": body.resource_id, "project_id": project.id})
     return {"job_id": job_id, "status": "queued"}
 
 

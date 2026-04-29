@@ -1,83 +1,41 @@
-"""Pydantic models for the graph layer.
+"""Graph models.
 
-These mirror the SQL schema in `loci/db/migrations/0001_initial.sql`. They are
-the read/write shape used by the API layer and the repositories. Keeping them
-strict (using `Literal` enums and tight constraints) catches a lot of bugs that
-would otherwise only surface at SQL CHECK time.
+These are the data shapes used by the graph layer repositories and the API
+layer. They mirror the SQL schema. All writes go through the repository classes;
+models here are the in-Python representation returned from and passed to repos.
 
-A note on `Node` vs `RawNode` / `InterpretationNode`: the SQL schema stores
-the base columns in `nodes` and the kind-specific columns in side tables. The
-Python models follow the same split: `Node` is the base shape, and the two
-subtypes inherit. We expose discriminated-union types via `kind` for the API.
+RawSubkind keeps the existing coarse file-type taxonomy.
+Aspect / ConceptEdge / ResourceProvenance are the new concept-layer models that
+replace the old interpretation-node / locus DAG.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Literal
 
 import ulid
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---------------------------------------------------------------------------
-# Type aliases (Literal unions) — keep these in lock-step with the SQL CHECKs
-# in 0001_initial.sql. If you add a value here, add it there.
+# Enums / Literal aliases — keep in sync with SQL CHECK constraints
 # ---------------------------------------------------------------------------
-
-NodeKind = Literal["raw", "interpretation"]
-NodeStatus = Literal["proposed", "live", "dirty", "stale", "dismissed"]
 
 RawSubkind = Literal["pdf", "md", "code", "html", "transcript", "txt", "image"]
-InterpretationSubkind = Literal[
-    "philosophy",  # grounding axiom — first-principle belief
-    "tension",     # two values pulling against each other (also: open tensions / unanswered questions)
-    "decision",    # concrete choice with named trade-offs
-    "relevance",   # typed bridge between workspace(s) and project intent (requires angle)
-]
-Subkind = RawSubkind | InterpretationSubkind
-
-InterpretationOrigin = Literal[
-    "user_correction", "user_pin", "user_summary",
-    "user_explicit_create", "proposal_accepted",
-    "agent_synthesis",   # written autonomously by the interpreter (Phase F)
-]
-
-EdgeType = Literal[
-    "cites",         # interp → raw: this locus points at this source
-    "derives_from",  # interp → interp: this locus builds on / extends that locus
-]
-
-EdgeCreator = Literal["user", "system", "proposal_accepted"]
-
-Role = Literal["included", "excluded", "pinned"]
 
 # Workspace kind — coarse hint for retrieval weighting and prompt phrasing.
 WorkspaceKind = Literal["papers", "codebase", "notes", "transcripts", "web", "mixed"]
 
+# Role of a node within a project membership.
+Role = Literal["included", "excluded", "pinned"]
+
 # Role of a workspace within a project link.
 WorkspaceRole = Literal["primary", "reference", "excluded"]
 
-# Closed vocabulary of relevance angles. Used on relevance interpretation nodes
-# and on their cites edges to describe *why* a source matters to a project.
-RelevanceAngle = Literal[
-    "applicable_pattern",       # a technique/approach from the source is directly usable
-    "experimental_setup",       # source's eval/experiment design matches the project's
-    "borrowed_concept",         # a concept from the source informs the project's design
-    "counterexample",           # source demonstrates what not to do / a failure mode
-    "prior_attempt",            # source tried something similar; lessons apply
-    "vocabulary_source",        # source defines terms the project adopts
-    "methodological_neighbor",  # similar method, different domain; generalises
-    "contrast_baseline",        # source is the baseline to compare against
-]
 
-# DAG topology. The new edge model is strictly directed and acyclic — no
-# symmetric edges, no inverses. Direction rules:
-#   cites         interp → raw    (raw is a leaf; never has outgoing edges)
-#   derives_from  interp → interp (acyclic; cycles rejected at insert time)
-EDGE_DIRECTION: dict[EdgeType, tuple[NodeKind, NodeKind]] = {
-    "cites": ("interpretation", "raw"),
-    "derives_from": ("interpretation", "interpretation"),
-}
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def new_id() -> str:
@@ -87,101 +45,47 @@ def new_id() -> str:
 
 def now_iso() -> str:
     """ISO 8601 UTC timestamp matching SQLite's strftime('%Y-%m-%dT%H:%M:%fZ', 'now')."""
-    # microseconds → milliseconds (3 digits) to match the schema's %f format.
     dt = datetime.now(UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 # ---------------------------------------------------------------------------
-# Nodes
+# Raw source nodes
 # ---------------------------------------------------------------------------
 
 
-class Node(BaseModel):
-    """Base node shape. The kind/subkind discriminates the read interpretation.
-
-    For writes, prefer constructing `RawNode` or `InterpretationNode` so the
-    invariants (e.g. raw subkind ↔ raw kind) are enforced by Pydantic.
-    """
-    model_config = ConfigDict(frozen=False)
-
-    id: str = Field(default_factory=new_id)
-    kind: NodeKind
-    subkind: Subkind
-    title: str
+@dataclass
+class Node:
+    """Base node shape — shared columns for all node types."""
+    id: str = field(default_factory=new_id)
+    kind: str = ""     # "raw" for now; extensible
+    subkind: str = ""
+    title: str = ""
     body: str = ""
-    tags: list[str] = Field(default_factory=list)
-    created_at: str = Field(default_factory=now_iso)
-    updated_at: str = Field(default_factory=now_iso)
+    tags: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
     last_accessed_at: str | None = None
     access_count: int = 0
-    confidence: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
-    status: NodeStatus = "live"
-
-    @field_validator("title")
-    @classmethod
-    def _title_nonempty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Node.title must be non-empty")
-        return v
+    confidence: float = 1.0
+    status: str = "live"
 
 
+@dataclass
 class RawNode(Node):
-    kind: Literal["raw"] = "raw"
-    subkind: RawSubkind
-    content_hash: str
-    canonical_path: str
-    mime: str
-    size_bytes: int = Field(ge=0)
+    """A raw source file (PDF, Markdown, code, …).
+
+    These are the leaves of the graph — actual user content. They are never
+    authored here; they are produced by the ingest pipeline.
+    """
+    kind: str = "raw"
+    subkind: str = "txt"          # overridden to RawSubkind at ingest time
+    content_hash: str = ""
+    canonical_path: str = ""
+    mime: str = ""
+    size_bytes: int = 0
     source_of_truth: bool = True
-
-
-class InterpretationNode(Node):
-    kind: Literal["interpretation"] = "interpretation"
-    subkind: InterpretationSubkind
-    origin: InterpretationOrigin
-    origin_session_id: str | None = None
-    origin_response_id: str | None = None
-    # Set on subkind='relevance' nodes; NULL for all other subkinds.
-    angle: RelevanceAngle | None = None
-    # The three locus slots — these are how an interpretation acts as a "locus
-    # of thought." They describe *where* the source meets the project, not
-    # *what* the source says.
-    relation_md: str = ""        # how the source(s) relate to the project (1–3 sentences)
-    overlap_md: str = ""         # the concrete intersection — what they share
-    source_anchor_md: str = ""   # which part(s) of which source(s) carry the weight
-    # Legacy/free-form rationale — used by proposal flow + back-compat with
-    # earlier relevance interps. Optional.
-    rationale_md: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Edges
-# ---------------------------------------------------------------------------
-
-
-class Edge(BaseModel):
-    id: str = Field(default_factory=new_id)
-    src: str
-    dst: str
-    type: EdgeType
-    weight: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
-    created_at: str = Field(default_factory=now_iso)
-    created_by: EdgeCreator = "user"
-    # Per-edge rationale. For cites: the snippet/quote/why-this-section that
-    # makes this raw the right anchor for the locus. For derives_from: the
-    # inheritance reason ("decision X follows from philosophy Y because…").
-    rationale: str | None = None
-    # Denormalised angle for cites edges in relevance interps; NULL otherwise.
-    angle: RelevanceAngle | None = None
-
-    @field_validator("src", "dst")
-    @classmethod
-    def _id_shape(cls, v: str) -> str:
-        if not v or len(v) != 26:
-            raise ValueError("edge endpoints must be ULIDs (26 chars)")
-        return v
+    folder: str | None = None     # logical folder label, e.g. the workspace root subdir
 
 
 # ---------------------------------------------------------------------------
@@ -189,76 +93,147 @@ class Edge(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Project(BaseModel):
-    id: str = Field(default_factory=new_id)
-    slug: str
-    name: str
+@dataclass
+class Project:
+    id: str = field(default_factory=new_id)
+    slug: str = ""
+    name: str = ""
     profile_md: str = ""
-    created_at: str = Field(default_factory=now_iso)
-    last_active_at: str = Field(default_factory=now_iso)
-    config: dict[str, object] = Field(default_factory=dict)
-
-    @field_validator("slug")
-    @classmethod
-    def _slug_shape(cls, v: str) -> str:
-        v = v.strip().lower()
-        if not v or not all(c.isalnum() or c in "-_" for c in v):
-            raise ValueError("slug must be lowercase alphanumeric / dashes / underscores")
-        return v
+    created_at: str = field(default_factory=now_iso)
+    last_active_at: str = field(default_factory=now_iso)
+    config: dict = field(default_factory=dict)
 
 
-class ProjectMembership(BaseModel):
-    project_id: str
-    node_id: str
-    role: Role = "included"
-    added_at: str = Field(default_factory=now_iso)
+@dataclass
+class ProjectMembership:
+    project_id: str = ""
+    node_id: str = ""
+    role: str = "included"        # Role
+    added_at: str = field(default_factory=now_iso)
     added_by: str = "user"
 
 
 # ---------------------------------------------------------------------------
-# Information Workspaces
+# Workspaces
 # ---------------------------------------------------------------------------
 
 
-class Workspace(BaseModel):
-    id: str = Field(default_factory=new_id)
-    slug: str
-    name: str
+@dataclass
+class Workspace:
+    id: str = field(default_factory=new_id)
+    slug: str = ""
+    name: str = ""
     description_md: str = ""
-    kind: WorkspaceKind = "mixed"
-    created_at: str = Field(default_factory=now_iso)
-    last_active_at: str = Field(default_factory=now_iso)
+    kind: str = "mixed"           # WorkspaceKind
+    created_at: str = field(default_factory=now_iso)
+    last_active_at: str = field(default_factory=now_iso)
     last_scanned_at: str | None = None
-    config: dict[str, object] = Field(default_factory=dict)
-
-    @field_validator("slug")
-    @classmethod
-    def _slug_shape(cls, v: str) -> str:
-        v = v.strip().lower()
-        if not v or not all(c.isalnum() or c in "-_" for c in v):
-            raise ValueError("slug must be lowercase alphanumeric / dashes / underscores")
-        return v
+    config: dict = field(default_factory=dict)
 
 
-class WorkspaceSource(BaseModel):
-    id: str = Field(default_factory=new_id)
-    workspace_id: str
-    root_path: str
+@dataclass
+class WorkspaceSource:
+    id: str = field(default_factory=new_id)
+    workspace_id: str = ""
+    root_path: str = ""
     label: str | None = None
-    added_at: str = Field(default_factory=now_iso)
+    added_at: str = field(default_factory=now_iso)
     last_scanned_at: str | None = None
 
 
-class WorkspaceMembership(BaseModel):
+@dataclass
+class WorkspaceMembership:
     workspace_id: str
     node_id: str
-    added_at: str = Field(default_factory=now_iso)
+    added_at: str = field(default_factory=now_iso)
 
 
-class ProjectWorkspace(BaseModel):
+@dataclass
+class ProjectWorkspace:
     project_id: str
     workspace_id: str
-    linked_at: str = Field(default_factory=now_iso)
-    role: WorkspaceRole = "reference"
-    weight: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+    linked_at: str = field(default_factory=now_iso)
+    role: str = "reference"       # WorkspaceRole
+    weight: float = 1.0
     last_relevance_pass_at: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Concept layer — Aspects, ConceptEdges, ResourceProvenance
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Aspect:
+    """A named concept or tag in the aspect vocabulary.
+
+    Aspects are the unit of semantic grouping across resources. They can be
+    user-defined (hand-crafted labels), auto-inferred (produced by the ingest
+    pipeline from content), or folder-derived (inherited from a workspace
+    folder path).
+
+    `conceptnet_relation_hint` is an optional ConceptNet 5.5 relation label
+    (IsA, UsedFor, PartOf, …) that describes how resources tagged with this
+    aspect relate to the concept. See `conceptnet_types.py`.
+    """
+    id: str = field(default_factory=new_id)
+    label: str = ""
+    description: str | None = None
+    conceptnet_relation_hint: str | None = None   # IsA, UsedFor, PartOf, etc.
+    user_defined: bool = False
+    auto_inferred: bool = False
+    last_used: str | None = None
+    created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class ResourceAspect:
+    """Association between a resource (raw node) and an aspect.
+
+    `source` records how the tag arrived: typed by the user ("user"), derived
+    from a folder path ("folder"), produced by the ingest model ("inferred"),
+    or promoted by repeated retrieval access ("usage").
+    """
+    resource_id: str
+    aspect_id: str
+    confidence: float = 1.0
+    source: str = "user"    # user | folder | inferred | usage
+    created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class ConceptEdge:
+    """A typed directed edge between two resources in the concept graph.
+
+    `edge_type` is a structural type (cites, wikilink, co_aspect, co_folder,
+    custom) or a ConceptNet relation hint (IsA, UsedFor, …).  The distinction
+    lets callers filter graph traversal to just structural links or to semantic
+    links independently.
+
+    `metadata` is an optional JSON-serialisable dict for caller-specific data
+    (e.g. the anchor text for a wikilink, or the chunk IDs for a cites edge).
+    """
+    id: str = field(default_factory=new_id)
+    src_id: str = ""
+    dst_id: str = ""
+    edge_type: str = "custom"
+    relation_hint: str | None = None
+    weight: float = 1.0
+    metadata: dict | None = None
+    created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class ResourceProvenance:
+    """Provenance metadata for a raw resource.
+
+    Tracks how and where a resource entered the graph: which URL it came from,
+    which folder it lives in, what tool ingested it, and optional context text
+    (e.g. the surrounding paragraph from a web page, or a user's note).
+    """
+    resource_id: str
+    source_url: str | None = None
+    folder: str | None = None
+    saved_via: str = "cli"        # cli | mcp | watch
+    context_text: str | None = None
+    captured_at: str = field(default_factory=now_iso)

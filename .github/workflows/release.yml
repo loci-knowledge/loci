@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/loci
+      url: https://pypi.org/p/loci-wiki
     steps:
       - name: Download dist
         uses: actions/download-artifact@v4

@@ -52,16 +52,6 @@ class Settings(BaseSettings):
     # --- Retrieval -------------------------------------------------------
     # Default top-k for the retrieval pipeline. Endpoints can override.
     retrieve_default_k: int = 10
-    # Weight of the personalization channel in RRF fusion. Keep <= 0.3 to
-    # avoid double-boosting pinned nodes that also appear as PPR anchors.
-    # Override via LOCI_PERSONALIZATION_WEIGHT.
-    personalization_weight: float = 0.15
-    # Personalized PageRank damping factor (Page-Brin classical 0.85).
-    ppr_alpha: float = 0.85
-    # Iteration cap for the sparse PPR power method. Convergence is checked
-    # against L1 < ppr_tol; this is just a safety net.
-    ppr_max_iter: int = 50
-    ppr_tol: float = 1e-6
 
     # --- LLM provider keys ----------------------------------------------
     # Each key is read from the standard provider env var (no LOCI_ prefix)
@@ -74,51 +64,15 @@ class Settings(BaseSettings):
 
     # --- LLM model selection (per-task) ---------------------------------
     # Each spec is `<provider>:<model_name>`. Providers: anthropic, openai,
-    # openrouter. The four roles below are the only ones loci uses; tasks that
-    # don't need an LLM (lex, vec, PPR, ingest) ignore these entirely.
-    #
-    # Defaults are conservative — strong models for the writing/maintenance
-    # paths, fast models for high-frequency classification.
+    # openrouter. Tasks that don't need an LLM (lex, vec, ingest) ignore
+    # these entirely.
 
-    # Used by the absorb pipeline's contradiction pass and the kickoff job.
-    # Maintains/regenerates interpretation nodes; sees the project profile
-    # plus a sample of raw nodes. Wants strong reasoning + long context.
-    # interpretation_model: str = "openrouter:google/gemini-3-flash-preview"
-    interpretation_model: str = "openrouter:openai/gpt-5.5"
-
-    # Used by `loci draft` to synthesise output_md from retrieved candidates
-    # while honouring the [Cn] citation contract. Wants strong instruction
-    # following and prompt-cache friendliness.
+    # Used for LLM-driven aspect classification (capture/classify_aspects job)
+    # and any other pipeline that needs strong instruction following.
     rag_model: str = "openrouter:anthropic/claude-opus-4.7"
-
-    # Used by the contradiction 3-way classifier (raw vs interpretation).
-    # Many small calls; favour cheap + fast.
-    classifier_model: str = "openrouter:deepseek/deepseek-v4-flash"
 
     # Used by HyDE expansion. Throwaway hypothetical answers; favour fast.
     hyde_model: str = "openrouter:deepseek/deepseek-v4-flash"
-
-    # Used by the autoresearch sub-agent (paper crawl + sandbox tool calls).
-    # Falls back to interpretation_model if not set. Wants strong tool use +
-    # long context for digesting paper sections.
-    research_model: str = "openrouter:anthropic/claude-opus-4.6"
-
-    # --- Auto-research -------------------------------------------------
-    # HF account that owns sandbox Spaces created by the research agent.
-    # Read from env LOCI_RESEARCH_HF_OWNER (or fall back to HF_OWNER in the
-    # autoresearch handler). Required when sandbox=True.
-    research_hf_owner: str | None = None
-    # Default HF Spaces hardware tier for sandboxes.
-    research_sandbox_hardware: str = "cpu-basic"
-    # Template Space duplicated to bootstrap sandboxes. The agent overwrites
-    # `sandbox_server.py` + `Dockerfile` on first commit, so any duplicable
-    # Space works. ml-intern's `burtenshaw/sandbox` is a known-good default.
-    research_template_space: str = "burtenshaw/sandbox"
-    # HF API token. Read from `HF_TOKEN` (no LOCI_ prefix) so users don't
-    # have to set two variables.
-    hf_token: SecretStr | None = Field(default=None, alias="HF_TOKEN")
-    # Semantic Scholar API key (optional, raises rate limits).
-    s2_api_key: SecretStr | None = Field(default=None, alias="S2_API_KEY")
 
     # --- LLM behaviour --------------------------------------------------
     # Whether to enable Anthropic prompt caching on instructions / system
@@ -128,15 +82,6 @@ class Settings(BaseSettings):
     # --- Server ---------------------------------------------------------
     host: str = "127.0.0.1"
     port: int = 7077  # arbitrary high port; chosen because "loci" → mnemonic
-
-    # --- Absorb / job queue ---------------------------------------------
-    # How many traces/explicit signals trigger an automatic absorb suggestion.
-    # We never auto-run absorb (it's expensive); we surface the proposal.
-    absorb_signal_threshold: int = 15
-    # Forgetting policy: nodes with access_count==0 over N days *and* low
-    # confidence become dismissed candidates at absorb. PLAN §Cost model.
-    forgetting_inactivity_days: int = 30
-    forgetting_confidence_floor: float = 0.3
 
     # --- Computed paths -------------------------------------------------
     @property
@@ -162,14 +107,6 @@ class Settings(BaseSettings):
         return self.data_dir / "exports"
 
     @property
-    def research_dir(self) -> Path:
-        return self.data_dir / "research"
-
-    @property
-    def assets_dir(self) -> Path:
-        return self.data_dir / "assets"
-
-    @property
     def state_dir(self) -> Path:
         return self.data_dir / "state"
 
@@ -180,8 +117,6 @@ class Settings(BaseSettings):
         self.model_cache_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.exports_dir.mkdir(parents=True, exist_ok=True)
-        self.research_dir.mkdir(parents=True, exist_ok=True)
-        self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod

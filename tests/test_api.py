@@ -22,7 +22,7 @@ def test_create_project_and_duplicate(loci_dir):
         assert r.status_code == 409
 
 
-def test_full_loop_scan_retrieve_pin(loci_dir, fake_embedder, tmp_path):
+def test_create_workspace_and_scan(loci_dir, fake_embedder, tmp_path):
     from loci.api import create_app
     src = tmp_path / "c"
     src.mkdir()
@@ -39,61 +39,35 @@ def test_full_loop_scan_retrieve_pin(loci_dir, fake_embedder, tmp_path):
         assert r.status_code == 200
         assert r.json()["new_raw"] == 1
 
-        r = c.post(f"/projects/{pid}/retrieve", json={"query": "rotary", "k": 3})
+        # Sources endpoint should list the scanned file
+        r = c.get(f"/projects/{pid}/sources")
         assert r.status_code == 200
-        ids = [n["id"] for n in r.json()["nodes"]]
-        assert ids
-
-        # Pin first node
-        r = c.post(f"/nodes/{ids[0]}/pin", params={"project_id": pid})
-        assert r.status_code == 200
-
-        # Graph view should show the pinned role
-        r = c.get(f"/projects/{pid}/graph")
-        roles = {n["id"]: n["role"] for n in r.json()["nodes"]}
-        assert roles[ids[0]] == "pinned"
+        assert len(r.json()) == 1
 
 
-def test_create_interp_and_edge(loci_dir, fake_embedder, tmp_path):
-    from loci.api import create_app
-    with TestClient(create_app()) as c:
-        pid = c.post("/projects", json={"slug": "p", "name": "P", "profile_md": ""}).json()["id"]
-        n1 = c.post("/nodes", json={
-            "project_id": pid, "subkind": "decision", "title": "T1", "body": "b1",
-            "origin": "user_explicit_create",
-        }).json()["node_id"]
-        n2 = c.post("/nodes", json={
-            "project_id": pid, "subkind": "decision", "title": "T2", "body": "b2",
-            "origin": "user_explicit_create",
-        }).json()["node_id"]
-        r = c.post("/edges", json={"src": n1, "dst": n2, "type": "derives_from"})
-        assert r.status_code == 201
-        assert len(r.json()["edges"]) == 1  # directed, no reciprocal
-
-        r = c.get(f"/nodes/{n1}")
-        assert r.status_code == 200
-        edges_out = [e["type"] for e in r.json()["edges_out"]]
-        assert "derives_from" in edges_out
-
-
-def test_response_expansion(loci_dir, fake_embedder, tmp_path):
+def test_aspects_crud(loci_dir, fake_embedder, tmp_path):
     from loci.api import create_app
     src = tmp_path / "c"
     src.mkdir()
-    (src / "a.md").write_text("hello world")
+    (src / "b.md").write_text("methodology section describes the experiment design")
     with TestClient(create_app()) as c:
-        pid = c.post("/projects", json={"slug": "p", "name": "P", "profile_md": ""}).json()["id"]
-        ws = c.post("/workspaces", json={"slug": "ws-p", "name": "P"}).json()
+        pid = c.post("/projects", json={"slug": "q", "name": "Q", "profile_md": ""}).json()["id"]
+        ws = c.post("/workspaces", json={"slug": "ws-q", "name": "Q"}).json()
         ws_id = ws["id"]
         c.post(f"/workspaces/{ws_id}/sources", json={"root": str(src)})
         c.post(f"/projects/{pid}/workspaces/{ws_id}", json={"role": "primary"})
         c.post(f"/workspaces/{ws_id}/scan")
-        r = c.post(f"/projects/{pid}/retrieve", json={"query": "hello", "k": 1})
-        rid = r.json()["trace_id"]
-        # Expand the response
-        r = c.get(f"/responses/{rid}")
+
+        sources = c.get(f"/projects/{pid}/sources").json()
+        rid = sources[0]["id"]
+
+        # Tag with an aspect
+        r = c.post(f"/projects/{pid}/aspects/resources/{rid}/tags",
+                   json={"labels": ["methodology"], "source": "user"})
         assert r.status_code == 200
-        assert "request" in r.json()
-        # 404 on bogus
-        r = c.get("/responses/01ZZZZZZZZZZZZZZZZZZZZZZZZ")
-        assert r.status_code == 404
+
+        # List aspects for resource
+        r = c.get(f"/projects/{pid}/aspects/resources/{rid}")
+        assert r.status_code == 200
+        labels = [a["label"] for a in r.json()]
+        assert "methodology" in labels

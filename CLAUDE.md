@@ -1,25 +1,29 @@
 # loci — Claude Code integration
 
-loci is a personal memory graph server. When running, it exposes an HTTP API
-on `127.0.0.1:7077` and an MCP server over stdio.
+loci is a personal memory server. When running, it exposes an HTTP API on
+`127.0.0.1:7077` and an MCP server over stdio. Saved sources are tagged with
+aspects (folder-inferred + LLM-inferred + user-edited) and connected by
+typed edges (citations, wikilinks, co-aspect). Retrieval expands the query
+through that concept graph and returns ranked chunks with "why surfaced"
+reasons.
 
 ## Quick start
 
 ```bash
-# installed (uv tool install loci / pipx install loci)
-loci config init          # one-time: writes ~/.loci/.env and ~/.loci/config.toml
+# installed (uv tool install loci-wiki / pipx install loci-wiki)
+loci config init               # one-time: writes ~/.loci/.env + ~/.loci/config.toml
 loci project create <slug>
-loci server               # starts HTTP + worker
+loci server                    # HTTP + worker on 127.0.0.1:7077
 
 # from source (dev / clone)
 uv sync
-# add keys to .env (see loci config init output for the format)
+# add provider keys to .env (see `loci config init` for the format)
 uv run loci server
 ```
 
 ## MCP server (Claude Code)
 
-Register globally (works for both install and clone paths):
+Register globally — works for both install and clone paths:
 
 ```bash
 # installed binary (primary path)
@@ -27,19 +31,16 @@ claude mcp add loci --transport stdio --scope user -- loci mcp
 
 # from source clone
 claude mcp add loci --transport stdio --scope user -- \
-  uv run --directory /Users/r4yen/repos/loci loci mcp
+  uv run --directory /path/to/loci loci mcp
 ```
 
-The server shows up in every Claude Code session automatically (user scope = all dirs).
-Verify with: `! claude mcp get loci`
+Verify with `! claude mcp get loci`.
 
 ### Choosing which loci project to use
 
-Three options, first match wins:
+First match wins:
 
-**Option A — per-workspace `.mcp.json` (recommended for pinned projects)**
-
-Create a `.mcp.json` in your project folder (e.g. `~/Documents/my-research/`):
+**A — per-workspace `.mcp.json`** (recommended for pinned projects)
 
 ```json
 {
@@ -54,127 +55,137 @@ Create a `.mcp.json` in your project folder (e.g. `~/Documents/my-research/`):
 }
 ```
 
-Claude Code prompts for approval the first time.
-
-**Option B — bind the directory**
+**B — bind the directory**
 
 ```bash
 cd ~/Documents/my-research
-loci project bind your-slug   # writes .loci/project.toml here
+loci project bind your-slug    # writes .loci/project.toml
 ```
 
-MCP tools walk up the directory tree to find `.loci/project.toml`. Commit it if you want the binding tracked in git.
+MCP tools walk up the directory tree to find `.loci/project.toml`. Commit it
+if you want the binding tracked in git.
 
-**Option C — pin for the session**
+**C — pin for the session**
 
 ```bash
-loci current set your-slug    # writes ~/.loci/state/current
-loci current show             # verify
-loci current clear            # unpin
+loci current set your-slug     # writes ~/.loci/state/current
+loci current show
+loci current clear
 ```
 
-This is picked up by every MCP session that has no other resolution path.
+You can also pass `project=` explicitly in each tool call, or set
+`LOCI_PROJECT` directly in the environment.
 
-Also works: pass `project=` explicitly in each tool call, or set `LOCI_PROJECT` env var.
+## MCP tools (6)
 
-## Key MCP tools
+| tool             | what it does                                                                   |
+|------------------|--------------------------------------------------------------------------------|
+| `loci_save`      | ingest a URL / file / text, propose folder + aspects via elicitation, persist  |
+| `loci_recall`    | concept-expand the query, run BM25 + ANN over chunks, graph-rerank, return reasons |
+| `loci_aspects`   | list or edit aspects on a resource (elicitation form for edits)                |
+| `loci_browse`    | list resources with their folder + top aspects, filter by folder/aspect/query  |
+| `loci_context`   | project profile + resource count + top aspects for the current session         |
+| `loci_research`  | paper-search sub-agent (stub; v1.1)                                            |
 
-| tool | what it does |
-|------|-------------|
-| `loci_retrieve` | semantic + lex search over a project's sources |
-| `loci_draft` | generate a cited markdown draft |
-| `loci_expand_citation` | get the full body of a cited raw node |
-| `loci_expand_node` | get all three locus slots for an interpretation node |
-| `loci_propose_node` | author a new interpretation (relation_md / overlap_md / source_anchor_md) |
-| `loci_accept_proposal` | accept a housekeeping proposal from reflect |
-| `loci_reflect` | run reflect (pass `absorb=True` to run absorb checkpoint first) |
-| `loci_research` | enqueue autoresearch job (paper search + optional sandbox) |
-| `loci_research_status` | poll an autoresearch job |
-| `loci_feedback` | submit citation-level feedback on a draft |
-| `loci_context` | get project profile + live loci summary for this session |
-| `loci_current_project` | resolve which project is active in this session |
-| `loci_workspace_*` | create / list / link / unlink workspaces and add sources |
+## MCP resources (@-mentionable)
 
-## Key CLI commands
+```
+@loci:source://{resource_id}     full body of a single resource
+@loci:folder://{folder_path}     list of resources in that folder
+@loci:aspect://{label}           list of resources tagged with that aspect
+```
+
+## CLI commands
 
 ```bash
-loci config init                         # first-run: writes ~/.loci/.env + config.toml
-loci doctor                              # show all resolved paths and active project
-loci project create <slug>               # interactive setup wizard
-loci project manage                      # manage existing projects
-loci project bind <slug>                 # write .loci/project.toml in cwd
-loci current set <slug>                  # pin project for MCP sessions
-loci workspace scan <ws>                 # index / re-index sources
-loci kickoff <project>                   # seed the interpretation graph
-loci draft <project> "..."               # draft with citations
-loci retrieve <project> "..."            # retrieval (alias: q)
-loci reflect <project>                   # run reflection cycle
-loci reflect <project> --absorb          # absorb checkpoint then reflect
-loci research <project> <ws> "..."       # autoresearch (blocking)
-loci rebuild <project>                   # re-derive all loci (keep raws)
-loci export [<project>]                  # write graph.json + memo.md snapshots
-loci graph export <project>              # export D3 HTML visualization
-loci reset                               # wipe everything
+loci config init                              # ~/.loci/.env + config.toml
+loci doctor                                   # storage paths + active project
+loci server                                   # HTTP + worker
+loci mcp                                      # MCP stdio (use via `claude mcp add`)
+loci worker                                   # background worker only
+
+loci project create <slug>                    # interactive wizard
+loci project list / info <slug> / bind <slug>
+loci current set/clear/show <slug>            # pin for MCP sessions
+
+loci workspace create / list / add-source / scan / link / unlink
+loci scan <project>                           # scan all linked workspaces
+loci use [workspace_slugs...] [--project p]   # set active context (rich table)
+
+loci save <url_or_path> [--folder F] [--aspects a,b]
+loci recall "query" [--aspects a,b] [--folder F] [-n 10]
+loci aspects [resource_id] [--add a --remove b --list-vocab]
+
+loci status [project]
+loci export [project]
+loci reset                                    # wipe everything
 ```
 
 ## Storage layout
 
-All user data lives under `~/.loci/` regardless of install method:
+All user data lives under `~/.loci/`:
 
 ```
 ~/.loci/
-  loci.sqlite          # the graph database
-  blobs/               # content-addressed raw files
-  models/              # embedding model cache (~130 MB, downloaded on first scan)
-  assets/              # D3 cache for graph export
-  logs/loci.log        # rotating application log (server/mcp/worker)
-  exports/             # default graph export destination
-  research/            # autoresearch artifacts (fallback; prefers <repo>/.loci/research/)
-  state/current        # pinned project for MCP sessions
-  .env                 # provider keys (chmod 600; written by loci config init)
-  config.toml          # non-secret settings (model IDs, weights, etc.)
-  version.json         # layout version stamp
+  loci.sqlite          single-file database (source of truth)
+  blobs/               content-addressed raw files (sha256-keyed)
+  models/              embedding model cache (~130 MB, downloaded on first scan)
+  logs/loci.log        rotating application log
+  exports/             default destination for `loci export`
+  state/current        pinned project for MCP sessions
+  .env                 provider keys (chmod 600; written by `loci config init`)
+  config.toml          non-secret settings
 ```
 
-Per-repo binding (git-trackable, text-only):
+Per-repo binding (git-trackable):
 
 ```
 <your-repo>/.loci/
-  project.toml         # { slug = "...", created_at = "..." }
-  .gitignore           # auto-generated; views/research/drafts are opt-in to commit
-  views/graph.json     # optional: loci export snapshot
-  views/memo.md        # optional: loci export snapshot
-  research/<run_id>/   # autoresearch artifacts (preferred location)
+  project.toml         { slug = "...", created_at = "..." }
+  .gitignore           auto-generated; opt in to commit views/
+  views/               optional `loci export` snapshots
 ```
 
 ## Architecture in brief
 
-Three layers:
-1. **Raw nodes** — content-addressed files (PDF, md, code, …) with embeddings
-2. **Interpretation nodes** — loci of thought: `relation_md`, `overlap_md`, `source_anchor_md`
-3. **Project** — a profile + membership view over the graph
+Single layer: raw sources, embedded at chunk granularity, joined to a concept
+graph of aspects + typed edges.
 
-Edges: `cites` (interp→raw) and `derives_from` (interp→interp). Strict DAG.
+```
+nodes / raw_nodes / raw_chunks       chunks_fts + chunk_vec   (lex + ANN)
+aspect_vocab / resource_aspects      concept_edges            (concept graph)
+projects / project_workspaces        workspace_membership     (scoping)
+jobs                                                          (background work)
+```
 
-Retrieval is interpretation-routed: loci are scored first, then their cited
-raws are promoted. Response includes `routing_loci[]` (side context) and
-`trace_table[]` (per-raw routing path).
+Retrieval:
+
+```
+query
+  → expand_query_aspects (rapidfuzz over aspect_vocab + concept_edges neighbors)
+  → HyDE
+  → BM25 over chunks_fts  +  ANN over chunk_vec
+  → RRF fusion
+  → graph rerank (boost chunks whose resource neighbors top hits via co_aspect / cites)
+  → group + materialise + build "why surfaced" reason per resource
+```
 
 Source layout:
+
 ```
 src/loci/
-  ui/         # CLI (ui/cli.py) and TUI (ui/tui.py) — entry: loci.ui.cli:main
-  usecases/   # shared orchestration: retrieve.py, draft.py
-  api/        # FastAPI REST + WebSocket
-  mcp/        # MCP adapter
-  graph/      # node/edge/project/workspace repositories
-  retrieve/   # lex + vec + hyde + PPR pipeline
-  draft.py    # draft pipeline (domain module)
-  jobs/       # background queue + worker
-  ingest/     # walk → hash → extract → embed
-  config.py   # settings + all ~/.loci/ path properties
-  layout.py   # data-dir version stamp + lazy migrations
-  logging_config.py  # rotating file handler setup
+  ui/cli.py            CLI (entry: loci.ui.cli:main) + ui/tui.py wizard
+  api/                 FastAPI app + routes (projects, workspaces, sources, aspects, jobs)
+  mcp/                 MCP server + project resolution
+  graph/               sources, aspects, concept_edges, projects, workspaces
+  retrieve/            lex + vec + hyde + concept_expand + pipeline
+  capture/             ingest, folder_suggest, aspect_suggest, link_parser
+  ingest/              walk → hash → extract → chunk → embed
+  jobs/                queue + worker + handlers
+  embed/               sentence-transformers wrapper
+  llm/                 pydantic-ai wrapper
+  db/                  schema.sql + connection.py
+  config.py            Settings + ~/.loci/ paths
 ```
 
-See `docs/` for full architecture, graph model, and agent behaviour.
+See `docs/` for the user-facing guide and the architecture deep dive.

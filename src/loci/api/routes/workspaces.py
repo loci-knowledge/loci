@@ -19,7 +19,6 @@ linked to multiple projects. These routes expose the full workspace lifecycle:
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -30,7 +29,6 @@ from loci.api.dependencies import db, project_by_id
 from loci.graph.models import Project, Workspace, WorkspaceKind, WorkspaceRole
 from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest.pipeline import scan_workspace
-from loci.jobs.queue import enqueue
 
 router = APIRouter(tags=["workspaces"])
 
@@ -228,19 +226,6 @@ def link_workspace_to_project(
     if ws_repo.get(ws_id) is None:
         raise HTTPException(404, detail="workspace not found")
     ws_repo.link_project(project.id, ws_id, role=body.role, weight=body.weight)
-
-    # Enqueue a relevance pass for this new link.
-    fp = hashlib.sha256(
-        f"{project.id}:{ws_id}:link".encode()
-    ).hexdigest()[:32]
-    enqueue(
-        conn,
-        kind="relevance",
-        project_id=project.id,
-        payload={"workspace_id": ws_id, "scope": "link"},
-        fingerprint=fp,
-    )
-
     return {"linked": True, "project_id": project.id, "workspace_id": ws_id, "role": body.role}
 
 
@@ -254,15 +239,6 @@ def unlink_workspace_from_project(
     if ws_repo.get(ws_id) is None:
         raise HTTPException(404, detail="workspace not found")
     ws_repo.unlink_project(project.id, ws_id)
-
-    # Enqueue sweep_orphans to mark dirty interps whose raws left the project.
-    enqueue(
-        conn,
-        kind="sweep_orphans",
-        project_id=project.id,
-        payload={"workspace_id": ws_id},
-    )
-
     return {"unlinked": True, "project_id": project.id, "workspace_id": ws_id}
 
 

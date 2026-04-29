@@ -27,10 +27,10 @@ def loci_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def conn(loci_dir: Path):
     """Fresh DB with migrations applied."""
-    from loci.db import migrate
+    from loci.db import init_schema
     from loci.db.connection import close_thread_connection, connect
 
-    migrate()
+    init_schema()
     c = connect()
     try:
         yield c

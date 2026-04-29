@@ -77,24 +77,6 @@ def write_chunks(
     return chunk_ids
 
 
-def delete_chunks_for(conn: sqlite3.Connection, raw_id: str) -> int:
-    """Drop all chunks (+ vec rows) for a raw. Used by re-chunk / backfill."""
-    chunk_ids = [
-        r["id"] for r in conn.execute(
-            "SELECT id FROM raw_chunks WHERE raw_id = ?", (raw_id,),
-        ).fetchall()
-    ]
-    if not chunk_ids:
-        return 0
-    placeholders = ",".join("?" * len(chunk_ids))
-    conn.execute(
-        f"DELETE FROM chunk_vec WHERE chunk_id IN ({placeholders})",
-        tuple(chunk_ids),
-    )
-    conn.execute("DELETE FROM raw_chunks WHERE raw_id = ?", (raw_id,))
-    return len(chunk_ids)
-
-
 def chunks_for(conn: sqlite3.Connection, raw_id: str) -> list[ChunkRow]:
     rows = conn.execute(
         """
@@ -137,40 +119,3 @@ def has_chunks(conn: sqlite3.Connection, raw_id: str) -> bool:
         "SELECT 1 FROM raw_chunks WHERE raw_id = ? LIMIT 1", (raw_id,),
     ).fetchone()
     return row is not None
-
-
-def raws_missing_chunks(
-    conn: sqlite3.Connection, project_id: str | None = None,
-) -> list[tuple[str, str, str]]:
-    """Return [(raw_id, body, subkind)] for raws whose chunks haven't been written.
-
-    If `project_id` is given, scope to that project's effective members; else
-    consider all live raws in the DB. Used by the backfill helper.
-    """
-    if project_id:
-        sql = """
-            SELECT n.id AS id, n.body AS body, r.mime AS mime, n.subkind AS subkind
-            FROM nodes n
-            JOIN raw_nodes r ON r.node_id = n.id
-            JOIN project_effective_members pm ON pm.node_id = n.id
-            WHERE pm.project_id = ?
-              AND n.kind = 'raw'
-              AND n.status IN ('live','dirty')
-              AND NOT EXISTS (
-                  SELECT 1 FROM raw_chunks rc WHERE rc.raw_id = n.id
-              )
-        """
-        params: tuple = (project_id,)
-    else:
-        sql = """
-            SELECT n.id AS id, n.body AS body, r.mime AS mime, n.subkind AS subkind
-            FROM nodes n
-            JOIN raw_nodes r ON r.node_id = n.id
-            WHERE n.kind = 'raw'
-              AND n.status IN ('live','dirty')
-              AND NOT EXISTS (
-                  SELECT 1 FROM raw_chunks rc WHERE rc.raw_id = n.id
-              )
-        """
-        params = ()
-    return [(r["id"], r["body"], r["subkind"]) for r in conn.execute(sql, params).fetchall()]

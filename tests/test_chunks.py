@@ -79,12 +79,12 @@ def test_chunks_fts_indexes_chunk_text(conn, fake_embedder, workspace, long_corp
 
 def test_lex_search_returns_chunk_handle(conn, fake_embedder, project, workspace, long_corpus):
     scan_path(conn, workspace.id, long_corpus, embedder=fake_embedder)
-    hits = lex_mod.search(conn, project.id, "rotary", k=5, kind="raw")
+    hits = lex_mod.search_lex("rotary", project.id, conn, limit=5)
     assert hits
     # The winning hit should carry the chunk_id + chunk_text from chunks_fts.
     top = hits[0]
-    assert top.chunk_id is not None
-    assert top.chunk_text is not None and "rotary" in top.chunk_text.lower()
+    assert top["chunk_id"] is not None
+    assert top["text"] is not None and "rotary" in top["text"].lower()
 
 
 def test_chunks_cascade_delete_on_raw(conn, fake_embedder, workspace, long_corpus):

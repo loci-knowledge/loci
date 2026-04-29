@@ -6,7 +6,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$Package = "loci"
+$Package = "loci-wiki"
 $MinMajor = 3; $MinMinor = 12
 
 function Write-Info { Write-Host "=> $args" -ForegroundColor Green }

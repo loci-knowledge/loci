@@ -1,44 +1,24 @@
-"""Retrieval pipeline — interpretation-routed.
+"""Concept-graph-driven retrieval pipeline.
 
-The new model:
+The new model: queries hit raw chunks directly. The concept graph (aspect
+labels + co_aspect / cites edges) expands and reranks the results.
 
-    Interpretations are LOCI OF THOUGHT (routers), not retrieval targets.
-    A query reaches raws via the loci that point at them.
+Pipeline (see `pipeline.retrieve` for the full recipe):
 
-Stages (see `pipeline.Retriever.retrieve` for the recipe):
+    1. expand_query_aspects()  → relevant aspect labels from the concept graph
+    2. HyDE                    → hypothetical document embedding
+    3. search_lex / search_vec → BM25 + ANN over chunks_fts / chunk_vec
+    4. RRF fusion              → merged chunk ranking
+    5. Graph rerank            → boost resources linked by co_aspect / cites
+    6. Group + materialise     → RetrievalResult list with why_surfaced strings
 
-    1. INTERP STAGE   — lex + vec + (HyDE) + PPR over the derives_from DAG,
-                         RRF-fused → top-K_interp routing loci.
-    2. ROUTE STAGE    — walk cites and derives_from·cites from the top loci
-                         to raws, accumulating a per-raw provenance trace.
-    3. DIRECT STAGE   — also score raws directly so we don't miss raws that
-                         match the query without a routing locus.
-    4. MERGE          — direct score + routed bonus (capped) → final raws.
-    5. RESPONSE       — `nodes` (raws), `routing_interps` (the loci used as
-                         routers), `trace_table` (per-raw interp path).
-
-The shape of the result is documented in `pipeline.RetrievedNode` and
-`pipeline.RetrievalResponse`.
+Public API shapes are in `pipeline.RetrievalResult` and `pipeline.ChunkResult`.
 """
 
-from loci.retrieve.narrative import render_trace_narrative
-from loci.retrieve.pipeline import (
-    PrunedLocus,
-    RetrievalRequest,
-    RetrievalResponse,
-    RetrievedNode,
-    Retriever,
-    RouteHop,
-    RoutingInterp,
-)
+from loci.retrieve.pipeline import ChunkResult, RetrievalResult, retrieve
 
 __all__ = [
-    "PrunedLocus",
-    "RetrievalRequest",
-    "RetrievalResponse",
-    "RetrievedNode",
-    "Retriever",
-    "RouteHop",
-    "RoutingInterp",
-    "render_trace_narrative",
+    "ChunkResult",
+    "RetrievalResult",
+    "retrieve",
 ]

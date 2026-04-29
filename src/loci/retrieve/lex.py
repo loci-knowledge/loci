@@ -1,228 +1,141 @@
-"""Lexical retrieval via FTS5 BM25.
+"""Lexical retrieval via FTS5 BM25 over raw chunks.
 
-Two FTS targets:
+Queries `chunks_fts` (chunk text + section heading) at chunk granularity.
+Callers can narrow the search by aspect labels or folder prefix.
 
-- `nodes_fts`  — title + body + tags. Used for interpretation nodes (where
-                 the locus's slot text + title is what matters).
-- `chunks_fts` — chunk text + section heading. Used for `kind="raw"` so
-                 BM25 ranks at chunk granularity. The hit returns the
-                 winning chunk id + a snippet drawn from it, not from the
-                 whole-file body.
+Implementation notes:
 
-Three things worth knowing if you maintain this:
+1. `_sanitise_fts5_query` strips FTS5 reserved characters and turns the
+   query into a safe OR-disjunction so partial queries still match.
 
-1. We pass user queries through `_sanitise_fts5_query` because raw user input
-   can contain FTS5 reserved characters (`(`, `"`, `*`, `-`, etc.) that crash
-   the parser. We don't try to expose FTS5's full query language to the
-   caller — that's what a power user would write directly, anyway.
-
-2. The `bm25()` second argument is per-column weights. For `nodes_fts`,
-   title is weighted ~3× body to favour title matches without overwhelming
-   long-body relevance. For `chunks_fts`, text dominates and section is a
+2. The BM25 weights give text column a strong lead and treat section as a
    light tiebreaker.
 
-3. Each search joins to `project_effective_members` so we filter to the
-   right project (and status set) in a single statement.
+3. When `filter_aspects` is given, we join through `resource_aspects` and
+   `aspect_vocab` to restrict to resources carrying any of those labels.
+
+4. When `filter_folder` is given, we join through `resource_provenance` and
+   filter with a LIKE prefix match.
 """
 
 from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
 
-# FTS5 special characters that we strip / quote rather than try to interpret.
-# `'` is doubled to escape inside a single-quoted string literal.
 _FTS5_SPECIAL = re.compile(r"[\"():\^*\-]")
 
-
-@dataclass
-class LexHit:
-    node_id: str
-    bm25: float           # raw BM25 (smaller = better)
-    snippet: str          # FTS5 snippet for display
-    matched_terms: list[str]  # parsed from query, used for `why` strings
-    # When the hit comes from chunks_fts (kind="raw"), these point at the
-    # winning span. None for interp hits or for raw fallbacks via nodes_fts.
-    chunk_id: str | None = None
-    chunk_text: str | None = None
-    chunk_section: str | None = None
+_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "in", "on", "at", "to", "of",
+    "for", "with", "is", "are", "was", "be", "by", "that", "this",
+    "it", "as", "from", "but", "not", "have", "has",
+})
 
 
-def search(
-    conn: sqlite3.Connection,
-    project_id: str,
+def search_lex(
     query: str,
-    *,
-    k: int = 20,
-    include_status: tuple[str, ...] = ("live", "dirty"),
-    kind: str | None = None,
-) -> list[LexHit]:
-    """Run a BM25 search filtered to project + status (+ optional kind).
+    project_id: str,
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    filter_aspects: list[str] | None = None,
+    filter_folder: str | None = None,
+) -> list[dict]:
+    """BM25 over chunks_fts. Returns list of {chunk_id, resource_id, text, score}.
 
-    `kind="raw"` queries `chunks_fts` and aggregates to one row per raw
-    (winning chunk = lowest bm25). Anything else queries `nodes_fts`.
+    `score` is the raw BM25 value from SQLite (smaller = better match). Callers
+    that need a higher-is-better score should negate it.
+
+    If `filter_aspects` is given, only chunks from resources that have ANY of
+    those aspect labels (via resource_aspects) are returned.
+
+    If `filter_folder` is given, only chunks from resources whose provenance
+    folder starts with that string are returned.
     """
     fts_query = _sanitise_fts5_query(query)
     if not fts_query:
         return []
-    matched_terms = _terms(query)
-    if kind == "raw":
-        return _search_raw_chunks(
-            conn, project_id, fts_query, matched_terms,
-            k=k, include_status=include_status,
-        )
-    return _search_nodes_fts(
-        conn, project_id, fts_query, matched_terms,
-        k=k, include_status=include_status, kind=kind,
-    )
 
+    # We pull more chunk rows than requested so we have enough after
+    # the project membership filter.
+    chunk_k = max(limit * 4, limit + 20)
 
-# ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
+    # Build the aspect filter CTE if needed.
+    aspect_join = ""
+    aspect_params: tuple = ()
+    if filter_aspects:
+        placeholders = ",".join("?" * len(filter_aspects))
+        aspect_join = f"""
+            JOIN resource_aspects ra  ON ra.resource_id = c.raw_id
+            JOIN aspect_vocab av      ON av.id = ra.aspect_id
+                                      AND av.label IN ({placeholders})
+        """
+        aspect_params = tuple(filter_aspects)
 
+    folder_join = ""
+    folder_params: tuple = ()
+    if filter_folder:
+        folder_join = """
+            JOIN resource_provenance rp ON rp.resource_id = c.raw_id
+                                        AND rp.folder LIKE ?
+        """
+        folder_params = (filter_folder + "%",)
 
-def _search_raw_chunks(
-    conn: sqlite3.Connection,
-    project_id: str,
-    fts_query: str,
-    matched_terms: list[str],
-    *,
-    k: int,
-    include_status: tuple[str, ...],
-) -> list[LexHit]:
-    status_placeholders = ",".join("?" * len(include_status))
-    chunk_k = max(k * 4, k + 20)
-    # bm25 weights: text >> section.
     sql = f"""
         SELECT
             f.chunk_id                              AS chunk_id,
-            f.raw_id                                AS raw_id,
-            bm25(chunks_fts, 1.0, 0.4)              AS bm25,
-            snippet(chunks_fts, 2, '⟪', '⟫', '…', 12) AS snippet,
-            c.text                                  AS chunk_text,
-            c.section                               AS chunk_section
+            f.raw_id                                AS resource_id,
+            bm25(chunks_fts, 1.0, 0.4)              AS score,
+            c.text                                  AS text,
+            c.section                               AS section
         FROM chunks_fts f
         JOIN raw_chunks c                       ON c.id = f.chunk_id
         JOIN nodes n                            ON n.id = c.raw_id
         JOIN project_effective_members pm       ON pm.node_id = n.id
+        {aspect_join}
+        {folder_join}
         WHERE chunks_fts MATCH ?
           AND pm.project_id = ?
-          AND n.status IN ({status_placeholders})
-        ORDER BY bm25
+          AND n.status IN ('live', 'dirty')
+        ORDER BY score
         LIMIT ?
     """
-    params: tuple = (fts_query, project_id, *include_status, chunk_k)
+
+    params: tuple = (*aspect_params, *folder_params, fts_query, project_id, chunk_k)
     rows = conn.execute(sql, params).fetchall()
 
-    out: list[LexHit] = []
-    seen_raw: set[str] = set()
+    # Deduplicate to one chunk per resource (the top BM25 hit).
+    out: list[dict] = []
+    seen: set[str] = set()
     for r in rows:
-        if r["raw_id"] in seen_raw:
+        resource_id = r["resource_id"]
+        if resource_id in seen:
             continue
-        seen_raw.add(r["raw_id"])
-        out.append(LexHit(
-            node_id=r["raw_id"],
-            bm25=float(r["bm25"]),
-            snippet=r["snippet"] or "",
-            matched_terms=matched_terms,
-            chunk_id=r["chunk_id"],
-            chunk_text=r["chunk_text"],
-            chunk_section=r["chunk_section"],
-        ))
-        if len(out) >= k:
+        seen.add(resource_id)
+        out.append({
+            "chunk_id": r["chunk_id"],
+            "resource_id": resource_id,
+            "text": r["text"] or "",
+            "score": float(r["score"]),
+            "section": r["section"],
+        })
+        if len(out) >= limit:
             break
 
-    # Fallback to nodes_fts for raws that aren't chunked yet.
-    if len(out) < k:
-        fallback_sql = f"""
-            SELECT
-                f.node_id                                  AS node_id,
-                bm25(nodes_fts, 3.0, 1.0, 1.5)             AS bm25,
-                snippet(nodes_fts, 2, '⟪', '⟫', '…', 12)   AS snippet
-            FROM nodes_fts f
-            JOIN nodes n                       ON n.id = f.node_id
-            JOIN project_effective_members pm  ON pm.node_id = n.id
-            WHERE nodes_fts MATCH ?
-              AND pm.project_id = ?
-              AND n.status IN ({status_placeholders})
-              AND n.kind = 'raw'
-              AND NOT EXISTS (SELECT 1 FROM raw_chunks rc WHERE rc.raw_id = n.id)
-            ORDER BY bm25
-            LIMIT ?
-        """
-        seen_pred_params: tuple = ()
-        if seen_raw:
-            seen_pred = " AND n.id NOT IN (" + ",".join("?" * len(seen_raw)) + ")"
-            fallback_sql = fallback_sql.replace("ORDER BY bm25", seen_pred + " ORDER BY bm25")
-            seen_pred_params = tuple(seen_raw)
-        fb_params: tuple = (
-            fts_query, project_id, *include_status, *seen_pred_params, k - len(out),
-        )
-        for r in conn.execute(fallback_sql, fb_params).fetchall():
-            out.append(LexHit(
-                node_id=r["node_id"],
-                bm25=float(r["bm25"]),
-                snippet=r["snippet"] or "",
-                matched_terms=matched_terms,
-            ))
-            if len(out) >= k:
-                break
     return out
 
 
-def _search_nodes_fts(
-    conn: sqlite3.Connection,
-    project_id: str,
-    fts_query: str,
-    matched_terms: list[str],
-    *,
-    k: int,
-    include_status: tuple[str, ...],
-    kind: str | None,
-) -> list[LexHit]:
-    status_placeholders = ",".join("?" * len(include_status))
-    kind_clause = "AND n.kind = ?" if kind else ""
-    sql = f"""
-        SELECT
-            f.node_id        AS node_id,
-            bm25(nodes_fts, 3.0, 1.0, 1.5) AS bm25,
-            snippet(nodes_fts, 2, '⟪', '⟫', '…', 12) AS snippet
-        FROM nodes_fts f
-        JOIN nodes n ON n.id = f.node_id
-        JOIN project_effective_members pm ON pm.node_id = n.id
-        WHERE nodes_fts MATCH ?
-          AND pm.project_id = ?
-          AND n.status IN ({status_placeholders})
-          {kind_clause}
-        ORDER BY bm25
-        LIMIT ?
-    """
-    params: tuple = (fts_query, project_id, *include_status)
-    if kind:
-        params = (*params, kind)
-    params = (*params, k)
-    rows = conn.execute(sql, params).fetchall()
-    return [
-        LexHit(
-            node_id=row["node_id"],
-            bm25=float(row["bm25"]),
-            snippet=row["snippet"] or "",
-            matched_terms=matched_terms,
-        )
-        for row in rows
-    ]
+# ---------------------------------------------------------------------------
+# Internal helpers (also used by concept_expand.py)
+# ---------------------------------------------------------------------------
 
 
 def _sanitise_fts5_query(q: str) -> str:
-    """Strip FTS5 specials and turn the query into a safe disjunction.
+    """Strip FTS5 special characters and emit a safe OR-disjunction.
 
-    "rotary embeddings cross-attention" → '"rotary" OR "embeddings" OR "cross" OR "attention"'
+    "rotary embeddings cross-attention" → '"rotary" OR "embeddings" OR ...'
 
-    We disjunct rather than implicit-AND because users phrase queries
-    incompletely — "tell me about rotary attention pattern" should match a
-    doc that has "rotary" and "attention" but not "pattern" verbatim.
+    We use OR (not AND) because queries are often incomplete phrases —
+    partial-term queries should still surface relevant chunks.
     """
     cleaned = _FTS5_SPECIAL.sub(" ", q)
     tokens = [t for t in cleaned.split() if len(t) >= 2]
@@ -231,13 +144,13 @@ def _sanitise_fts5_query(q: str) -> str:
     return " OR ".join(f'"{t}"' for t in tokens)
 
 
-def _terms(q: str) -> list[str]:
-    """Return the lowercase terms we'll cite in `why` strings."""
+def _query_terms(q: str) -> list[str]:
+    """Return lowercase non-stop-word tokens from q (for 'why' strings)."""
     cleaned = _FTS5_SPECIAL.sub(" ", q)
     seen: set[str] = set()
     out: list[str] = []
     for t in cleaned.lower().split():
-        if len(t) >= 3 and t not in seen:
+        if len(t) >= 3 and t not in _STOP_WORDS and t not in seen:
             seen.add(t)
             out.append(t)
-    return out[:6]
+    return out[:8]

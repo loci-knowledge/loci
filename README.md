@@ -1,40 +1,40 @@
 # loci
 
-A personal memory **DAG**. Raw sources are leaves. Interpretations are *loci
-of thought* — pointers that say "the part of THIS source over here meets the
-part of THIS project over there, in this specific way." Loci route a query
-to the parts of sources that matter; they never hold the answer themselves.
+A personal memory server. You **save** what you read; loci tags each source
+with **aspects** (methodology, knowledge-graph, …), wires up **concept edges**
+(citations, wikilinks, co-aspect), and serves the result to Claude Code over
+**MCP** so the model can recall the parts of your library that actually matter
+for what you're writing.
 
-Two directed edge types — `cites` (interp → raw) and `derives_from` (interp
-→ interp) — make the graph acyclic and the provenance trivially traceable.
-Retrieval routes through loci to surface raws plus a per-raw trace; drafts
-cite raws only and ship a routing-locus side panel for inspection.
+No interpretation graph, no draft pipeline, no PageRank. Just:
 
-Served to any client (Claude Code via MCP, a VSCode extension, the CLI,
-plain HTTP) with a uniform citation contract. See [`docs/graph.md`](./docs/graph.md)
-for the locus model and [`docs/architecture.md`](./docs/architecture.md) for
-the full pipeline.
+```
+save → tag → recall
+```
+
+If you want a deeper read, start at [`docs/getting-started.md`](./docs/getting-started.md)
+and then [`docs/architecture.md`](./docs/architecture.md).
 
 ## Status
 
-Early. Single-user, local-first. The architecture in `PLAN.md` is the spec; this
-repo implements it.
+Single-user, local-first. SQLite is the source of truth; raw blobs are
+content-addressed on disk. Python 3.12+.
 
 ## Install
 
 ```bash
 # with uv (recommended — isolated environment)
-uv tool install loci
+uv tool install loci-wiki
 
 # with pipx
-pipx install loci
+pipx install loci-wiki
 
-# with pip
-pip install --user loci
+# or just curl-pipe the installer
+curl -fsSL https://raw.githubusercontent.com/loci-knowledge/loci/main/install.sh | sh
 ```
 
-Python 3.12+ required. The first scan downloads the embedding model
-(`BAAI/bge-small-en-v1.5`, ~130 MB) into `~/.loci/models/`.
+The first scan downloads the embedding model (`BAAI/bge-small-en-v1.5`,
+~130 MB) into `~/.loci/models/`.
 
 ## Quick start
 
@@ -42,78 +42,88 @@ Python 3.12+ required. The first scan downloads the embedding model
 # 1. First-run setup: writes ~/.loci/.env (provider keys) and ~/.loci/config.toml
 loci config init
 
-# 2. Create a project (interactive wizard)
-loci project create my-project
+# 2. Create a project
+loci project create my-research
 
-# 3. Start the server
-loci server
-```
-
-All user data lives under `~/.loci/`. Run `loci doctor` to see all resolved paths.
-
-## Usage
-
-```bash
-loci project create <slug>               # interactive wizard: project + workspace + scan + kickoff
-loci project bind <slug>                 # bind cwd to project (writes .loci/project.toml)
-loci workspace create <name>             # create a workspace
-loci workspace add-source <ws> <path>    # register a source root
-loci workspace scan <ws>                 # walk + hash + embed all sources
-loci kickoff <project>                   # seed the interpretation graph
-loci retrieve <project> "query"          # semantic + lex retrieval with routing trace
-loci draft <project> "instruction"       # cited markdown draft
-loci reflect <project> [--absorb]        # reflection / maintenance cycle
-loci server                              # HTTP + MCP server (127.0.0.1:7077)
-loci doctor                              # show storage paths + active project
-loci export [<project>]                  # write graph.json + memo.md snapshots
-loci current set <slug>                  # pin project for MCP sessions without .loci/ binding
-```
-
-Full guide: [`docs/getting-started.md`](./docs/getting-started.md).
-
-## MCP (Claude Code)
-
-Register once:
-
-```bash
+# 3. Register loci with Claude Code (one-time, user-scope)
 claude mcp add loci --transport stdio --scope user -- loci mcp
+
+# 4. Bind a directory to your project (so MCP knows which slug to use)
+cd ~/Documents/my-research
+loci project bind my-research
+
+# 5. Save sources directly from Claude Code
+#    (or via CLI: `loci save https://arxiv.org/abs/1612.03975`)
+
+# 6. Recall in Claude Code
+#    `@loci:source://...` for a single resource
+#    `loci_recall("how does PPR work")` for ranked chunks with reasons
 ```
 
-Then in any working directory either:
-- run `loci project bind <slug>` to write `.loci/project.toml` (git-trackable), or
-- run `loci current set <slug>` to pin globally for the session.
+All user data lives under `~/.loci/`. Run `loci doctor` to see resolved paths.
 
-See `CLAUDE.md` for the full MCP setup and per-workspace `.mcp.json` pattern.
-
-## Development (from source)
+## CLI commands
 
 ```bash
-git clone https://github.com/loci-knowledge/loci.git
-cd loci
-uv sync
-# add keys to .env (same format as ~/.loci/.env)
-uv run loci server
+loci config init                              # write ~/.loci/.env + config.toml
+loci doctor                                   # show storage paths + active project
+loci server                                   # HTTP API + worker on 127.0.0.1:7077
+loci mcp                                      # MCP stdio server (for Claude Code)
+loci worker                                   # background worker only
+
+loci project create <slug>                    # interactive wizard
+loci project list / info / bind / manage
+loci current set <slug>                       # pin project for MCP sessions
+
+loci workspace create / list / add-source / scan / link / unlink
+loci scan <project>                           # scan all linked workspaces
+loci use [workspace_slugs...]                 # bind workspaces for this session
+
+loci save <url_or_path> [--folder] [--aspects]
+loci recall "query" [--aspects ...] [-n 10]
+loci aspects [resource_id] [--add ... --remove ... --list-vocab]
+
+loci status [project]
+loci export [project]
+loci reset                                    # wipe everything
 ```
 
-## Layout
+## MCP surface (Claude Code)
+
+| tool                 | what it does                                                                  |
+|----------------------|-------------------------------------------------------------------------------|
+| `loci_save`          | ingest URL/file/text, propose folder + aspects via elicitation, write to DB   |
+| `loci_recall`        | concept-expand + BM25/ANN over chunks with concept-graph rerank               |
+| `loci_aspects`       | list/edit aspects on a resource (elicitation form for editing)                |
+| `loci_browse`        | list resources with folder + top aspects, filterable                          |
+| `loci_context`       | project profile + counts + top aspects for the current session                |
+| `loci_research`      | paper-search sub-agent (deferred to v1.1)                                     |
+
+@-mentionable resources:
+
+```
+@loci:source://{resource_id}
+@loci:folder://{folder_path}
+@loci:aspect://{label}
+```
+
+## Source layout
 
 ```
 src/loci/
-  ui/               # CLI (cli.py) and TUI (tui.py)
-  usecases/         # shared orchestration per operation (retrieve, draft)
-  api/              # FastAPI REST + WebSocket
-  mcp/              # MCP adapter
-  graph/            # node/edge/project/workspace repositories
-  retrieve/         # lex + vec + hyde + PPR
-  draft.py          # draft pipeline
-  citations/        # trace + response writers
-  jobs/             # background queue + worker
-  ingest/           # walk → hash → dedup → extract → embed
-  llm/              # pydantic-ai wrapper
-  config.py         # settings + ~/.loci/ path properties
-  layout.py         # data-dir version stamp + lazy migrations
-  logging_config.py # rotating file handler
-  db/               # schema, migrations, sqlite + sqlite-vec
+  ui/cli.py              entry point: loci.ui.cli:main
+  api/                   FastAPI REST + WebSocket
+    routes/              projects, workspaces, sources, aspects, jobs
+  mcp/                   MCP server + project resolution
+  graph/                 sources, aspects, concept_edges, projects, workspaces
+  retrieve/              lex + vec + hyde + concept_expand + pipeline
+  capture/               ingest, folder_suggest, aspect_suggest, link_parser
+  ingest/                walk → hash → extract → chunk → embed
+  jobs/                  queue + worker + handlers (classify_aspects, parse_links, …)
+  embed/                 sentence-transformers wrapper
+  llm/                   pydantic-ai wrapper
+  db/                    schema.sql + connection.py
+  config.py              Settings + ~/.loci/ paths
 ```
 
 ## License
