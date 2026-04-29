@@ -60,7 +60,9 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     openai_api_key: SecretStr | None = Field(default=None, alias="OPENAI_API_KEY")
     openrouter_api_key: SecretStr | None = Field(default=None, alias="OPENROUTER_API_KEY")
-    openrouter_api_key_backup: SecretStr | None = Field(default=None, alias="OPENROUTER_API_KEY_BACKUP")
+    openrouter_api_key_backup: SecretStr | None = Field(
+        default=None, alias="OPENROUTER_API_KEY_BACKUP"
+    )
 
     # --- LLM model selection (per-task) ---------------------------------
     # Each spec is `<provider>:<model_name>`. Providers: anthropic, openai,
@@ -69,7 +71,7 @@ class Settings(BaseSettings):
 
     # Used for LLM-driven aspect classification (capture/classify_aspects job)
     # and any other pipeline that needs strong instruction following.
-    rag_model: str = "openrouter:anthropic/claude-opus-4.7"
+    rag_model: str = "openrouter:google/gemini-3-flash-preview"
 
     # Used by HyDE expansion. Throwaway hypothetical answers; favour fast.
     hyde_model: str = "openrouter:deepseek/deepseek-v4-flash"
@@ -129,6 +131,7 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         from pydantic_settings import TomlConfigSettingsSource
+
         toml_path = Path.home() / ".loci" / "config.toml"
         return (
             init_settings,

@@ -1,23 +1,17 @@
-"""Background jobs.
+"""Background jobs (v2).
 
-PLAN.md §Background jobs:
+The queue is SQLite-backed. The worker is a daemon thread spun up inside the
+FastAPI process at startup. Atomic claim uses UPDATE...RETURNING.
 
-    POST /projects/:id/absorb        enqueue a checkpoint
-    GET  /jobs/:id                   status
-
-The queue is SQLite-backed (no Redis). The worker is a daemon thread spun up
-inside the FastAPI process at startup. For multi-process deployments the
-queue table supports atomic claim via UPDATE...RETURNING; we just don't run
-multiple workers today.
+Job kinds:
+    classify_aspects — tag a newly-ingested resource with aspect vocab
+    parse_links      — extract wikilinks + citations, write concept_edges
+    log_usage        — flush a usage event to resource_usage_log
+    embed_missing    — re-embed raw nodes that have no node_vec entry
 
 Subpackages:
-    queue        — enqueue / claim / progress / mark
-    worker       — polling loop + handler dispatch
-    absorb       — the checkpoint pipeline (PLAN §Cost model: per absorb)
-    contradiction — 3-way classifier over (raw, top-k interps)
-    proposals    — alias detection, broken-support tensions, forgetting
-    audits       — orphan / broken-support / bloat / thinning
-    communities  — Leiden community detection (optional, igraph-gated)
+    queue   — enqueue / claim / progress / mark
+    worker  — polling loop + handler dispatch
 """
 
 from loci.jobs.queue import append_job_step, enqueue, get_job, mark_failed

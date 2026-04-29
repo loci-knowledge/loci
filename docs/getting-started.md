@@ -183,7 +183,8 @@ A *workspace* is a directory tree you scan in bulk. Useful for the "I have a
 folder of 200 PDFs" case.
 
 ```bash
-loci workspace create literature ~/Documents/papers
+loci workspace create literature
+loci workspace add-source literature ~/Documents/papers
 loci workspace link literature my-research
 loci workspace scan literature
 ```

@@ -72,7 +72,7 @@ Before the first release, configure trusted publishing on PyPI:
 
 ```bash
 uv build
-uv run twine check dist/*
+uv tool run twine check dist/*
 
 # Bump version in pyproject.toml, commit, then tag
 git tag v0.1.0

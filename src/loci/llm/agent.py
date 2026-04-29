@@ -19,7 +19,7 @@ prompt sits in cache for the full hour TTL. Other providers ignore the flag.
 If the model spec asks for a provider whose API key isn't configured, we raise
 `LLMNotConfiguredError` — callers catch it and degrade gracefully (HyDE
 returns the original query, the contradiction pass skips, draft returns a
-stub). The retrieve / draft / kickoff routes never rely on a working LLM.
+stub). The retrieve routes never rely on a working LLM.
 
 `pydantic-settings` (in `loci/config.py`) already reads `.env` at startup, so
 we don't need an explicit `dotenv` load here.

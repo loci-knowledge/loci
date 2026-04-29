@@ -3,13 +3,14 @@
 Powered by cyclopts (>=3) for typed CLIs without ceremony.
 
 Subcommands:
+    loci config init                      write ~/.loci/.env + config.toml
     loci server [--host] [--port] [--no-worker]
     loci mcp                              MCP stdio server (for Claude Code)
     loci worker [--poll-interval]
     loci project create <slug>            interactive setup wizard
     loci project list
     loci project info <slug>
-    loci project bind <slug>              write .loci/project in cwd
+    loci project bind <slug>              write .loci/project.toml in cwd
     loci current set/clear/show           pin a project for MCP sessions
     loci workspace create/list/info/add-source/link/unlink/scan
     loci scan <project>                   scan all linked workspaces
@@ -52,12 +53,75 @@ app = App(
     help="Personal memory graph server.",
     version=__version__,
 )
+config_app = App(name="config", help="Configuration commands.")
+app.command(config_app)
 project_app = App(name="project", help="Project commands.")
 app.command(project_app)
 workspace_app = App(name="workspace", help="Information workspace commands.")
 app.command(workspace_app)
 current_app = App(name="current", help="Manage the pinned project for MCP sessions.")
 app.command(current_app)
+
+
+# ---------------------------------------------------------------------------
+# Config commands
+# ---------------------------------------------------------------------------
+
+
+@config_app.command(name="init")
+def config_init(force: bool = False) -> None:
+    """Write ~/.loci/.env (provider keys) and ~/.loci/config.toml (settings).
+
+    Safe to re-run — skips existing files unless --force is passed.
+    """
+    import stat
+
+    data_dir = Path.home() / ".loci"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    env_path = data_dir / ".env"
+    toml_path = data_dir / "config.toml"
+
+    if env_path.exists() and not force:
+        console.print(f"[yellow]skip[/yellow] {env_path} already exists (use --force to overwrite)")
+    else:
+        env_path.write_text(
+            "# loci provider keys\n"
+            "# Add at least one of the following:\n"
+            "OPENAI_API_KEY=\n"
+            "OPENROUTER_API_KEY=\n"
+            "ANTHROPIC_API_KEY=\n"
+            "\n"
+            "# Optional: model overrides (format: <provider>:<model>)\n"
+            "# LOCI_RAG_MODEL=openai:openai:gpt-5.4\n"
+            "# LOCI_HYDE_MODEL=openai:openai:gpt-5.4-mini\n",
+            encoding="utf-8",
+        )
+        env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+        console.print(f"[green]wrote[/green] {env_path} (chmod 600)")
+
+    if toml_path.exists() and not force:
+        console.print(
+            f"[yellow]skip[/yellow] {toml_path} already exists (use --force to overwrite)"
+        )
+    else:
+        toml_path.write_text(
+            "# loci non-secret settings — uncomment to override defaults\n"
+            "\n"
+            '# embedding_model = "BAAI/bge-small-en-v1.5"\n'
+            '# embedding_device = "auto"  # auto | cpu | mps | cuda\n'
+            '# rag_model = "openrouter:anthropic/claude-opus-4.7"\n'
+            '# hyde_model = "openrouter:deepseek/deepseek-v4-flash"\n'
+            "# port = 7077\n",
+            encoding="utf-8",
+        )
+        console.print(f"[green]wrote[/green] {toml_path}")
+
+    console.print()
+    console.print(
+        "Next: edit [bold]~/.loci/.env[/bold] and fill in at least one API key, "
+        "then run [bold]loci doctor[/bold] to verify."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +143,7 @@ def server(
 
     if not no_worker:
         from loci.jobs.worker import start_worker_thread
+
         start_worker_thread()
         console.print("[dim]worker thread started[/dim]")
 
@@ -95,6 +160,7 @@ def server(
 def mcp() -> None:
     """Run the loci MCP server over stdio (for Claude Code)."""
     from loci.mcp import run_stdio
+
     run_stdio()
 
 
@@ -102,6 +168,7 @@ def mcp() -> None:
 def worker(poll_interval: float = 1.0) -> None:
     """Run the job worker without the HTTP server."""
     from loci.jobs.worker import run_worker_loop
+
     run_worker_loop(poll_interval=poll_interval)
 
 
@@ -131,14 +198,20 @@ def project_create(
     conn = connect()
 
     if sys.stdin.isatty() and not yes:
-        from loci.tui import run_wizard
+        from loci.ui.tui import run_wizard
+
         run_wizard(conn, slug_hint=slug)
     else:
         from loci.graph import Project, ProjectRepository
+
         profile_md = profile.read_text() if profile else ""
-        proj = ProjectRepository(conn).create(Project(
-            slug=slug, name=name or slug, profile_md=profile_md,
-        ))
+        proj = ProjectRepository(conn).create(
+            Project(
+                slug=slug,
+                name=name or slug,
+                profile_md=profile_md,
+            )
+        )
         conn.commit()
         console.print(f"[green]created[/green] [bold]{proj.slug}[/bold] ({proj.id})")
 
@@ -148,7 +221,7 @@ def project_manage() -> None:
     """Open the interactive TUI project manager (list, edit, delete, create)."""
     from loci.db import init_schema
     from loci.db.connection import connect
-    from loci.tui import run_wizard
+    from loci.ui.tui import run_wizard
 
     init_schema()
     conn = connect()
@@ -159,6 +232,7 @@ def project_manage() -> None:
 def project_bind(slug: str) -> None:
     """Bind the current directory to a project. Writes .loci/project."""
     from loci.mcp.resolve import write_project_file
+
     path = write_project_file(slug)
     console.print(f"[green]bound[/green] [bold]{slug}[/bold] → {path}")
 
@@ -195,8 +269,15 @@ def project_info(slug: str) -> None:
         "SELECT COUNT(*) AS c FROM project_membership WHERE project_id = ?",
         (proj.id,),
     ).fetchone()["c"]
-    console.print({"id": proj.id, "slug": proj.slug, "name": proj.name,
-                    "members": members, "last_active_at": proj.last_active_at})
+    console.print(
+        {
+            "id": proj.id,
+            "slug": proj.slug,
+            "name": proj.name,
+            "members": members,
+            "last_active_at": proj.last_active_at,
+        }
+    )
     if proj.profile_md:
         console.rule("profile")
         console.print(proj.profile_md)
@@ -252,6 +333,7 @@ def current_show() -> None:
 
 def _resolve_project(conn, project_str: str):
     from loci.graph import ProjectRepository
+
     repo = ProjectRepository(conn)
     proj = repo.get_by_slug(project_str) or repo.get(project_str)
     if proj is None:
@@ -263,6 +345,7 @@ def _resolve_project(conn, project_str: str):
 def _resolve_project_id_auto(conn, project: str | None) -> str:
     """Resolve project id from explicit slug/id or auto-resolution."""
     from loci.mcp.resolve import ProjectNotFound, resolve_project_id
+
     try:
         return resolve_project_id(conn, project)
     except ProjectNotFound as exc:
@@ -279,6 +362,7 @@ def _session_toml_path() -> Path | None:
 
 def _resolve_workspace(conn, ws_str: str):
     from loci.graph.workspaces import WorkspaceRepository
+
     repo = WorkspaceRepository(conn)
     ws = repo.get_by_slug(ws_str) or repo.get(ws_str)
     if ws is None:
@@ -310,11 +394,17 @@ def workspace_create(
 
     init_schema()
     conn = connect()
-    ws = WorkspaceRepository(conn).create(Workspace(
-        id=new_id(), slug=slug, name=name or slug,
-        description_md=description, kind=kind,
-        created_at=now_iso(), last_active_at=now_iso(),
-    ))
+    ws = WorkspaceRepository(conn).create(
+        Workspace(
+            id=new_id(),
+            slug=slug,
+            name=name or slug,
+            description_md=description,
+            kind=kind,
+            created_at=now_iso(),
+            last_active_at=now_iso(),
+        )
+    )
     conn.commit()
     console.print(f"[green]created workspace[/green] [bold]{ws.slug}[/bold] ({ws.id})")
 
@@ -350,8 +440,15 @@ def workspace_info(slug: str) -> None:
     ws = _resolve_workspace(conn, slug)
     repo = WorkspaceRepository(conn)
     sources = repo.list_sources(ws.id)
-    console.print({"id": ws.id, "slug": ws.slug, "name": ws.name,
-                    "kind": ws.kind, "last_scanned_at": ws.last_scanned_at})
+    console.print(
+        {
+            "id": ws.id,
+            "slug": ws.slug,
+            "name": ws.name,
+            "kind": ws.kind,
+            "last_scanned_at": ws.last_scanned_at,
+        }
+    )
     table = Table("id", "root_path", "label", "last_scanned_at")
     for s in sources:
         table.add_row(s.id, s.root_path, s.label or "", s.last_scanned_at or "—")
@@ -389,7 +486,9 @@ def workspace_link(workspace: str, project: str, role: str = "primary") -> None:
     proj = _resolve_project(conn, project)
     WorkspaceRepository(conn).link_project(proj.id, ws.id, role=role)  # type: ignore[arg-type]
     conn.commit()
-    console.print(f"[green]linked[/green] [bold]{ws.slug}[/bold] → [bold]{proj.slug}[/bold] (role={role})")
+    console.print(
+        f"[green]linked[/green] [bold]{ws.slug}[/bold] → [bold]{proj.slug}[/bold] (role={role})"
+    )
 
 
 @workspace_app.command(name="unlink")
@@ -419,10 +518,16 @@ def workspace_scan(workspace: str) -> None:
     conn = connect()
     ws = _resolve_workspace(conn, workspace)
     res = scan_workspace(conn, ws.id)
-    console.print({"scanned": res.scanned, "new_raw": res.new_raw,
-                    "deduped": res.deduped, "skipped": res.skipped,
-                    "members_added": res.members_added,
-                    "errors": res.errors[:5]})
+    console.print(
+        {
+            "scanned": res.scanned,
+            "new_raw": res.new_raw,
+            "deduped": res.deduped,
+            "skipped": res.skipped,
+            "members_added": res.members_added,
+            "errors": res.errors[:5],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -441,10 +546,16 @@ def scan(project: str) -> None:
     conn = connect()
     proj = _resolve_project(conn, project)
     res = scan_project(conn, proj.id)
-    console.print({"scanned": res.scanned, "new_raw": res.new_raw,
-                    "deduped": res.deduped, "skipped": res.skipped,
-                    "members_added": res.members_added,
-                    "errors": res.errors[:5]})
+    console.print(
+        {
+            "scanned": res.scanned,
+            "new_raw": res.new_raw,
+            "deduped": res.deduped,
+            "skipped": res.skipped,
+            "members_added": res.members_added,
+            "errors": res.errors[:5],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -475,20 +586,26 @@ def save(
 
     if is_url:
         from loci.capture.ingest import ingest_url
-        result = asyncio.run(ingest_url(
-            url=source,
-            context_text=context,
-            project_id=project_id,
-            conn=conn,
-        ))
+
+        result = asyncio.run(
+            ingest_url(
+                url=source,
+                context_text=context,
+                project_id=project_id,
+                conn=conn,
+            )
+        )
     else:
         from loci.capture.ingest import ingest_file
-        result = asyncio.run(ingest_file(
-            path=source,
-            context_text=context,
-            project_id=project_id,
-            conn=conn,
-        ))
+
+        result = asyncio.run(
+            ingest_file(
+                path=source,
+                context_text=context,
+                project_id=project_id,
+                conn=conn,
+            )
+        )
 
     # Print summary.
     status_tag = "[yellow]duplicate[/yellow]" if result.is_duplicate else "[green]saved[/green]"
@@ -506,6 +623,7 @@ def save(
     if confirmed_folder is None:
         if result.folder_suggestions:
             import questionary
+
             choices = [f for f, _ in result.folder_suggestions] + ["(skip)"]
             confirmed_folder = questionary.select(
                 "Choose a folder for this resource:",
@@ -522,16 +640,21 @@ def save(
         confirmed_aspects = [a.strip() for a in aspects.split(",") if a.strip()]
     elif result.aspect_suggestions:
         import questionary
-        confirmed_aspects = questionary.checkbox(
-            "Select aspect labels for this resource (space to toggle, enter to confirm):",
-            choices=result.aspect_suggestions,
-        ).ask() or []
+
+        confirmed_aspects = (
+            questionary.checkbox(
+                "Select aspect labels for this resource (space to toggle, enter to confirm):",
+                choices=result.aspect_suggestions,
+            ).ask()
+            or []
+        )
     else:
         console.print("  [dim]no aspect suggestions[/dim]")
 
     # Write confirmed folder and aspects to DB.
     if confirmed_folder is not None:
         from loci.graph.models import now_iso
+
         conn.execute(
             """
             INSERT OR REPLACE INTO resource_provenance
@@ -544,6 +667,7 @@ def save(
 
     if confirmed_aspects:
         from loci.graph.aspects import AspectRepository
+
         AspectRepository(conn).tag_resource(
             result.resource_id,
             confirmed_aspects,
@@ -555,7 +679,9 @@ def save(
 
     console.print(f"  folder:  {confirmed_folder or '(none)'}")
     console.print(f"  aspects: {', '.join(confirmed_aspects) or '(none)'}")
-    console.print(f"\n[dim]Use @loci:source://{result.resource_id} to reference this resource.[/dim]")
+    console.print(
+        f"\n[dim]Use @loci:source://{result.resource_id} to reference this resource.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +704,7 @@ def use(
 
     # Fetch project info.
     from loci.graph import ProjectRepository
+
     proj = ProjectRepository(conn).get(project_id)
     if proj is None:
         console.print(f"[red]project not found for id:[/red] {project_id}")
@@ -621,6 +748,7 @@ def use(
     ).fetchall()
 
     from loci.graph.aspects import AspectRepository
+
     aspect_repo = AspectRepository(conn)
     top_global = aspect_repo.top_aspects(project_id, limit=3)
     top_labels = ", ".join(label for label, _ in top_global) if top_global else "—"
@@ -689,14 +817,16 @@ def recall(
     if aspects:
         filter_aspects = [a.strip() for a in aspects.split(",") if a.strip()]
 
-    results = asyncio.run(retrieve(
-        query=query,
-        project_id=project_id,
-        conn=conn,
-        n=n,
-        filter_aspects=filter_aspects,
-        filter_folder=folder,
-    ))
+    results = asyncio.run(
+        retrieve(
+            query=query,
+            project_id=project_id,
+            conn=conn,
+            n=n,
+            filter_aspects=filter_aspects,
+            filter_folder=folder,
+        )
+    )
 
     if not results:
         console.print("[yellow]no results found[/yellow]")
@@ -793,7 +923,9 @@ def aspects(
                 av = aspect_repo.get_by_id(ra.aspect_id)
                 if av:
                     label_map[ra.aspect_id] = av.label
-            current_label_list = [label_map[ra.aspect_id] for ra in current if label_map.get(ra.aspect_id)]
+            current_label_list = [
+                label_map[ra.aspect_id] for ra in current if label_map.get(ra.aspect_id)
+            ]
         else:
             current_label_list = []
 
@@ -805,6 +937,7 @@ def aspects(
 
         try:
             import questionary
+
             # Get full vocab for this project.
             project_id_str: str | None = None
             if project:
@@ -813,7 +946,9 @@ def aspects(
             vocab = aspect_repo.list_vocab(project_id=project_id_str)
             vocab_labels = [a.label for a in vocab]
             if not vocab_labels:
-                console.print("[dim]no vocabulary to choose from; use loci save to add resources first[/dim]")
+                console.print(
+                    "[dim]no vocabulary to choose from; use loci save to add resources first[/dim]"
+                )
                 return
             selected = questionary.checkbox(
                 "Toggle aspects (space to select, enter to confirm):",
@@ -939,11 +1074,14 @@ def reset(yes: bool = False) -> None:
             console.print("[yellow]aborted[/yellow]")
             return
     import shutil
+
     if db_path.exists():
         db_path.unlink()
     # WAL/SHM sidecars
-    for sidecar in (db_path.with_suffix(db_path.suffix + "-wal"),
-                    db_path.with_suffix(db_path.suffix + "-shm")):
+    for sidecar in (
+        db_path.with_suffix(db_path.suffix + "-wal"),
+        db_path.with_suffix(db_path.suffix + "-shm"),
+    ):
         if sidecar.exists():
             sidecar.unlink()
     if blob_dir.exists():
@@ -951,10 +1089,13 @@ def reset(yes: bool = False) -> None:
     blob_dir.mkdir(parents=True, exist_ok=True)
     # Re-create schema empty so the next CLI call doesn't trip the migration runner.
     from loci.db import init_schema
+
     init_schema()
-    console.print("[green]reset complete[/green] — run `loci workspace create`, "
-                  "`loci workspace add-source`, `loci workspace scan`, "
-                  "`loci project create`, `loci workspace link`.")
+    console.print(
+        "[green]reset complete[/green] — run `loci workspace create`, "
+        "`loci workspace add-source`, `loci workspace scan`, "
+        "`loci project create`, `loci workspace link`."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +1114,7 @@ def status(project: str | None = None) -> None:
 
     if project:
         from loci.graph import ProjectRepository
+
         proj = ProjectRepository(conn).get_by_slug(project) or ProjectRepository(conn).get(project)
         if proj is None:
             console.print(f"[red]no such project:[/red] {project}")
@@ -980,7 +1122,9 @@ def status(project: str | None = None) -> None:
         nm = conn.execute(
             "SELECT COUNT(*) AS c FROM project_membership WHERE project_id = ?", (proj.id,)
         ).fetchone()["c"]
-        queued = conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE status='queued'").fetchone()["c"]
+        queued = conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE status='queued'").fetchone()[
+            "c"
+        ]
         console.rule(f"[bold]{proj.slug}[/bold]")
         console.print(f"  {nm} nodes  ·  {queued} jobs queued")
         return
@@ -988,8 +1132,20 @@ def status(project: str | None = None) -> None:
     rows = []
     rows.append(("nodes", "", str(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])))
     rows.append(("projects", "", str(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])))
-    rows.append(("jobs", "queued", str(conn.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'").fetchone()[0])))
-    rows.append(("jobs", "done", str(conn.execute("SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()[0])))
+    rows.append(
+        (
+            "jobs",
+            "queued",
+            str(conn.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'").fetchone()[0]),
+        )
+    )
+    rows.append(
+        (
+            "jobs",
+            "done",
+            str(conn.execute("SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()[0]),
+        )
+    )
     table = Table("entity", "filter", "count")
     for e, f, c in rows:
         table.add_row(e, f, c)
@@ -1071,15 +1227,17 @@ def export(
             av = aspect_repo.get_by_id(aid)
             if av:
                 labels.append(av.label)
-        resources.append({
-            "id": row["id"],
-            "title": row["title"],
-            "subkind": row["subkind"],
-            "folder": row["folder"],
-            "source_url": row["source_url"],
-            "captured_at": row["captured_at"],
-            "aspects": labels,
-        })
+        resources.append(
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "subkind": row["subkind"],
+                "folder": row["folder"],
+                "source_url": row["source_url"],
+                "captured_at": row["captured_at"],
+                "aspects": labels,
+            }
+        )
 
     payload = {
         "project": {"id": proj.id, "slug": proj.slug, "name": proj.name},

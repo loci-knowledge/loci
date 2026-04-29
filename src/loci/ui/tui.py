@@ -43,7 +43,6 @@ class _State:
     profile_md: str = ""
     workspace_links: dict[str, str] = field(default_factory=dict)  # ws_id → role
     do_scan: bool = True
-    do_kickoff: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +166,7 @@ def _full_flow(conn: sqlite3.Connection, state: _State) -> None:
                 questionary.Choice("  Change slug", value="slug"),
                 questionary.Choice("  Change profile", value="profile"),
                 questionary.Choice("  Change workspace links", value="workspaces"),
-                questionary.Choice("  Change scan / kickoff", value="scan"),
+                questionary.Choice("  Change scan setting", value="scan"),
                 questionary.Separator(),
                 questionary.Choice("✗  Cancel without saving", value="cancel"),
             ],
@@ -492,13 +491,6 @@ def _step_scan_kickoff(state: _State) -> None:
     else:
         state.do_scan = False
 
-    ans = questionary.confirm(
-        "Run kickoff to seed interpretation graph?",
-        default=state.do_scan,
-        style=STYLE,
-    ).ask()
-    state.do_kickoff = bool(ans)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
@@ -529,7 +521,6 @@ def _print_summary(conn: sqlite3.Connection, state: _State) -> None:
         t.add_row("Workspaces", "[dim]none[/dim]")
 
     t.add_row("Scan", "[green]yes[/green]" if state.do_scan else "[dim]no[/dim]")
-    t.add_row("Kickoff", "[green]yes[/green]" if state.do_kickoff else "[dim]no[/dim]")
 
     console.print(Panel(t, title="[bold]Summary[/bold]", border_style="cyan", expand=False))
 
@@ -587,49 +578,11 @@ def _apply(conn: sqlite3.Connection, state: _State) -> None:
             for err in res.errors[:3]:
                 console.print(f"  [yellow]⚠[/yellow]  {err}")
 
-    # 4. Kickoff
-    kickoff_skipped_reason = ""
-    if state.do_kickoff and state.project_id:
-        with console.status("  Running kickoff…"):
-            from loci.jobs import enqueue
-            from loci.jobs.queue import get_job
-            from loci.jobs.worker import run_once
-            jid = enqueue(conn, kind="kickoff", project_id=state.project_id, payload={"n": 6})
-            run_once(conn)
-            job = get_job(conn, jid)
-        if job:
-            result_payload = job.get("result") or {}
-            if isinstance(result_payload, str):
-                import json as _json
-                try:
-                    result_payload = _json.loads(result_payload)
-                except Exception:
-                    result_payload = {}
-            if result_payload.get("skipped"):
-                kickoff_skipped_reason = result_payload.get("reason", "unknown")
-                console.print(f"[yellow]⚠[/yellow]  Kickoff skipped: {kickoff_skipped_reason}")
-            else:
-                written = result_payload.get("observations_written", "?")
-                console.print(f"[green]✓[/green]  Kickoff done — {written} loci written")
-        else:
-            console.print("[yellow]⚠[/yellow]  Kickoff job not found")
-
     console.print()
     console.print(
         f"[bold green]All done![/bold green]  "
-        f"Try: [cyan]loci draft {state.slug} \"your question\"[/cyan]"
+        f"Try: [cyan]loci recall {state.slug} \"your question\"[/cyan]"
     )
-    if kickoff_skipped_reason and "no profile" in kickoff_skipped_reason:
-        console.print(
-            "\n[dim]Tip: kickoff needs a profile to generate loci. Add one then re-run:[/dim]\n"
-            f"  [cyan]loci kickoff {state.slug}[/cyan]  [dim](after adding a profile via[/dim] "
-            f"[cyan]loci project manage[/cyan][dim])[/dim]"
-        )
-    elif kickoff_skipped_reason:
-        console.print(
-            f"\n[dim]Tip: once sources are scanned, re-run: [/dim]"
-            f"[cyan]loci kickoff {state.slug}[/cyan]"
-        )
     console.print()
 
 

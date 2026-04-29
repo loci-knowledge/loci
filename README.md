@@ -28,9 +28,6 @@ uv tool install loci-wiki
 
 # with pipx
 pipx install loci-wiki
-
-# or just curl-pipe the installer
-curl -fsSL https://raw.githubusercontent.com/loci-knowledge/loci/main/install.sh | sh
 ```
 
 The first scan downloads the embedding model (`BAAI/bge-small-en-v1.5`,

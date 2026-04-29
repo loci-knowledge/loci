@@ -1,6 +1,6 @@
 [project]
 name = "loci-wiki"
-version = "0.1.0"
+version = "0.1.1"
 description = "A personal memory server: aspect-tagged raw sources, concept-graph retrieval, and an MCP surface for Claude Code."
 readme = "README.md"
 requires-python = ">=3.12"
