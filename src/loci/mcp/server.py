@@ -589,6 +589,9 @@ def build_mcp_server() -> FastMCP:
                 if link.role == "excluded":
                     continue
                 lines.append(f"- **{ws.name or ws.slug}** (role: {link.role})")
+                for src in ws_repo.list_sources(ws.id):
+                    label_str = f" ({src.label})" if src.label else ""
+                    lines.append(f"  - `{src.root_path}`{label_str}")
             lines.append("")
 
         lines.append("### Usage hints")
@@ -628,18 +631,43 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(
         name="loci_workspace_list",
-        description="List all information workspaces.",
+        description=(
+            "List information workspaces linked to the current project with their "
+            "source folder paths. Falls back to all workspaces when no project is active."
+        ),
     )
-    async def loci_workspace_list() -> str:
+    async def loci_workspace_list(project: str | None = None) -> str:
         conn = get_connection()
-        workspaces = WorkspaceRepository(conn).list()
-        if not workspaces:
-            return "No workspaces found."
+        ws_repo = WorkspaceRepository(conn)
+        try:
+            project_id = resolve_project_id(conn, project)
+            ws_links = ws_repo.linked_workspaces(project_id)
+            linked = [(ws, link) for ws, link in ws_links if link.role != "excluded"]
+        except Exception:
+            linked = None
+
+        if linked is None:
+            workspaces = ws_repo.list()
+            if not workspaces:
+                return "No workspaces found."
+            lines = ["## All Workspaces\n", "| Slug | Name | Kind |", "|------|------|------|"]
+            for ws in workspaces:
+                lines.append(f"| {ws.slug} | {ws.name} | {ws.kind} |")
+            return "\n".join(lines)
+
+        if not linked:
+            return "No workspaces linked to this project."
         lines = ["## Workspaces\n"]
-        lines.append("| Slug | Name | Kind |")
-        lines.append("|------|------|------|")
-        for ws in workspaces:
-            lines.append(f"| {ws.slug} | {ws.name} | {ws.kind} |")
+        for ws, _link in linked:
+            sources = ws_repo.list_sources(ws.id)
+            lines.append(f"### {ws.name or ws.slug} (`{ws.slug}`, kind={ws.kind})")
+            if sources:
+                for src in sources:
+                    label_str = f" ({src.label})" if src.label else ""
+                    lines.append(f"- `{src.root_path}`{label_str}")
+            else:
+                lines.append("- *(no sources)*")
+            lines.append("")
         return "\n".join(lines)
 
     # -----------------------------------------------------------------------

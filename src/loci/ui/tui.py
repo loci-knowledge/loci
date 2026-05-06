@@ -351,12 +351,41 @@ def _setup_workspace_from_folder(conn: sqlite3.Connection, state: _State) -> Non
     # Create workspace (slug derived from project slug)
     ws_repo = WorkspaceRepository(conn)
     ws_slug = _slugify(f"{state.slug}-ws") or "workspace"
-    # Avoid slug collisions
     base = ws_slug
     counter = 2
     while ws_repo.get_by_slug(ws_slug) and ws_repo.get_by_slug(ws_slug).id not in state.workspace_links:
         ws_slug = f"{base}-{counter}"
         counter += 1
+
+    # If the slug still collides with an already-linked workspace, offer to update it.
+    existing_ws = ws_repo.get_by_slug(ws_slug)
+    if existing_ws and existing_ws.id in state.workspace_links:
+        choice = questionary.select(
+            "A workspace for this project already exists. What would you like to do?",
+            choices=[
+                questionary.Choice("Replace its sources with this folder selection", value="replace"),
+                questionary.Choice("Add as an additional workspace (new slug)", value="new"),
+                questionary.Choice("Cancel", value="cancel"),
+            ],
+            style=STYLE,
+        ).ask()
+        if choice is None or choice == "cancel":
+            return
+        if choice == "replace":
+            ws_repo.clear_sources(existing_ws.id)
+            for path, label in sources_to_add:
+                ws_repo.add_source(existing_ws.id, path, label=label)
+                tag = f"  label=[bold]{label}[/bold]" if label else ""
+                console.print(f"  [green]✓[/green]  Updated source [dim]{path.name}/[/dim]{tag}")
+            ws_repo.touch(existing_ws.id)
+            conn.commit()
+            state.workspace_links = {existing_ws.id: "primary"}
+            _offer_project_binding(root, state.slug)
+            return
+        # "new" — pick a fresh slug and fall through to create
+        while ws_repo.get_by_slug(ws_slug):
+            ws_slug = f"{base}-{counter}"
+            counter += 1
 
     kind = _infer_kind(subfolders)
     ws = Workspace(
@@ -378,6 +407,20 @@ def _setup_workspace_from_folder(conn: sqlite3.Connection, state: _State) -> Non
 
     conn.commit()
     state.workspace_links = {ws.id: "primary"}
+    _offer_project_binding(root, state.slug)
+
+
+def _offer_project_binding(root: Path, slug: str) -> None:
+    """Prompt to write .loci/project.toml so Claude Code auto-detects this project."""
+    confirm = questionary.confirm(
+        f"Write .loci/project.toml to {root} so Claude Code auto-detects project '{slug}'?",
+        default=True,
+        style=STYLE,
+    ).ask()
+    if confirm:
+        from loci.mcp.resolve import write_project_toml
+        path = write_project_toml(slug, directory=root)
+        console.print(f"  [green]✓[/green]  Wrote [dim]{path}[/dim]")
 
 
 def _link_existing_workspaces(

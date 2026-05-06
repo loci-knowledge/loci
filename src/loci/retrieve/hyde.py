@@ -36,7 +36,7 @@ _HYDE_INSTRUCTIONS = (
 )
 
 
-def hypothesize(query: str, project_memo: str | None = None) -> str:
+async def hypothesize(query: str, project_memo: str | None = None) -> str:
     """Return a hypothetical passage for `query`, or the query verbatim if no LLM.
 
     The fallback is intentional: callers can always pass the result to the
@@ -55,7 +55,7 @@ def hypothesize(query: str, project_memo: str | None = None) -> str:
     if project_memo:
         user_prompt = f"Project context: {project_memo[:200]}\n\n{query}"
     try:
-        result = agent.run_sync(user_prompt)
+        result = await agent.run(user_prompt)
     except Exception as exc:  # noqa: BLE001 — never let HyDE break retrieval
         log.warning("HyDE call failed; falling back to query: %s", exc)
         return query

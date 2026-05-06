@@ -144,7 +144,7 @@ async def retrieve(
     # ------------------------------------------------------------------
     hyde_vec: np.ndarray | None = None
     try:
-        hypothetical = hyde_mod.hypothesize(query)
+        hypothetical = await hyde_mod.hypothesize(query)
         if hypothetical and hypothetical != query:
             hyde_vec = emb.encode(hypothetical)
         else:

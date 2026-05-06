@@ -133,6 +133,10 @@ def resolve_project_id(
         or read_state_file()
     )
     if slug_or_id is None:
+        # Last resort: if exactly one project exists, use it automatically.
+        rows = conn.execute("SELECT id, slug FROM projects LIMIT 2").fetchall()
+        if len(rows) == 1:
+            return rows[0]["id"]
         raise ProjectNotFound(
             "No project specified. Set LOCI_PROJECT, create a .loci/project.toml "
             "file (run `loci project bind <slug>`), run `loci current set <slug>`, "

@@ -126,6 +126,14 @@ class WorkspaceRepository:
         ).fetchall()
         return [self._row_to_source(dict(r)) for r in rows]
 
+    def clear_sources(self, workspace_id: str) -> int:
+        """Remove all source roots for a workspace. Returns count deleted."""
+        cursor = self.conn.execute(
+            "DELETE FROM workspace_sources WHERE workspace_id = ?",
+            (workspace_id,),
+        )
+        return cursor.rowcount
+
     def remove_source(self, workspace_id: str, source_id_or_path: str) -> bool:
         """Remove by source-id or root_path. Returns True if a row was deleted."""
         cursor = self.conn.execute(
