@@ -10,11 +10,11 @@ with aspects and organised into folders. The six public tools are:
     loci_context   — project summary (counts, folders, top aspects)
     loci_research  — stub (paper research coming in v1.1)
 
-Three MCP resource templates expose @-mention deep-links:
-
-    loci:source://{resource_id}  — full text of a resource
-    loci:folder://{folder_path}  — resource list for a folder
-    loci:aspect://{label}        — resources tagged with an aspect
+Three MCP resource templates expose @-mention deep-links.
+The server is named "loci", so Claude Code displays them as @loci:<scheme>:
+    source://{resource_id}  — @loci:source://{id}   full text of a resource
+    folder://{folder_path}  — @loci:folder://{path} resource list for a folder
+    aspect://{label}        — @loci:aspect://{tag}  resources tagged with an aspect
 
 Project auto-resolution is unchanged — see loci.mcp.resolve.
 """
@@ -75,6 +75,10 @@ def build_mcp_server() -> FastMCP:
     settings = get_settings()
     settings.ensure_dirs()
     init_schema()
+
+    # Slug → resource_id mapping for concrete resources registered at startup.
+    # Populated by _register_recent_resources; captured by the get_source handler.
+    _slug_to_id: dict[str, str] = {}
 
     mcp = FastMCP(
         name="loci",
@@ -201,7 +205,9 @@ def build_mcp_server() -> FastMCP:
         description=(
             "Retrieve resources relevant to a query using concept-graph-driven "
             "retrieval (BM25 + ANN + aspect expansion + graph reranking). "
-            "Returns ranked sources with the reason each was surfaced."
+            "Returns ranked sources as clickable @loci:source:// links with "
+            "the reason each was surfaced. Set verbose=true to see expanded "
+            "aspects, HyDE hypothesis, and per-result retrieval scores."
         ),
     )
     async def loci_recall(
@@ -210,8 +216,9 @@ def build_mcp_server() -> FastMCP:
         filter_aspects: list[str] | None = None,
         filter_folder: str | None = None,
         project: str | None = None,
+        verbose: bool = False,
     ) -> str:
-        from loci.retrieve.pipeline import retrieve
+        from loci.retrieve.pipeline import RetrievalTrace, retrieve
 
         conn = get_connection()
         try:
@@ -220,17 +227,24 @@ def build_mcp_server() -> FastMCP:
             return f"Error: {e}"
 
         try:
-            results = await retrieve(
+            retrieve_result = await retrieve(
                 query=query,
                 project_id=project_id,
                 conn=conn,
                 n=n,
                 filter_aspects=filter_aspects,
                 filter_folder=filter_folder,
+                return_trace=verbose,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("loci_recall: retrieve failed")
             return f"Error during retrieval: {exc}"
+
+        trace: RetrievalTrace | None = None
+        if verbose:
+            results, trace = retrieve_result  # type: ignore[misc]
+        else:
+            results = retrieve_result  # type: ignore[assignment]
 
         if not results:
             return f'## Recall: "{query}"\n\nNo results found.'
@@ -240,8 +254,21 @@ def build_mcp_server() -> FastMCP:
             await _log_usage(r.resource_id, "loci_recall", conn)
 
         lines: list[str] = [f'## Recall: "{query}"\n']
+
+        # Trace block (verbose mode only)
+        if trace:
+            lines.append("### Retrieval trace\n")
+            if trace.expanded_aspects:
+                lines.append(
+                    f"- **Expanded aspects**: {', '.join(trace.expanded_aspects)}"
+                )
+            if trace.hyde_hypothesis:
+                hyp = trace.hyde_hypothesis[:200].replace("\n", " ")
+                lines.append(f"- **HyDE hypothesis**: {hyp}")
+            lines.append("")
+
         for i, r in enumerate(results, start=1):
-            folder_tag = f" [{r.folder}]" if r.folder else ""
+            folder_tag = f" `{r.folder}`" if r.folder else ""
             aspects_str = ", ".join(r.aspects) if r.aspects else "—"
             top_text = ""
             if r.chunks:
@@ -250,10 +277,21 @@ def build_mcp_server() -> FastMCP:
                 if len(r.chunks[0].text) > 300:
                     top_text += "..."
 
-            lines.append(f"### {i}. {r.title}{folder_tag}")
-            lines.append(f"**ID**: `{r.resource_id}`")
+            lines.append(
+                f"### {i}. [{r.title}](@loci:source://{r.resource_id}){folder_tag}"
+            )
             lines.append(f"**Aspects**: {aspects_str}")
             lines.append(f"**Why surfaced**: {r.why_surfaced}")
+            if trace:
+                boosted = r.resource_id in trace.boosted_resource_ids
+                score_parts = [f"**Score (RRF)**: `{r.total_score:.4f}`"]
+                if r.chunks:
+                    c = r.chunks[0]
+                    score_parts.append(f"**BM25**: `{c.lex_score:.4f}`")
+                    score_parts.append(f"**ANN**: `{c.vec_score:.4f}`")
+                if boosted:
+                    score_parts.append("*(graph-boosted)*")
+                lines.append("  ".join(score_parts))
             if top_text:
                 lines.append(f"\n> {top_text}")
             lines.append("")
@@ -409,8 +447,8 @@ def build_mcp_server() -> FastMCP:
         name="loci_browse",
         description=(
             "Browse saved resources, optionally filtered by folder, aspect label, "
-            "or keyword (title/body substring). Returns a markdown table of matching "
-            "resources with Title, ID, Folder, Aspects, and Saved date."
+            "or keyword (title/body substring). Returns a markdown table with "
+            "clickable @loci:source:// title links, Folder, Aspects, and Saved date."
         ),
     )
     async def loci_browse(
@@ -488,8 +526,8 @@ def build_mcp_server() -> FastMCP:
             return f"No resources found ({filter_str})."
 
         lines = ["## Resources\n"]
-        lines.append("| Title | ID | Folder | Aspects | Saved |")
-        lines.append("|-------|-----|--------|---------|-------|")
+        lines.append("| Title | Folder | Aspects | Saved |")
+        lines.append("|-------|--------|---------|-------|")
         for row in rows:
             title = (row["title"] or "Untitled")[:50]
             rid = row["id"]
@@ -498,8 +536,9 @@ def build_mcp_server() -> FastMCP:
             if len(aspects_cell) > 40:
                 aspects_cell = aspects_cell[:37] + "..."
             saved = (row["created_at"] or "")[:10]
+            title_link = f"[{title}](@loci:source://{rid})"
             lines.append(
-                f"| {title} | `{rid}` | {folder_cell} | {aspects_cell} | {saved} |"
+                f"| {title_link} | {folder_cell} | {aspects_cell} | {saved} |"
             )
 
         return "\n".join(lines)
@@ -674,12 +713,16 @@ def build_mcp_server() -> FastMCP:
     # MCP Resources — @-mention deep links
     # -----------------------------------------------------------------------
 
-    @mcp.resource("loci:source://{resource_id}")
+    @mcp.resource("source://{resource_id}")
     async def get_source(resource_id: str) -> str:
-        """Full text of a resource by ID."""
+        """Full text of a resource by ID or slug."""
         conn = get_connection()
         src_repo = SourceRepository(conn)
         node = src_repo.get(resource_id)
+        # Fall back to slug lookup for concrete resources registered at startup.
+        if node is None and resource_id in _slug_to_id:
+            node = src_repo.get(_slug_to_id[resource_id])
+            resource_id = _slug_to_id[resource_id]
         if node is None:
             return f"Resource not found: {resource_id}"
 
@@ -721,7 +764,7 @@ def build_mcp_server() -> FastMCP:
 
         return "\n".join(header_parts)
 
-    @mcp.resource("loci:folder://{folder_path}")
+    @mcp.resource("folder://{folder_path}")
     async def get_folder(folder_path: str) -> str:
         """List of resources in a folder."""
         conn = get_connection()
@@ -771,7 +814,7 @@ def build_mcp_server() -> FastMCP:
 
         return "\n".join(lines)
 
-    @mcp.resource("loci:aspect://{label}")
+    @mcp.resource("aspect://{label}")
     async def get_aspect_resources(label: str) -> str:
         """Resources tagged with this aspect."""
         conn = get_connection()
@@ -806,6 +849,45 @@ def build_mcp_server() -> FastMCP:
             )
 
         return "\n".join(lines)
+
+    # -----------------------------------------------------------------------
+    # Completion handler — live URI template autocomplete
+    # -----------------------------------------------------------------------
+
+    @mcp.completion()
+    async def handle_completion(ref, argument, context):  # noqa: ANN001
+        from loci.mcp.completions import handle_completion as _handle
+        return await _handle(ref, argument, get_connection())
+
+    # -----------------------------------------------------------------------
+    # MCP Prompts — slash-command entry points
+    # -----------------------------------------------------------------------
+
+    @mcp.prompt("recall")
+    async def recall_prompt(query: str) -> str:
+        """Semantic search over saved resources."""
+        return (
+            f"Use loci_recall with query={query!r} and summarize the top results. "
+            f"Include the clickable resource links in your response."
+        )
+
+    @mcp.prompt("save")
+    async def save_prompt(target: str) -> str:
+        """Save a URL, file, or text snippet into loci."""
+        return f"Use loci_save to capture {target!r} into the current loci project."
+
+    # -----------------------------------------------------------------------
+    # Concrete resource enumeration — top-30 by recency for @-mention picker
+    # -----------------------------------------------------------------------
+
+    _startup_conn = get_connection()
+    try:
+        _startup_project_id: str | None = resolve_project_id(_startup_conn)
+    except ProjectNotFound:
+        _startup_project_id = None
+
+    if _startup_project_id:
+        _register_recent_resources(mcp, _startup_conn, _startup_project_id, _slug_to_id)
 
     return mcp
 
@@ -890,6 +972,95 @@ async def _elicit_folder_and_aspects(
         pass
 
     return top_folder, top_aspects
+
+
+# ---------------------------------------------------------------------------
+# Concrete resource registration helper
+# ---------------------------------------------------------------------------
+
+
+def _slugify(text: str, max_len: int = 60) -> str:
+    """Convert a title to a URL-safe slug."""
+    import re
+    s = re.sub(r"[^\w\s-]", "", text.lower())
+    s = re.sub(r"[\s_]+", "-", s).strip("-")
+    return s[:max_len]
+
+
+def _register_recent_resources(
+    mcp: Any,
+    conn: Any,
+    project_id: str,
+    slug_to_id: dict[str, str],
+    limit: int = 30,
+) -> None:
+    """Register the most-recently accessed resources as concrete MCP resources.
+
+    Resources appear by title in the Claude Code @loci: autocomplete picker.
+    The slug_to_id dict is populated so get_source can resolve slug URIs.
+    URI scheme is 'source://{slug}' so Claude Code shows '@loci:source://{slug}'.
+    """
+    from mcp.server.fastmcp.resources.types import FunctionResource
+    from pydantic import AnyUrl
+
+    rows = conn.execute(
+        """
+        SELECT n.id, n.title
+        FROM nodes n
+        JOIN project_effective_members pm ON pm.node_id = n.id
+        WHERE pm.project_id = ?
+        ORDER BY COALESCE(n.last_accessed_at, n.created_at) DESC
+        LIMIT ?
+        """,
+        (project_id, limit),
+    ).fetchall()
+
+    for row in rows:
+        rid = row["id"]
+        title = (row["title"] or rid)[:120]
+
+        # Build a unique slug for this resource.
+        base_slug = _slugify(title)
+        slug = base_slug
+        n = 2
+        while slug in slug_to_id:
+            slug = f"{base_slug[:55]}-{n}"
+            n += 1
+        slug_to_id[slug] = rid
+
+        def _make_reader(_id: str = rid) -> Any:
+            async def _read() -> str:
+                _conn = get_connection()
+                src_repo = SourceRepository(_conn)
+                node = src_repo.get(_id)
+                if node is None:
+                    return f"Resource not found: {_id}"
+                prov_row = _conn.execute(
+                    "SELECT folder, source_url FROM resource_provenance WHERE resource_id = ?",
+                    (_id,),
+                ).fetchone()
+                folder = prov_row["folder"] if prov_row else None
+                source_url = prov_row["source_url"] if prov_row else None
+                header = [f"# {node.title}"]
+                if folder:
+                    header.append(f"**Folder**: {folder}")
+                if source_url:
+                    header.append(f"**Source**: {source_url}")
+                header.append(f"**ID**: `{_id}`")
+                header.append("")
+                return "\n".join(header) + (node.body or "(no content)")
+            return _read
+
+        try:
+            resource = FunctionResource.from_function(
+                fn=_make_reader(),
+                uri=f"source://{slug}",
+                name=title,
+                description=title,
+            )
+            mcp.add_resource(resource)
+        except Exception:  # noqa: BLE001
+            log.debug("_register_recent_resources: skipped %s", rid, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

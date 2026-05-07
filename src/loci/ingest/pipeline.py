@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 
 from loci.embed.local import Embedder, get_embedder
-from loci.graph.models import RawNode
+from loci.graph.models import RawNode, now_iso
 from loci.graph.sources import SourceRepository
 from loci.graph.workspaces import WorkspaceRepository
 from loci.ingest.chunker import Chunk, chunk_doc
@@ -94,8 +94,13 @@ class IngestPipeline:
     # Public entry point
     # -----------------------------------------------------------------------
 
-    def scan(self, root: Path) -> IngestResult:
-        """Walk `root`, ingest everything new, return a summary."""
+    def scan(self, root: Path, *, folder: str | None = None) -> IngestResult:
+        """Walk `root`, ingest everything new, return a summary.
+
+        `folder` is the workspace source label (e.g. "papers") written into
+        resource_provenance so that folder-based filtering and @loci:folder://
+        links work correctly.
+        """
         result = IngestResult()
         batch: list[_Pending] = []
         # Track hashes staged in the current batch but not yet written to DB.
@@ -122,11 +127,11 @@ class IngestPipeline:
                 continue
             batch.append(outcome)
             if len(batch) >= self.embed_batch_size:
-                self._flush_batch(batch, result)
+                self._flush_batch(batch, result, folder=folder)
                 batch = []
                 batch_hashes.clear()
         if batch:
-            self._flush_batch(batch, result)
+            self._flush_batch(batch, result, folder=folder)
         self.workspaces.touch(self.workspace_id)
         return result
 
@@ -175,7 +180,13 @@ class IngestPipeline:
             chunks=chunks,
         )
 
-    def _flush_batch(self, batch: list[_Pending], result: IngestResult) -> None:
+    def _flush_batch(
+        self,
+        batch: list[_Pending],
+        result: IngestResult,
+        *,
+        folder: str | None = None,
+    ) -> None:
         """Embed every chunk in the batch in one model call, then write each raw + chunks.
 
         We collect all chunks across every file in the batch, embed them in a
@@ -206,14 +217,16 @@ class IngestPipeline:
         for pending, (s, e) in zip(batch, slices, strict=True):
             chunk_vecs = vectors[s:e] if vectors is not None else None
             try:
-                self._write_one(pending, chunk_vecs)
+                self._write_one(pending, chunk_vecs, folder=folder)
                 result.new_raw += 1
                 result.members_added += 1
             except Exception as exc:  # noqa: BLE001
                 log.exception("ingest write failed for %s", pending.path)
                 result.errors.append(f"{pending.path}: {exc}")
 
-    def _write_one(self, p: _Pending, chunk_vecs: np.ndarray | None) -> None:
+    def _write_one(
+        self, p: _Pending, chunk_vecs: np.ndarray | None, *, folder: str | None = None
+    ) -> None:
         store_blob(p.full_hash, p.raw_bytes)
         title = self._derive_title(p)
         node = RawNode(
@@ -227,6 +240,14 @@ class IngestPipeline:
         )
         self.nodes.insert(node, chunks=p.chunks, chunk_embeddings=chunk_vecs)
         self.workspaces.add_member(self.workspace_id, node.id)
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO resource_provenance
+                (resource_id, source_url, folder, saved_via, context_text, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (node.id, None, folder, "workspace", None, now_iso()),
+        )
 
     @staticmethod
     def _embed_text_for_chunk(p: _Pending, chunk: Chunk) -> str:
@@ -289,7 +310,7 @@ def scan_workspace(
         if not root_path.exists():
             combined.errors.append(f"missing source root: {src.root_path}")
             continue
-        partial = pipeline.scan(root_path)
+        partial = pipeline.scan(root_path, folder=src.label)
         combined.scanned += partial.scanned
         combined.new_raw += partial.new_raw
         combined.deduped += partial.deduped

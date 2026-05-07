@@ -77,6 +77,10 @@ Verify:
 claude mcp get loci
 ```
 
+> **No HTTP server needed for MCP.** `loci mcp` runs as a stdio subprocess that
+> Claude Code spawns directly. `loci server` is only needed if you use the browser
+> extension or REST API clients.
+
 ## 5. Tell loci which project a directory belongs to
 
 So MCP tools know which slug to use, bind a directory to your project:
@@ -153,6 +157,13 @@ Or `@`-mention a specific resource directly:
 @loci:folder://papers/kb-construction
 @loci:aspect://methodology
 ```
+
+> **Note on `@loci` autocomplete**: Typing `@loci:` in Claude Code shows three URI
+> *templates* (`folder://`, `source://`, `aspect://`) — not an enumerable list of
+> resources. This is how MCP resources work. To find a specific resource ID, use
+> `loci_browse` first, then paste the ID into `@loci:source://<id>`. To browse all
+> resources in a folder, type `@loci:folder://papers` (replacing `papers` with your
+> folder label).
 
 CLI:
 

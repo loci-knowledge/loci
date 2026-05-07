@@ -83,6 +83,15 @@ class RetrievalResult:
     total_score: float   # higher = better; RRF-fused and graph-boosted
 
 
+@dataclass
+class RetrievalTrace:
+    """Pipeline trace returned when retrieve(return_trace=True) is called."""
+
+    expanded_aspects: list[str]
+    hyde_hypothesis: str | None
+    boosted_resource_ids: frozenset[str]
+
+
 async def retrieve(
     query: str,
     project_id: str,
@@ -91,7 +100,8 @@ async def retrieve(
     filter_aspects: list[str] | None = None,
     filter_folder: str | None = None,
     embedder: Embedder | None = None,
-) -> list[RetrievalResult]:
+    return_trace: bool = False,
+) -> "list[RetrievalResult] | tuple[list[RetrievalResult], RetrievalTrace]":
     """Run the concept-graph retrieval pipeline.
 
     Parameters
@@ -143,6 +153,7 @@ async def retrieve(
     # Step 2: HyDE — generate a hypothetical doc and embed it
     # ------------------------------------------------------------------
     hyde_vec: np.ndarray | None = None
+    hypothetical: str | None = None
     try:
         hypothetical = await hyde_mod.hypothesize(query)
         if hypothetical and hypothetical != query:
@@ -327,6 +338,12 @@ async def retrieve(
             total_score=total_score,
         ))
 
+    if return_trace:
+        return results, RetrievalTrace(
+            expanded_aspects=expanded_aspects,
+            hyde_hypothesis=hypothetical,
+            boosted_resource_ids=frozenset(boosted_resources),
+        )
     return results
 
 

@@ -15,10 +15,11 @@ Pipeline (see `pipeline.retrieve` for the full recipe):
 Public API shapes are in `pipeline.RetrievalResult` and `pipeline.ChunkResult`.
 """
 
-from loci.retrieve.pipeline import ChunkResult, RetrievalResult, retrieve
+from loci.retrieve.pipeline import ChunkResult, RetrievalResult, RetrievalTrace, retrieve
 
 __all__ = [
     "ChunkResult",
     "RetrievalResult",
+    "RetrievalTrace",
     "retrieve",
 ]
