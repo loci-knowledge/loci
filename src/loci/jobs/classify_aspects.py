@@ -45,7 +45,7 @@ async def handle_classify_aspects(job: dict, conn: sqlite3.Connection, settings)
         """
         SELECT n.title, n.body
         FROM nodes n
-        JOIN raw_nodes r ON r.node_id = n.id
+        JOIN raw_nodes rn ON rn.id = n.id
         WHERE n.id = ? AND n.kind = 'raw'
         """,
         (resource_id,),
@@ -107,10 +107,39 @@ async def handle_classify_aspects(job: dict, conn: sqlite3.Connection, settings)
     log.info(
         "classify_aspects: wrote %d aspects for resource %s", len(pairs), resource_id
     )
+
+    # Cascade: enqueue per-project interpretation for every project that
+    # contains this resource (daily bucket dedup).
+    from datetime import UTC, datetime
+
+    from loci.jobs.queue import enqueue
+
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    projects_rows = conn.execute(
+        """
+        SELECT DISTINCT project_id FROM project_effective_members
+        WHERE node_id = ?
+        """,
+        (resource_id,),
+    ).fetchall()
+    infer_queued = 0
+    for pr in projects_rows:
+        pid = pr["project_id"]
+        fp = f"infer_interpretation:{pid}:{resource_id}:{today}"[:64]
+        enqueue(
+            conn,
+            kind="infer_interpretation",
+            project_id=pid,
+            payload={"resource_id": resource_id, "project_id": pid, "trigger": "classify"},
+            fingerprint=fp,
+        )
+        infer_queued += 1
+
     return {
         "skipped": False,
         "aspects_written": len(pairs),
         "labels": labels,
+        "infer_interpretation_queued": infer_queued,
         "model": getattr(settings, "rag_model", "unknown"),
     }
 

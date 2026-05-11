@@ -1,9 +1,9 @@
-"""One-shot schema initializer.
+"""Schema initializer + incremental migrations.
 
-The schema is a single canonical file (`schema.sql`). On every connect we run
-it through `executescript` — every statement is `CREATE … IF NOT EXISTS` so the
-call is idempotent and there is no migration history to track. When the schema
-changes we rewrite `schema.sql` and the database is reset (`loci reset`).
+The base schema lives in `schema.sql` (all statements are CREATE … IF NOT
+EXISTS, so applying it is idempotent). After the base schema, `run_migrations`
+applies any pending incremental changes to existing databases (ALTER TABLE,
+table recreations, etc.).
 """
 
 from __future__ import annotations
@@ -25,10 +25,24 @@ def _read_schema() -> str:
 
 
 def init_schema(db_path: Path | None = None) -> None:
-    """Apply the canonical schema. Idempotent."""
+    """Apply the canonical schema then run pending migrations. Idempotent.
+
+    Order matters on existing databases: migrations add columns (e.g.
+    aspect_vocab.project_id) BEFORE executescript tries to create indexes
+    that reference those columns. On fresh installs migrations detect missing
+    tables and skip, letting executescript create everything from scratch.
+    """
+    from loci.db.migrations import _ensure_migrations_table, run_migrations
+
     sql = _read_schema()
     conn = connect(db_path)
     try:
+        # 1. Bootstrap migrations tracking table (IF NOT EXISTS — always safe).
+        _ensure_migrations_table(conn)
+        # 2. Apply incremental migrations so existing tables gain new columns
+        #    before executescript references them in index definitions.
+        run_migrations(conn)
+        # 3. Apply full schema (all IF NOT EXISTS — idempotent).
         conn.executescript(sql)
     finally:
         conn.close()

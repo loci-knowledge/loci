@@ -61,6 +61,10 @@ workspace_app = App(name="workspace", help="Information workspace commands.")
 app.command(workspace_app)
 current_app = App(name="current", help="Manage the pinned project for MCP sessions.")
 app.command(current_app)
+event_app = App(name="event", help="Ingest external signals into loci.")
+app.command(event_app)
+aspect_app = App(name="aspect", help="Aspect provenance and graph commands.")
+app.command(aspect_app)
 
 
 # ---------------------------------------------------------------------------
@@ -803,11 +807,17 @@ def recall(
     folder: str | None = None,
     n: int = 5,
     project: str | None = None,
+    explain: bool = False,
 ) -> None:
-    """Retrieve relevant resources using concept-graph-driven search."""
+    """Retrieve relevant resources using concept-graph-driven search.
+
+    Pass --explain / -e to show the retrieval trace (expanded aspects, HyDE
+    hypothesis, and per-result graph-boost indicator).
+    """
     from loci.db import init_schema
     from loci.db.connection import connect
-    from loci.retrieve.pipeline import retrieve
+    from loci.retrieve.pipeline import RetrievalTrace, retrieve
+    from loci.retrieve.query_cnl import split_query
 
     init_schema()
     conn = connect()
@@ -817,23 +827,37 @@ def recall(
     if aspects:
         filter_aspects = [a.strip() for a in aspects.split(",") if a.strip()]
 
-    results = asyncio.run(
+    free_text, cnl_query = split_query(query)
+    effective_query = free_text if free_text else query
+
+    retrieve_result = asyncio.run(
         retrieve(
-            query=query,
+            query=effective_query,
             project_id=project_id,
             conn=conn,
             n=n,
             filter_aspects=filter_aspects,
             filter_folder=folder,
+            return_trace=explain,
+            cnl_query=cnl_query if not cnl_query.is_empty else None,
         )
     )
+
+    trace: RetrievalTrace | None = None
+    if explain:
+        results, trace = retrieve_result  # type: ignore[misc]
+    else:
+        results = retrieve_result  # type: ignore[assignment]
 
     if not results:
         console.print("[yellow]no results found[/yellow]")
         return
 
+    from loci.graph.handles import short_id as _short_id
+
     for i, res in enumerate(results, start=1):
-        console.rule(f"[bold]{i}. {res.title}[/bold]")
+        sid = _short_id(res.resource_id)
+        console.rule(f"[bold]{i}. {sid} — {res.title}[/bold]")
         folder_str = f"  folder: {res.folder}" if res.folder else ""
         aspects_str = f"  aspects: {', '.join(res.aspects)}" if res.aspects else ""
         if folder_str:
@@ -841,7 +865,12 @@ def recall(
         if aspects_str:
             console.print(aspects_str)
         console.print(f"  why: {res.why_surfaced}")
-        console.print(f"  score: {res.total_score:.4f}")
+        if trace:
+            boosted = res.resource_id in trace.boosted_resource_ids
+            boost_note = "  [dim](graph-boosted)[/dim]" if boosted else ""
+            console.print(f"  score: {res.total_score:.4f}{boost_note}")
+        else:
+            console.print(f"  score: {res.total_score:.4f}")
         if res.chunks:
             top_chunk = res.chunks[0]
             snippet = top_chunk.text[:300].replace("\n", " ")
@@ -849,7 +878,31 @@ def recall(
                 console.print(f"  [{top_chunk.section}] {snippet}…")
             else:
                 console.print(f"  {snippet}…")
+            if trace and (top_chunk.lex_score or top_chunk.vec_score):
+                console.print(
+                    f"  [dim]BM25: {top_chunk.lex_score:.4f}  ANN: {top_chunk.vec_score:.4f}[/dim]"
+                )
         console.print(f"  [dim]id: {res.resource_id}[/dim]")
+
+    if trace:
+        console.rule("[dim]Retrieval trace[/dim]")
+        console.print(f'  [bold]Query:[/bold] "{query}"')
+        if not cnl_query.is_empty:
+            parts = []
+            if cnl_query.topic:
+                parts.append(f"topic={'~' if cnl_query.topic_fuzzy else ''}{cnl_query.topic}")
+            if cnl_query.kind:
+                parts.append(f"kind={cnl_query.kind}")
+            if cnl_query.role:
+                parts.append(f"role={cnl_query.role}")
+            if cnl_query.target:
+                parts.append(f"target={cnl_query.target}")
+            console.print(f"  [bold]Parsed CNL:[/bold] {' '.join(parts)}")
+        if trace.expanded_aspects:
+            console.print(f"  [bold]ε(q)[/bold] = [{', '.join(trace.expanded_aspects)}]")
+        if trace.hyde_hypothesis:
+            hyp = trace.hyde_hypothesis[:200].replace("\n", " ")
+            console.print(f"  [bold]HyDE:[/bold] {hyp!r} [dim][truncated at 200 chars][/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -883,12 +936,14 @@ def aspects(
         if not vocab:
             console.print("[dim]no aspects in vocabulary[/dim]")
             return
-        table = Table("label", "user_defined", "auto_inferred", "last_used", "id")
+        table = Table("label", "kind", "role", "target", "src", "last_used", "id")
         for a in vocab:
             table.add_row(
                 a.label,
-                "yes" if a.user_defined else "—",
-                "yes" if a.auto_inferred else "—",
+                a.kind or "—",
+                a.role or "—",
+                (a.target_aspect_id or "")[:12] + ("…" if a.target_aspect_id else "—"),
+                "user" if a.user_defined else ("inferred" if a.auto_inferred else "—"),
                 (a.last_used or "—")[:16],
                 a.id[:12] + "…",
             )
@@ -982,6 +1037,344 @@ def aspects(
         console.print(f"Current aspects: {', '.join(labels_now)}")
     else:
         console.print("[dim]no aspects set[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# aspect trace — show aspect provenance history for a resource
+# ---------------------------------------------------------------------------
+
+
+@aspect_app.command(name="trace")
+def aspect_trace(
+    handle: str,
+    project: str | None = None,
+) -> None:
+    """Show the aspect provenance history for a resource.
+
+    <handle> can be a short-id (rid_XXXXXX), full UUID, or fuzzy title.
+    """
+    from rich.tree import Tree
+
+    from loci.db import init_schema
+    from loci.db.connection import connect
+    from loci.graph.handles import resolve_handle, short_id as _short_id
+
+    init_schema()
+    conn = connect()
+    project_id = _resolve_project_id_auto(conn, project) if project else None
+
+    # Resolve handle to resource UUID.
+    resource_id = resolve_handle(handle, project_id, conn)
+    if resource_id is None:
+        console.print(f"[red]could not resolve handle:[/red] {handle}")
+        raise SystemExit(1)
+
+    # Fetch title + short_id.
+    node_row = conn.execute(
+        "SELECT title FROM nodes WHERE id = ?", (resource_id,)
+    ).fetchone()
+    title = (node_row["title"] if node_row else resource_id) or resource_id
+
+    sid = _short_id(resource_id)
+
+    # Check if aspect_provenance table exists.
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "aspect_provenance" not in tables:
+        console.print(f"[yellow]{sid} — {title!r}[/yellow]")
+        console.print("[dim]No aspect provenance data yet (migration pending).[/dim]")
+        return
+
+    # Query provenance rows for this resource.
+    rows = conn.execute(
+        """
+        SELECT ap.aspect_id, av.label,
+               ap.action, ap.source, ap.confidence, ap.rationale, ap.recorded_at
+        FROM aspect_provenance ap
+        JOIN aspect_vocab av ON av.id = ap.aspect_id
+        WHERE ap.resource_id = ?
+          AND (ap.project_id IS ? OR ap.project_id IS NULL)
+        ORDER BY ap.recorded_at ASC
+        """,
+        (resource_id, project_id),
+    ).fetchall()
+
+    if not rows:
+        console.print(f"[bold]{sid} — {title!r}[/bold]")
+        console.print("[dim]No provenance entries for this resource.[/dim]")
+        return
+
+    # Group rows by aspect_id.
+    from collections import defaultdict
+
+    by_aspect: dict[str, list] = defaultdict(list)
+    aspect_labels: dict[str, str] = {}
+    for row in rows:
+        aid = row["aspect_id"]
+        aspect_labels[aid] = row["label"]
+        by_aspect[aid].append(row)
+
+    # Sort aspects by latest recorded_at desc.
+    sorted_aspects = sorted(
+        by_aspect.items(),
+        key=lambda kv: max(r["recorded_at"] for r in kv[1]),
+        reverse=True,
+    )
+
+    # Source color mapping.
+    source_colors = {
+        "user": "cyan",
+        "folder": "green",
+        "llm": "magenta",
+        "infer_interpretation": "magenta",
+        "inferred": "dim",
+        "seed": "bright_black",
+        "usage": "yellow",
+        "conversation": "blue",
+    }
+
+    tree = Tree(f"[bold]{sid} — {title!r}[/bold]")
+
+    for aid, aspect_rows in sorted_aspects:
+        label = aspect_labels[aid]
+
+        # Latest row determines the "current" source + confidence.
+        latest = aspect_rows[-1]
+        src = latest["source"]
+        conf = latest["confidence"]
+        conf_str = f"{conf:.2f}" if conf is not None else "—"
+        color = source_colors.get(src, "white")
+        lock_icon = " [cyan]🔒[/cyan]" if src == "user" else " [magenta]✨[/magenta]" if src in ("llm", "inferred", "infer_interpretation") else ""
+
+        branch = tree.add(
+            f"[{color}]{label}[/{color}]  "
+            f"(source: {src}, conf: {conf_str}){lock_icon}"
+        )
+
+        for entry in aspect_rows:
+            action = entry["action"]
+            entry_src = entry["source"]
+            entry_color = source_colors.get(entry_src, "white")
+            date_str = (entry["recorded_at"] or "")[:10]
+            rationale = entry["rationale"]
+            rationale_str = f" · [dim]{rationale[:60]}[/dim]" if rationale else ""
+            branch.add(
+                f"[dim]{action}[/dim] · "
+                f"[{entry_color}]{entry_src}[/{entry_color}] · "
+                f"[dim]{date_str}[/dim]{rationale_str}"
+            )
+
+    console.print(tree)
+
+
+# ---------------------------------------------------------------------------
+# aspects graph — render aspect-to-aspect relationship tree
+# ---------------------------------------------------------------------------
+
+
+@aspect_app.command(name="graph")
+def aspect_graph(
+    root: str | None = None,
+    depth: int = 2,
+    project: str | None = None,
+) -> None:
+    """Render the aspect graph (aspect_edges) as a rich tree.
+
+    Use --root <label> to start from a specific aspect, or leave blank
+    to use the top-5 most-used aspects for the project.
+    """
+    from rich.tree import Tree
+
+    from loci.db import init_schema
+    from loci.db.connection import connect
+    from loci.graph.aspects import AspectRepository
+
+    init_schema()
+    conn = connect()
+    project_id = _resolve_project_id_auto(conn, project) if project else None
+
+    # Check if aspect_edges exists.
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "aspect_edges" not in tables:
+        console.print("[yellow]No aspect graph data yet.[/yellow]")
+        console.print("[dim]Aspect edges are computed after aspects are classified.[/dim]")
+        return
+
+    aspect_repo = AspectRepository(conn)
+
+    # Helper: resource count for an aspect in this project.
+    def _resource_count(label: str) -> int:
+        if project_id is None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM resource_aspects ra "
+                "JOIN aspect_vocab av ON av.id = ra.aspect_id WHERE av.label = ?",
+                (label,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM project_resource_aspects pra
+                JOIN aspect_vocab av ON av.id = pra.aspect_id
+                WHERE av.label = ? AND pra.project_id = ?
+                """,
+                (label, project_id),
+            ).fetchone()
+        return row["c"] if row else 0
+
+    # Determine root aspects.
+    if root:
+        root_labels = [root]
+    else:
+        if project_id:
+            top = aspect_repo.top_aspects(project_id, limit=5)
+        else:
+            rows = conn.execute(
+                "SELECT av.label, COUNT(ra.resource_id) AS cnt "
+                "FROM resource_aspects ra JOIN aspect_vocab av ON av.id = ra.aspect_id "
+                "GROUP BY av.label ORDER BY cnt DESC LIMIT 5"
+            ).fetchall()
+            top = [(r["label"], r["cnt"]) for r in rows]
+        root_labels = [label for label, _ in top]
+
+    if not root_labels:
+        console.print("[dim]No aspects found.[/dim]")
+        return
+
+    # Helper: fetch outgoing edges for an aspect label.
+    def _edges(label: str) -> list[dict]:
+        av = aspect_repo.get_by_label(label, project_id=project_id) or aspect_repo.get_by_label(label)
+        if av is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT av2.label AS dst_label, ae.edge_type, ae.weight
+            FROM aspect_edges ae
+            JOIN aspect_vocab av2 ON av2.id = ae.dst_aspect_id
+            WHERE ae.src_aspect_id = ?
+              AND (ae.project_id IS ? OR ae.project_id IS NULL)
+            ORDER BY ae.weight DESC
+            LIMIT 10
+            """,
+            (av.id, project_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _build_tree(branch, label: str, current_depth: int, visited: set) -> None:
+        if current_depth <= 0 or label in visited:
+            return
+        visited.add(label)
+        for edge in _edges(label):
+            dst = edge["dst_label"]
+            etype = edge["edge_type"]
+            weight = edge["weight"]
+            cnt = _resource_count(dst)
+            child = branch.add(
+                f"[cyan]{etype}[/cyan] → [bold]{dst}[/bold]  "
+                f"([dim]{cnt} res, w={weight:.2f}[/dim])"
+            )
+            _build_tree(child, dst, current_depth - 1, visited)
+
+    tree = Tree("[bold]Aspect Graph[/bold]")
+    for label in root_labels:
+        cnt = _resource_count(label)
+        branch = tree.add(f"[bold]{label}[/bold]  ([dim]{cnt} resources[/dim])")
+        _build_tree(branch, label, depth, {label})
+
+    console.print(tree)
+
+
+# ---------------------------------------------------------------------------
+# aspect structure — batch-upgrade flat labels to CNL propositions
+# ---------------------------------------------------------------------------
+
+
+@aspect_app.command(name="structure")
+def aspect_structure(
+    project: str,
+    limit: int = 20,
+    yes: bool = False,
+) -> None:
+    """Re-interpret flat aspect labels as typed CNL propositions (costs LLM tokens).
+
+    Finds resources in the project whose aspects have no structured kind/role/target
+    columns and re-triggers `infer_interpretation` with force=True so the LLM
+    re-emits propositions in CNL format. Run `loci worker` to process queued jobs.
+
+    Use --limit to cap how many resources are scheduled (default 20).
+    """
+    from loci.db import init_schema
+    from loci.db.connection import connect
+    from loci.jobs.queue import enqueue
+
+    init_schema()
+    conn = connect()
+    proj = _resolve_project(conn, project)
+    project_id = proj.id
+
+    # Find resources with at least one flat aspect (kind IS NULL) in this project.
+    rows = conn.execute(
+        """
+        SELECT DISTINCT pra.resource_id, n.title
+        FROM project_resource_aspects pra
+        JOIN aspect_vocab av ON av.id = pra.aspect_id
+        JOIN raw_nodes n ON n.id = pra.resource_id
+        WHERE pra.project_id = ?
+          AND av.kind IS NULL
+        ORDER BY pra.updated_at DESC
+        LIMIT ?
+        """,
+        (project_id, limit),
+    ).fetchall()
+
+    if not rows:
+        console.print("[green]All aspects in this project are already structured.[/green]")
+        return
+
+    console.print(
+        f"[yellow]Will re-interpret {len(rows)} resource(s) via LLM (costs tokens):[/yellow]"
+    )
+    for row in rows[:5]:
+        title_str = (row["title"] or row["resource_id"])[:60]
+        console.print(f"  • {title_str}")
+    if len(rows) > 5:
+        console.print(f"  … and {len(rows) - 5} more")
+
+    if not yes:
+        ans = input("Proceed? [y/N] ").strip().lower()
+        if ans != "y":
+            console.print("[yellow]aborted[/yellow]")
+            return
+
+    from loci.graph.models import now_iso
+
+    ts = now_iso()
+    count = 0
+    for row in rows:
+        rid = row["resource_id"]
+        fingerprint = f"structure:{project_id}:{rid}:{ts}"[:64]
+        enqueue(
+            conn,
+            kind="infer_interpretation",
+            project_id=project_id,
+            payload={"resource_id": rid, "project_id": project_id, "trigger": "structure", "force": True},
+            fingerprint=fingerprint,
+        )
+        count += 1
+    conn.commit()
+    console.print(
+        f"[green]Enqueued {count} infer_interpretation job(s) with force=True.[/green]"
+    )
+    console.print("[dim]Run `loci worker` to process them.[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +1641,148 @@ def export(
     out_path = views_dir / "resources.json"
     out_path.write_text(_json.dumps(payload, ensure_ascii=False, indent=2))
     console.print(f"[green]wrote[/green] {out_path}  ({len(resources)} resources)")
+
+
+# ---------------------------------------------------------------------------
+# event — ingest external signals (Claude Code conversation hooks, etc.)
+# ---------------------------------------------------------------------------
+
+
+def _maybe_trigger_inference(conn, project_id: str, text: str, settings) -> None:
+    """Enqueue infer_interpretation for resources whose aspects appear in text."""
+    try:
+        from rapidfuzz import fuzz
+        from rapidfuzz import process as rfprocess
+    except ImportError:
+        return
+
+    from datetime import UTC, datetime
+
+    from loci.graph.aspects import AspectRepository
+    from loci.jobs.queue import enqueue
+
+    aspect_repo = AspectRepository(conn)
+    top = aspect_repo.top_aspects(project_id, limit=20)
+    if not top:
+        return
+
+    labels = [label for label, _ in top]
+    hits = rfprocess.extract(
+        text[:500],
+        labels,
+        scorer=fuzz.partial_ratio,
+        limit=5,
+        score_cutoff=settings.conversation_relevance_cutoff,
+    )
+    if not hits:
+        return
+
+    matched_labels = [label for label, _score, _idx in hits]
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    for label in matched_labels[:3]:
+        rids = aspect_repo.resources_for_aspect(label, project_id=project_id, limit=5)
+        for rid in rids:
+            fingerprint = f"infer_interpretation:{project_id}:{rid}:{today}"[:64]
+            enqueue(
+                conn,
+                kind="infer_interpretation",
+                project_id=project_id,
+                payload={
+                    "resource_id": rid,
+                    "project_id": project_id,
+                    "trigger": "conversation",
+                },
+                fingerprint=fingerprint,
+            )
+
+
+@event_app.command(name="conversation")
+def event_conversation(
+    role: str = "user",
+    project: str | None = None,
+    cwd: str | None = None,
+) -> None:
+    """Ingest a Claude Code conversation event from stdin (JSON hook payload).
+
+    Reads JSON from stdin. Claude Code hook payload format:
+      {"prompt": "...", "cwd": "/path/to/repo"}  (UserPromptSubmit)
+      {"response": "...", "cwd": "/path/to/repo"}  (Stop hook)
+
+    Exits silently if capture_conversation is disabled or no project resolved.
+    """
+    import json
+    import re
+    import sys
+
+    settings = get_settings()
+
+    if not settings.capture_conversation:
+        return  # opt-in required
+
+    try:
+        payload = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    text = payload.get("prompt") or payload.get("response") or ""
+    if not text:
+        return
+
+    # Redact and truncate
+    text = re.sub(settings.conversation_redact_paths, "[REDACTED]", text)
+    text = text[: settings.conversation_max_chars]
+
+    effective_cwd = cwd or payload.get("cwd")
+
+    try:
+        from pathlib import Path as _Path
+
+        from loci.db import init_schema
+        from loci.db.connection import connect
+        from loci.graph.models import new_id, now_iso
+        from loci.mcp.resolve import ProjectNotFound, resolve_project_id
+
+        init_schema()
+        conn = connect()
+
+        cwd_path = _Path(effective_cwd) if effective_cwd else None
+        try:
+            project_id = resolve_project_id(conn, project, cwd=cwd_path)
+        except ProjectNotFound:
+            return  # no project → nothing to do
+
+    except Exception:  # noqa: BLE001
+        return
+
+    if not project_id:
+        return
+
+    # Derive a session hash from pid + cwd (stable per Claude Code session)
+    import hashlib
+    import os
+
+    session_hash = hashlib.sha256(
+        f"{os.getpid()}:{effective_cwd or ''}".encode()
+    ).hexdigest()[:16]
+
+    try:
+        event_id = new_id()
+        conn.execute(
+            "INSERT INTO conversation_events(id, project_id, session_hash, role, text, cwd, received_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, project_id, session_hash, role, text, effective_cwd, now_iso()),
+        )
+
+        # Lightweight relevance check: fuzzy-match text against project top aspects
+        _maybe_trigger_inference(conn, project_id, text, settings)
+    except Exception:  # noqa: BLE001
+        pass  # never surface errors from a hook
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def main() -> None:  # script entrypoint (pyproject `loci = "loci.cli:main"`)

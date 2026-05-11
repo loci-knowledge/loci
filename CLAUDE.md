@@ -1,11 +1,12 @@
 # loci — Claude Code integration
 
-loci is a personal memory server. When running, it exposes an HTTP API on
-`127.0.0.1:7077` and an MCP server over stdio. Saved sources are tagged with
-aspects (folder-inferred + LLM-inferred + user-edited) and connected by
-typed edges (citations, wikilinks, co-aspect). Retrieval expands the query
-through that concept graph and returns ranked chunks with "why surfaced"
-reasons.
+loci is a personal memory server that generates **project-scoped interpretations**
+of your saved resources. Each resource is tagged globally with aspects, then
+re-interpreted in the context of each project: what does this document mean *here*,
+for your specific research goals?
+
+All of this happens automatically in the background from MCP usage — no explicit
+classification commands needed.
 
 ## Quick start
 
@@ -74,18 +75,18 @@ loci current clear
 ```
 
 You can also pass `project=` explicitly in each tool call, or set
-`LOCI_PROJECT` directly in the environment.
+`LOCI_PROJECT` in the environment.
 
 ## MCP tools (6)
 
-| tool             | what it does                                                                   |
-|------------------|--------------------------------------------------------------------------------|
-| `loci_save`      | ingest a URL / file / text, propose folder + aspects via elicitation, persist  |
-| `loci_recall`    | concept-expand the query, run BM25 + ANN over chunks, graph-rerank, return reasons |
-| `loci_aspects`   | list or edit aspects on a resource (elicitation form for edits)                |
-| `loci_browse`    | list resources with their folder + top aspects, filter by folder/aspect/query  |
-| `loci_context`   | project profile + resource count + top aspects for the current session         |
-| `loci_research`  | paper-search sub-agent (stub; v1.1)                                            |
+| tool | what it does |
+|---|---|
+| `loci_save` | ingest a URL / file / text, propose folder + aspects via elicitation, persist |
+| `loci_recall` | concept-expand the query, BM25 + ANN + graph-rerank, return project-aware reasons |
+| `loci_aspects` | list or edit aspects on a resource; user edits are gold (never overwritten) |
+| `loci_browse` | list resources filtered by folder / aspect / keyword |
+| `loci_context` | project profile + resource count + top aspects for the current session |
+| `loci_research` | paper-search sub-agent (stub; v1.1) |
 
 ## MCP resources (@-mentionable)
 
@@ -93,6 +94,25 @@ You can also pass `project=` explicitly in each tool call, or set
 @loci:source://{resource_id}     full body of a single resource
 @loci:folder://{folder_path}     list of resources in that folder
 @loci:aspect://{label}           list of resources tagged with that aspect
+```
+
+## What fires automatically after every MCP call
+
+All MCP tools call `record_event()` which:
+1. Writes a `resource_usage_log` row (project_id, session_hash, query, tool).
+2. Enqueues `infer_interpretation` with a daily-bucket fingerprint
+   `infer_interpretation:{project_id}:{resource_id}:{YYYY-MM-DD}`.
+
+This means: recall something 10 times in a day → exactly one LLM call overnight.
+
+The interpretation pipeline:
+```
+classify_aspects  (after ingest)       global tags → "literate programming", "WEB system"
+    ↓ cascades to
+infer_interpretation (per project, daily)
+    → project_resource_aspects         "Historical foundation for CoDoc"
+    → project_interpretations          stance + 2-sentence project-aware summary
+    → concept_edges                    typed relations: supports, instantiates, …
 ```
 
 ## CLI commands
@@ -110,12 +130,12 @@ loci current set/clear/show <slug>            # pin for MCP sessions
 
 loci workspace create / list / add-source / scan / link / unlink
 loci scan <project>                           # scan all linked workspaces
-loci use [workspace_slugs...] [--project p]   # set active context (rich table)
 
 loci save <url_or_path> [--folder F] [--aspects a,b]
 loci recall "query" [--aspects a,b] [--folder F] [-n 10]
 loci aspects [resource_id] [--add a --remove b --list-vocab]
 
+loci event conversation --role user           # pipe Claude Code hook payload via stdin
 loci status [project]
 loci export [project]
 loci reset                                    # wipe everything
@@ -148,43 +168,50 @@ Per-repo binding (git-trackable):
 
 ## Architecture in brief
 
-Single layer: raw sources, embedded at chunk granularity, joined to a concept
-graph of aspects + typed edges.
+Two aspect layers on top of raw sources + embeddings:
 
 ```
-nodes / raw_nodes / raw_chunks       chunks_fts + chunk_vec   (lex + ANN)
-aspect_vocab / resource_aspects      concept_edges            (concept graph)
-projects / project_workspaces        workspace_membership     (scoping)
-jobs                                                          (background work)
+nodes / raw_nodes / raw_chunks       chunks_fts + chunk_vec       (lex + ANN)
+resource_aspects                     global tags, seeded at ingest
+project_resource_aspects             per-project, LLM-interpreted, gold-protected
+project_interpretations              stance + summary per (project, resource)
+concept_edges                        citations, co-aspect, supports, contradicts…
+projects / project_workspaces        workspace_membership         (scoping)
+jobs                                 background queue
+conversation_events                  Claude Code hook signals      (optional)
 ```
 
 Retrieval:
-
 ```
 query
-  → expand_query_aspects (rapidfuzz over aspect_vocab + concept_edges neighbors)
-  → HyDE
-  → BM25 over chunks_fts  +  ANN over chunk_vec
-  → RRF fusion
-  → graph rerank (boost chunks whose resource neighbors top hits via co_aspect / cites)
-  → group + materialise + build "why surfaced" reason per resource
+  → expand_query_aspects (fuzzy+embedding over vocab + concept_edges neighbors, project-scoped)
+  → HyDE (grounded by project.profile_md + expanded aspects)
+  → BM25 over chunks_fts  +  ANN over chunk_vec  +  aspect-overlap soft channel (3-way RRF)
+  → RRF fusion (k=60, aspect channel weight=0.5)
+  → graph rerank (signed-sum, edge-weight-aware: supports+0.30, contradicts-0.15, …)
+  → aspect-density resource bonus (α=0.2)
+  → group + materialise
+  → build_why_surfaced: uses merged_aspects; prepends project interpretation summary when available
 ```
 
 Source layout:
-
 ```
 src/loci/
   ui/cli.py            CLI (entry: loci.ui.cli:main) + ui/tui.py wizard
   api/                 FastAPI app + routes (projects, workspaces, sources, aspects, jobs)
-  mcp/                 MCP server + project resolution
-  graph/               sources, aspects, concept_edges, projects, workspaces
+  mcp/                 MCP server, project resolution, session.py, events.py
+  graph/               sources, aspects, concept_edges, interpretations, projects, workspaces
   retrieve/            lex + vec + hyde + concept_expand + pipeline
-  capture/             ingest, folder_suggest, aspect_suggest, link_parser
+  capture/             ingest, folder_suggest, aspect_suggest (+ classify_project_interpretation_llm)
   ingest/              walk → hash → extract → chunk → embed
   jobs/                queue + worker + handlers
+    classify_aspects.py         global tagging → cascades to infer_interpretation
+    infer_interpretation.py     per-project LLM interpretation (daily-bucketed)
+    refresh_project_edges.py    cheap co-aspect edge recompute after user aspect edits
+    sweep_interpretations.py    periodic stale-row enqueuer (14-day threshold)
   embed/               sentence-transformers wrapper
   llm/                 pydantic-ai wrapper
-  db/                  schema.sql + connection.py
+  db/                  schema.sql + migrations.py
   config.py            Settings + ~/.loci/ paths
 ```
 

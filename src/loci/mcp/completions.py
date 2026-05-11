@@ -10,9 +10,12 @@ Supported templates:
 
 from __future__ import annotations
 
+import random
 import sqlite3
 
 from mcp.types import Completion, CompletionArgument, ResourceTemplateReference
+
+from loci.config import get_settings
 
 
 async def handle_completion(
@@ -51,6 +54,21 @@ async def handle_completion(
             (f"{partial}%",),
         ).fetchall()
         values = [r["label"] for r in rows]
+
+        # 1-in-10 sampling for autocomplete signal capture (opt-in only).
+        settings = get_settings()
+        if settings.capture_autocomplete and random.random() < 0.1:  # noqa: S311
+            from loci.mcp.events import record_event
+            await record_event(
+                conn=conn,
+                tool="autocomplete_aspect",
+                project_id=None,
+                resource_id=None,
+                query=argument.value or None,
+                session_hash=None,
+                enqueue_inference=False,
+            )
+
         return Completion(values=values, hasMore=False, total=len(values))
 
     return None

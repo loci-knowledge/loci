@@ -81,6 +81,25 @@ class Settings(BaseSettings):
     # prompts. Free latency + cost win on Anthropic; ignored by other providers.
     anthropic_cache_instructions: bool = True
 
+    # --- Project-scoped interpretation layer ----------------------------
+    # Whether to capture Claude Code conversation text as inference signal.
+    # Off by default; user must opt-in via `loci event conversation` hook.
+    capture_conversation: bool = False
+
+    # Whether to sample accepted MCP autocomplete events as weak signals.
+    capture_autocomplete: bool = False
+
+    # Regex pattern applied to conversation text before storing it.
+    # Matches are replaced with [REDACTED]. Example: file paths.
+    conversation_redact_paths: str = r"/(?:[a-zA-Z0-9_.\-]+/)+"
+
+    # Maximum characters of conversation text to store per event.
+    conversation_max_chars: int = 4000
+
+    # Minimum rapidfuzz score for a conversation keyword to match a project
+    # aspect or resource title (triggers an infer_interpretation job).
+    conversation_relevance_cutoff: float = 65.0
+
     # --- Server ---------------------------------------------------------
     host: str = "127.0.0.1"
     port: int = 7077  # arbitrary high port; chosen because "loci" → mnemonic

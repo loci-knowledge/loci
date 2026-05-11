@@ -47,23 +47,23 @@ class ConceptEdgeRepository:
         relation_hint: str | None = None,
         weight: float = 1.0,
         metadata: dict | None = None,
+        project_id: str | None = None,
     ) -> ConceptEdge:
         """Add a typed edge between two resources.
 
-        Idempotent on (src_id, dst_id, edge_type): if the triple already
-        exists, weight and metadata are updated in place and the existing
-        row is returned.
+        Idempotent on (src_id, dst_id, edge_type, COALESCE(project_id, '')): if
+        the tuple already exists, weight and metadata are updated in place.
         """
         ts = now_iso()
         metadata_json = json.dumps(metadata) if metadata is not None else None
 
-        # Check for existing edge on (src, dst, type)
+        # Check for existing edge on (src, dst, type, project_id)
         existing = self.conn.execute(
             """
             SELECT * FROM concept_edges
-            WHERE src_id = ? AND dst_id = ? AND edge_type = ?
+            WHERE src_id = ? AND dst_id = ? AND edge_type = ? AND project_id IS ?
             """,
-            (src_id, dst_id, edge_type),
+            (src_id, dst_id, edge_type, project_id),
         ).fetchone()
 
         if existing is not None:
@@ -71,9 +71,9 @@ class ConceptEdgeRepository:
                 """
                 UPDATE concept_edges
                 SET weight = ?, relation_hint = ?, metadata = ?
-                WHERE src_id = ? AND dst_id = ? AND edge_type = ?
+                WHERE src_id = ? AND dst_id = ? AND edge_type = ? AND project_id IS ?
                 """,
-                (weight, relation_hint, metadata_json, src_id, dst_id, edge_type),
+                (weight, relation_hint, metadata_json, src_id, dst_id, edge_type, project_id),
             )
             return ConceptEdge(
                 id=existing["id"],
@@ -84,16 +84,17 @@ class ConceptEdgeRepository:
                 weight=weight,
                 metadata=metadata,
                 created_at=existing["created_at"],
+                project_id=project_id,
             )
 
         edge_id = new_id()
         self.conn.execute(
             """
             INSERT INTO concept_edges(id, src_id, dst_id, edge_type,
-                                      relation_hint, weight, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                      relation_hint, weight, metadata, created_at, project_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (edge_id, src_id, dst_id, edge_type, relation_hint, weight, metadata_json, ts),
+            (edge_id, src_id, dst_id, edge_type, relation_hint, weight, metadata_json, ts, project_id),
         )
         return ConceptEdge(
             id=edge_id,
@@ -104,6 +105,7 @@ class ConceptEdgeRepository:
             weight=weight,
             metadata=metadata,
             created_at=ts,
+            project_id=project_id,
         )
 
     def delete_edge(self, edge_id: str) -> bool:
@@ -113,12 +115,24 @@ class ConceptEdgeRepository:
         )
         return cursor.rowcount > 0
 
-    def delete_edges_for(self, resource_id: str) -> None:
-        """Delete all edges where src_id or dst_id equals resource_id."""
-        self.conn.execute(
-            "DELETE FROM concept_edges WHERE src_id = ? OR dst_id = ?",
-            (resource_id, resource_id),
-        )
+    def delete_edges_for(self, resource_id: str, project_id: str | None = None) -> None:
+        """Delete all edges where src_id or dst_id equals resource_id.
+
+        When `project_id` is given, only project-scoped edges are deleted.
+        """
+        if project_id is not None:
+            self.conn.execute(
+                """
+                DELETE FROM concept_edges
+                WHERE (src_id = ? OR dst_id = ?) AND project_id IS ?
+                """,
+                (resource_id, resource_id, project_id),
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM concept_edges WHERE src_id = ? OR dst_id = ?",
+                (resource_id, resource_id),
+            )
 
     # -----------------------------------------------------------------------
     # Reads
@@ -135,26 +149,33 @@ class ConceptEdgeRepository:
         self,
         src_id: str,
         edge_types: list[str] | None = None,
+        project_id: str | None = None,
     ) -> list[ConceptEdge]:
-        """All edges from a resource, optionally filtered by edge_type."""
+        """All edges from a resource, optionally filtered by edge_type and project.
+
+        When `project_id` is given, returns edges where project_id matches OR is NULL.
+        """
+        project_filter = "AND (project_id = ? OR project_id IS NULL)" if project_id is not None else ""
+        project_params = (project_id,) if project_id is not None else ()
+
         if edge_types:
             placeholders = ",".join("?" * len(edge_types))
             rows = self.conn.execute(
                 f"""
                 SELECT * FROM concept_edges
-                WHERE src_id = ? AND edge_type IN ({placeholders})
+                WHERE src_id = ? AND edge_type IN ({placeholders}) {project_filter}
                 ORDER BY weight DESC, created_at
                 """,
-                (src_id, *edge_types),
+                (src_id, *edge_types, *project_params),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT * FROM concept_edges
-                WHERE src_id = ?
+                WHERE src_id = ? {project_filter}
                 ORDER BY weight DESC, created_at
                 """,
-                (src_id,),
+                (src_id, *project_params),
             ).fetchall()
         return [self._row_to_edge(r) for r in rows]
 
@@ -162,26 +183,33 @@ class ConceptEdgeRepository:
         self,
         dst_id: str,
         edge_types: list[str] | None = None,
+        project_id: str | None = None,
     ) -> list[ConceptEdge]:
-        """All edges pointing to a resource, optionally filtered by edge_type."""
+        """All edges pointing to a resource, optionally filtered by edge_type and project.
+
+        When `project_id` is given, returns edges where project_id matches OR is NULL.
+        """
+        project_filter = "AND (project_id = ? OR project_id IS NULL)" if project_id is not None else ""
+        project_params = (project_id,) if project_id is not None else ()
+
         if edge_types:
             placeholders = ",".join("?" * len(edge_types))
             rows = self.conn.execute(
                 f"""
                 SELECT * FROM concept_edges
-                WHERE dst_id = ? AND edge_type IN ({placeholders})
+                WHERE dst_id = ? AND edge_type IN ({placeholders}) {project_filter}
                 ORDER BY weight DESC, created_at
                 """,
-                (dst_id, *edge_types),
+                (dst_id, *edge_types, *project_params),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT * FROM concept_edges
-                WHERE dst_id = ?
+                WHERE dst_id = ? {project_filter}
                 ORDER BY weight DESC, created_at
                 """,
-                (dst_id,),
+                (dst_id, *project_params),
             ).fetchall()
         return [self._row_to_edge(r) for r in rows]
 
@@ -190,6 +218,7 @@ class ConceptEdgeRepository:
         resource_id: str,
         edge_types: list[str] | None = None,
         depth: int = 1,
+        project_id: str | None = None,
     ) -> list[str]:
         """Resource IDs reachable from `resource_id` within `depth` hops.
 
@@ -208,12 +237,12 @@ class ConceptEdgeRepository:
             next_frontier: set[str] = set()
             for node_id in frontier:
                 # Outgoing
-                for edge in self.edges_from(node_id, edge_types):
+                for edge in self.edges_from(node_id, edge_types, project_id=project_id):
                     if edge.dst_id not in visited:
                         next_frontier.add(edge.dst_id)
                         visited.add(edge.dst_id)
                 # Incoming
-                for edge in self.edges_to(node_id, edge_types):
+                for edge in self.edges_to(node_id, edge_types, project_id=project_id):
                     if edge.src_id not in visited:
                         next_frontier.add(edge.src_id)
                         visited.add(edge.src_id)
@@ -252,4 +281,5 @@ class ConceptEdgeRepository:
             weight=d.get("weight", 1.0),
             metadata=metadata,
             created_at=d["created_at"],
+            project_id=d.get("project_id"),
         )

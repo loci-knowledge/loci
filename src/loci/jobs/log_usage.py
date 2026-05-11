@@ -52,47 +52,66 @@ async def handle_log_usage(job: dict, conn: sqlite3.Connection, settings) -> dic
     ts = now_iso()
     conn.execute(
         """
-        INSERT INTO resource_usage_log(id, resource_id, session_hash,
-                                       tool_call_type, context_note, used_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO resource_usage_log(id, resource_id, project_id, session_hash,
+                                       tool_call_type, query, context_note, used_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (usage_id, resource_id, session_hash, tool_call_type, context_note, ts),
+        (
+            usage_id,
+            resource_id,
+            project_id,
+            session_hash,
+            tool_call_type,
+            payload.get("query"),
+            context_note,
+            ts,
+        ),
     )
 
-    # 2. Count total usage events for this resource.
-    count_row = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM resource_usage_log WHERE resource_id = ?",
-        (resource_id,),
-    ).fetchone()
+    # 2. Count total usage events for this (project, resource) — or globally if
+    #    no project_id is available (backward compat).
+    if project_id:
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM resource_usage_log WHERE resource_id = ? AND project_id = ?",
+            (resource_id, project_id),
+        ).fetchone()
+    else:
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM resource_usage_log WHERE resource_id = ?",
+            (resource_id,),
+        ).fetchone()
     usage_count = count_row["cnt"] if count_row else 0
 
-    # 3. Queue a classify_aspects refinement if we hit the threshold.
-    classify_queued = False
+    # 3. Queue an infer_interpretation refinement if we hit the threshold.
+    infer_queued = False
     if usage_count >= _CLASSIFY_THRESHOLD and project_id is not None:
-        # Use a fingerprint to avoid stacking up multiple classify jobs for the
+        # Use a fingerprint to avoid stacking up multiple inference jobs for the
         # same resource when usage bursts past the threshold repeatedly.
         import hashlib
+
         fingerprint = hashlib.sha256(
-            f"classify_aspects:{resource_id}:{usage_count // _CLASSIFY_THRESHOLD}".encode()
+            f"infer_interpretation:{resource_id}:{usage_count // _CLASSIFY_THRESHOLD}".encode()
         ).hexdigest()[:32]
 
         from loci.jobs.queue import enqueue
+
         enqueue(
             conn,
-            kind="classify_aspects",
+            kind="infer_interpretation",
             project_id=project_id,
-            payload={"resource_id": resource_id, "project_id": project_id},
+            payload={"resource_id": resource_id, "project_id": project_id, "trigger": "usage"},
             fingerprint=fingerprint,
         )
-        classify_queued = True
+        infer_queued = True
         log.info(
-            "log_usage: usage_count=%d for resource=%s; queued classify_aspects",
-            usage_count, resource_id,
+            "log_usage: usage_count=%d for resource=%s; queued infer_interpretation",
+            usage_count,
+            resource_id,
         )
 
     return {
         "usage_id": usage_id,
         "resource_id": resource_id,
         "usage_count": usage_count,
-        "classify_aspects_queued": classify_queued,
+        "infer_interpretation_queued": infer_queued,
     }

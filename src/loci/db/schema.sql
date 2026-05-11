@@ -251,9 +251,9 @@ WHERE  pm.role = 'pinned';
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL CHECK (kind IN (
-        'classify_aspects','parse_links','log_usage','embed_missing'
-    )),
+    -- kind is validated in Python (jobs/__init__.py); no SQL CHECK so new
+    -- kinds don't require a schema migration.
+    kind        TEXT NOT NULL,
     project_id  TEXT REFERENCES projects(id) ON DELETE CASCADE,
     payload     TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
     status      TEXT NOT NULL DEFAULT 'queued' CHECK (status IN (
@@ -278,22 +278,132 @@ CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint    ON jobs(fingerprint) WHERE fi
 -- ---------------------------------------------------------------------------
 -- aspect_vocab (controlled vocabulary; auto-grows)
 -- ---------------------------------------------------------------------------
+-- project_id = NULL means a global concept shared across all projects.
+-- project_id = <id> means a label local to that project only.
+-- Uniqueness is enforced on (label, COALESCE(project_id, '')) so the same
+-- word can exist as both a global label and a project-local refinement.
 CREATE TABLE IF NOT EXISTS aspect_vocab (
     id                       TEXT PRIMARY KEY,
-    label                    TEXT NOT NULL UNIQUE,
+    label                    TEXT NOT NULL,
+    project_id               TEXT,
     description              TEXT,
     -- Optional ConceptNet relation hint (IsA, UsedFor, PartOf, RelatedTo, …).
     conceptnet_relation_hint TEXT,
     user_defined             INTEGER NOT NULL DEFAULT 1,
     auto_inferred            INTEGER NOT NULL DEFAULT 0,
     last_used                TEXT,
-    created_at               TEXT NOT NULL
+    created_at               TEXT NOT NULL,
+    -- DSL proposition fields (v2.2) — all nullable for backward compat.
+    -- `topic` is the head slug; for flat labels topic = label.
+    -- `kind` is from the controlled+extensible set (methodology, technique, …).
+    -- `role` is from the CLOSED set (critiques, extends, …); drives aspect_edges.
+    -- `target_aspect_id` is the FK to the target vocab row when role is set.
+    -- `modifiers_json` holds arbitrary key=value pairs as JSON.
+    topic                    TEXT,
+    kind                     TEXT,
+    role                     TEXT,
+    target_aspect_id         TEXT REFERENCES aspect_vocab(id) ON DELETE SET NULL,
+    modifiers_json           TEXT CHECK (modifiers_json IS NULL OR json_valid(modifiers_json))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aspect_vocab_label_scope
+    ON aspect_vocab(label, COALESCE(project_id, ''));
+CREATE INDEX IF NOT EXISTS idx_av_topic   ON aspect_vocab(topic, COALESCE(project_id, ''));
+CREATE INDEX IF NOT EXISTS idx_av_kind    ON aspect_vocab(kind) WHERE kind IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_av_role    ON aspect_vocab(role) WHERE role IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_av_target  ON aspect_vocab(target_aspect_id) WHERE target_aspect_id IS NOT NULL;
+
+-- Extensible per-project kind vocabulary (v2.2)
+CREATE TABLE IF NOT EXISTS aspect_kinds (
+    kind        TEXT NOT NULL,
+    project_id  TEXT,           -- NULL = global controlled set
+    description TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aspect_kinds_scope
+    ON aspect_kinds(kind, COALESCE(project_id, ''));
+
+-- Effective-confidence view: adjusts pra.confidence by provenance actions + usage (v2.2)
+CREATE VIEW IF NOT EXISTS aspect_effective_confidence AS
+SELECT
+    pra.project_id,
+    pra.resource_id,
+    pra.aspect_id,
+    MIN(1.0, MAX(0.0,
+        pra.confidence
+        + 0.05 * COALESCE((
+            SELECT COUNT(*) FROM aspect_provenance p
+            WHERE p.project_id  = pra.project_id
+              AND p.resource_id = pra.resource_id
+              AND p.aspect_id   = pra.aspect_id
+              AND p.action      = 'confirmed'
+              AND p.source      = 'user'
+          ), 0)
+        - 0.10 * COALESCE((
+            SELECT COUNT(*) FROM aspect_provenance p
+            WHERE p.project_id  = pra.project_id
+              AND p.resource_id = pra.resource_id
+              AND p.aspect_id   = pra.aspect_id
+              AND p.action      = 'rejected'
+          ), 0)
+        + 0.05 * MIN(6, LOG(1.0 + COALESCE((
+            SELECT COUNT(*) FROM resource_usage_log u
+            WHERE u.project_id  = pra.project_id
+              AND u.resource_id = pra.resource_id
+              AND u.used_at    >= datetime('now', '-30 days')
+          ), 0)))
+    )) AS effective_confidence
+FROM project_resource_aspects pra;
+
+-- ---------------------------------------------------------------------------
+-- aspect_edges (typed directed edges between aspect vocab entries)
+-- ---------------------------------------------------------------------------
+-- edge_type values:
+--   parent_of    — broader concept hierarchy (e.g. deep-learning → parent_of → transformer)
+--   related_to   — soft semantic relation
+--   opposite_of  — antonyms / contrasting concepts
+--   alias_of     — synonyms / alternate spellings
+--   co_aspect_pmi — PMI-weighted co-occurrence within a project
+--   semantic_sim  — cosine similarity between label embeddings
+-- project_id = NULL → global edge; project_id = <id> → project-local edge
+CREATE TABLE IF NOT EXISTS aspect_edges (
+    id            TEXT PRIMARY KEY,
+    src_aspect_id TEXT NOT NULL REFERENCES aspect_vocab(id) ON DELETE CASCADE,
+    dst_aspect_id TEXT NOT NULL REFERENCES aspect_vocab(id) ON DELETE CASCADE,
+    project_id    TEXT,
+    edge_type     TEXT NOT NULL CHECK (edge_type IN (
+        'parent_of','related_to','opposite_of','alias_of',
+        'co_aspect_pmi','semantic_sim'
+    )),
+    weight        REAL NOT NULL DEFAULT 1.0,
+    computed_at   TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aspect_edges_triple
+    ON aspect_edges(src_aspect_id, dst_aspect_id, edge_type,
+                    COALESCE(project_id,''));
+CREATE INDEX IF NOT EXISTS idx_aspect_edges_src
+    ON aspect_edges(src_aspect_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_aspect_edges_project
+    ON aspect_edges(project_id);
+
+
+-- ---------------------------------------------------------------------------
+-- aspect_embeddings (pre-computed label vectors for cosine matching)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS aspect_embeddings (
+    aspect_id    TEXT PRIMARY KEY REFERENCES aspect_vocab(id) ON DELETE CASCADE,
+    embedding    BLOB NOT NULL,
+    model_id     TEXT NOT NULL,
+    computed_at  TEXT NOT NULL
 );
 
 
 -- ---------------------------------------------------------------------------
--- resource_aspects (M:N: raw resources ↔ aspects)
+-- resource_aspects (M:N: raw resources ↔ aspects)  [legacy global table]
 -- ---------------------------------------------------------------------------
+-- New code writes to project_resource_aspects instead. This table is kept
+-- as a backfill seed during the dual-write phase and will be retired.
 CREATE TABLE IF NOT EXISTS resource_aspects (
     resource_id TEXT NOT NULL REFERENCES raw_nodes(id) ON DELETE CASCADE,
     aspect_id   TEXT NOT NULL REFERENCES aspect_vocab(id) ON DELETE CASCADE,
@@ -309,10 +419,64 @@ CREATE INDEX IF NOT EXISTS idx_resource_aspects_source   ON resource_aspects(sou
 
 
 -- ---------------------------------------------------------------------------
+-- project_resource_aspects (per-project interpretation of a resource)
+-- ---------------------------------------------------------------------------
+-- Same resource can carry different aspects across different projects,
+-- reflecting how each project "reads" the same content.
+-- source values:
+--   user         — hand-labelled by the user (gold; never overwritten by LLM)
+--   folder       — inherited from workspace folder path
+--   inferred     — KeyBERT / heuristic ingest-time suggestion
+--   usage        — promoted by repeated retrieval access
+--   llm          — produced by the infer_interpretation background job
+--   conversation — inferred from Claude Code conversation hook events
+--   seed         — backfilled from legacy resource_aspects during migration
+CREATE TABLE IF NOT EXISTS project_resource_aspects (
+    project_id          TEXT NOT NULL,
+    resource_id         TEXT NOT NULL REFERENCES raw_nodes(id) ON DELETE CASCADE,
+    aspect_id           TEXT NOT NULL REFERENCES aspect_vocab(id) ON DELETE CASCADE,
+    confidence          REAL NOT NULL DEFAULT 1.0,
+    source              TEXT NOT NULL CHECK (source IN (
+        'user','folder','inferred','usage','llm','conversation','seed'
+    )),
+    weight_signals_json TEXT CHECK (weight_signals_json IS NULL OR json_valid(weight_signals_json)),
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (project_id, resource_id, aspect_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pra_project_aspect ON project_resource_aspects(project_id, aspect_id);
+CREATE INDEX IF NOT EXISTS idx_pra_resource        ON project_resource_aspects(resource_id);
+CREATE INDEX IF NOT EXISTS idx_pra_source          ON project_resource_aspects(source);
+
+
+-- ---------------------------------------------------------------------------
+-- project_interpretations (LLM narrative per project × resource)
+-- ---------------------------------------------------------------------------
+-- A short natural-language interpretation of a resource from a project's
+-- vantage point, generated by the infer_interpretation job.
+-- inputs_hash gates re-generation: skip if unchanged.
+CREATE TABLE IF NOT EXISTS project_interpretations (
+    project_id   TEXT NOT NULL,
+    resource_id  TEXT NOT NULL REFERENCES raw_nodes(id) ON DELETE CASCADE,
+    summary_md   TEXT NOT NULL,
+    stance       TEXT,   -- methodological|supporting|contradictory|reference|tangential
+    inputs_hash  TEXT NOT NULL,
+    model_id     TEXT,
+    generated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, resource_id)
+);
+
+
+-- ---------------------------------------------------------------------------
 -- concept_edges (typed directed edges between resources)
 -- ---------------------------------------------------------------------------
--- edge_type values: cites | wikilink | co_aspect | co_folder | custom
+-- Structural edge_type values: cites | wikilink | co_aspect | co_folder | custom
+-- Semantic (project-level) edge types: supports | contradicts | instantiates |
+--   depends_on | co_recalled | addresses_query
 -- relation_hint optionally borrows a ConceptNet label.
+-- project_id = NULL → global edge (fact about the document, e.g. citation).
+-- project_id = <id> → interpretation edge local to that project.
 CREATE TABLE IF NOT EXISTS concept_edges (
     id            TEXT PRIMARY KEY,
     src_id        TEXT NOT NULL REFERENCES raw_nodes(id) ON DELETE CASCADE,
@@ -320,13 +484,38 @@ CREATE TABLE IF NOT EXISTS concept_edges (
     edge_type     TEXT NOT NULL,
     relation_hint TEXT,
     weight        REAL NOT NULL DEFAULT 1.0,
-    metadata_json TEXT,
+    metadata      TEXT,
+    project_id    TEXT,
     created_at    TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_concept_edges_src  ON concept_edges(src_id);
-CREATE INDEX IF NOT EXISTS idx_concept_edges_dst  ON concept_edges(dst_id);
-CREATE INDEX IF NOT EXISTS idx_concept_edges_type ON concept_edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_concept_edges_src     ON concept_edges(src_id);
+CREATE INDEX IF NOT EXISTS idx_concept_edges_dst     ON concept_edges(dst_id);
+CREATE INDEX IF NOT EXISTS idx_concept_edges_type    ON concept_edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_concept_edges_project ON concept_edges(project_id);
+
+
+-- ---------------------------------------------------------------------------
+-- aspect_provenance (append-only log of aspect add/remove events)
+-- ---------------------------------------------------------------------------
+-- Tracks every aspect tag operation: who applied it, why, with what confidence.
+-- action values: added | removed | confirmed | rejected
+-- source mirrors resource_aspects.source plus 'user', 'llm', etc.
+CREATE TABLE IF NOT EXISTS aspect_provenance (
+    id           TEXT PRIMARY KEY,
+    project_id   TEXT,
+    resource_id  TEXT NOT NULL REFERENCES raw_nodes(id) ON DELETE CASCADE,
+    aspect_id    TEXT NOT NULL REFERENCES aspect_vocab(id) ON DELETE CASCADE,
+    action       TEXT NOT NULL CHECK (action IN ('added','removed','confirmed','rejected')),
+    source       TEXT NOT NULL,
+    confidence   REAL,
+    rationale    TEXT,
+    session_hash TEXT,
+    recorded_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ap_resource ON aspect_provenance(project_id, resource_id);
+CREATE INDEX IF NOT EXISTS idx_ap_aspect   ON aspect_provenance(project_id, aspect_id);
 
 
 -- ---------------------------------------------------------------------------
@@ -350,14 +539,36 @@ CREATE INDEX IF NOT EXISTS idx_provenance_folder ON resource_provenance(folder);
 CREATE TABLE IF NOT EXISTS resource_usage_log (
     id             TEXT PRIMARY KEY,
     resource_id    TEXT NOT NULL REFERENCES raw_nodes(id) ON DELETE CASCADE,
+    project_id     TEXT,
     session_hash   TEXT,
     tool_call_type TEXT,
+    query          TEXT,
     context_note   TEXT,
     used_at        TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_log_resource ON resource_usage_log(resource_id);
 CREATE INDEX IF NOT EXISTS idx_usage_log_session  ON resource_usage_log(session_hash);
+CREATE INDEX IF NOT EXISTS idx_usage_log_project  ON resource_usage_log(project_id, used_at);
+
+
+-- ---------------------------------------------------------------------------
+-- conversation_events (Claude Code hook signal source)
+-- ---------------------------------------------------------------------------
+-- Populated by `loci event conversation` CLI subcommand invoked via hooks.
+-- Feeds passive project-scoped inference without the user calling loci tools.
+CREATE TABLE IF NOT EXISTS conversation_events (
+    id           TEXT PRIMARY KEY,
+    project_id   TEXT,
+    session_hash TEXT,
+    role         TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    text         TEXT NOT NULL,
+    cwd          TEXT,
+    received_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conv_project_time ON conversation_events(project_id, received_at);
+CREATE INDEX IF NOT EXISTS idx_conv_session      ON conversation_events(session_hash);
 
 
 -- ---------------------------------------------------------------------------

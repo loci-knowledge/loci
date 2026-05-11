@@ -40,14 +40,24 @@ def _handlers() -> dict[str, HandlerFn]:
     """Resolve handlers lazily so importing the worker doesn't pull in the
     embedder (which imports torch) until a job that needs it is actually claimed."""
     from loci.jobs.classify_aspects import handle_classify_aspects
+    from loci.jobs.embed_aspects import handle as embed_aspects_handle
     from loci.jobs.embed_missing import handle_embed_missing
+    from loci.jobs.infer_interpretation import handle_infer_interpretation
     from loci.jobs.log_usage import handle_log_usage
     from loci.jobs.parse_links import handle_parse_links
+    from loci.jobs.refresh_co_recalled_edges import handle_refresh_co_recalled_edges
+    from loci.jobs.refresh_project_edges import handle_refresh_project_edges
+    from loci.jobs.sweep_interpretations import handle_sweep_interpretations
     return {
         "classify_aspects": handle_classify_aspects,
+        "embed_aspects": embed_aspects_handle,
         "parse_links": handle_parse_links,
         "log_usage": handle_log_usage,
         "embed_missing": handle_embed_missing,
+        "infer_interpretation": handle_infer_interpretation,
+        "refresh_co_recalled_edges": handle_refresh_co_recalled_edges,
+        "refresh_project_edges": handle_refresh_project_edges,
+        "sweep_interpretations": handle_sweep_interpretations,
     }
 
 

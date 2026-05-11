@@ -17,13 +17,16 @@ def test_enqueue_and_claim(conn, project):
     assert claim_one(conn) is None
 
 
-def test_unknown_kind_rejected_by_schema(conn, project):
-    """The jobs.kind CHECK is the safety net for handler dispatch — verify it."""
-    import sqlite3
-
-    import pytest as pt
-    with pt.raises(sqlite3.IntegrityError):
-        enqueue(conn, kind="bogus_kind", project_id=project.id)
+def test_unknown_kind_handled_by_worker(conn, project):
+    """jobs.kind has no SQL CHECK (removed by _m001); worker marks unknown kinds failed."""
+    # Since v2.1, kind validation is Python-level in the worker dispatch —
+    # the DB accepts any kind, the worker marks it failed when no handler found.
+    jid = enqueue(conn, kind="bogus_kind", project_id=project.id)
+    assert jid is not None  # SQL level accepts it
+    # Worker claims and fails it (no handler registered)
+    assert run_once(conn) is True
+    job = get_job(conn, jid)
+    assert job["status"] == "failed"
 
 
 def test_handler_failure_marks_job_failed(conn, project, monkeypatch):

@@ -36,26 +36,33 @@ _HYDE_INSTRUCTIONS = (
 )
 
 
-async def hypothesize(query: str, project_memo: str | None = None) -> str:
+async def hypothesize(
+    query: str,
+    project_memo: str | None = None,
+    aspects: list[str] | None = None,
+) -> str:
     """Return a hypothetical passage for `query`, or the query verbatim if no LLM.
 
     The fallback is intentional: callers can always pass the result to the
     embedder. They don't need to special-case "no LLM".
 
-    `project_memo` is optional short context prepended to the user prompt so
-    the hypothetical passage is grounded in the project's domain.
+    `project_memo` grounds the hypothetical in the project's domain.
+    `aspects` are the query-expanded aspect labels; when present they bias the
+    hypothetical toward the project's vocabulary (R2: symmetric grounding).
     """
     settings = get_settings()
+    instructions = _HYDE_INSTRUCTIONS
+    if project_memo:
+        instructions += f"\n\nProject context: {project_memo[:500]}"
+    if aspects:
+        instructions += f"\n\nRelevant concepts: {', '.join(aspects[:5])}"
     try:
-        agent = build_agent(settings.hyde_model, instructions=_HYDE_INSTRUCTIONS)
+        agent = build_agent(settings.hyde_model, instructions=instructions)
     except LLMNotConfiguredError as exc:
         log.debug("HyDE: %s; returning query verbatim", exc)
         return query
-    user_prompt = query
-    if project_memo:
-        user_prompt = f"Project context: {project_memo[:200]}\n\n{query}"
     try:
-        result = await agent.run(user_prompt)
+        result = await agent.run(query)
     except Exception as exc:  # noqa: BLE001 — never let HyDE break retrieval
         log.warning("HyDE call failed; falling back to query: %s", exc)
         return query

@@ -34,35 +34,11 @@ from loci.graph.models import new_id, now_iso
 from loci.graph.projects import ProjectRepository
 from loci.graph.sources import SourceRepository
 from loci.graph.workspaces import WorkspaceRepository
+from loci.mcp.events import record_browse_events, record_event
 from loci.mcp.resolve import ProjectNotFound, resolve_project_id
+from loci.mcp.session import session_hash_from_ctx
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Usage logging helper
-# ---------------------------------------------------------------------------
-
-
-async def _log_usage(
-    resource_id: str,
-    tool_call_type: str,
-    conn,
-    session_hash: str | None = None,
-) -> None:
-    """Insert a row into resource_usage_log. Best-effort — never raises."""
-    try:
-        conn.execute(
-            """
-            INSERT INTO resource_usage_log
-                (id, resource_id, session_hash, tool_call_type, used_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (new_id(), resource_id, session_hash, tool_call_type, now_iso()),
-        )
-        conn.commit()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +161,26 @@ def build_mcp_server() -> FastMCP:
         ).fetchone()
         chunk_count = chunk_count_row[0] if chunk_count_row else 0
 
+        # Trigger immediate interpretation for this project (no daily bucket)
+        session = session_hash_from_ctx(ctx)
+        await record_event(
+            conn=conn,
+            tool="loci_save",
+            project_id=project_id,
+            resource_id=result.resource_id,
+            session_hash=session,
+            enqueue_inference=True,
+            immediate=True,
+        )
+
         dup_note = " (already existed)" if result.is_duplicate else ""
         aspects_str = ", ".join(confirmed_aspects) if confirmed_aspects else "(none)"
         folder_str = confirmed_folder or "(none)"
+        from loci.graph.handles import short_id as _short_id
+        sid = _short_id(result.resource_id)
         return (
             f"Saved: {result.title}{dup_note}\n"
-            f"ID: {result.resource_id}\n"
+            f"ID: {sid} ({result.resource_id})\n"
             f"Folder: {folder_str}\n"
             f"Aspects: {aspects_str}\n"
             f"Chunks: {chunk_count}"
@@ -212,6 +202,7 @@ def build_mcp_server() -> FastMCP:
     )
     async def loci_recall(
         query: str,
+        ctx: Context,
         n: int = 5,
         filter_aspects: list[str] | None = None,
         filter_folder: str | None = None,
@@ -219,6 +210,7 @@ def build_mcp_server() -> FastMCP:
         verbose: bool = False,
     ) -> str:
         from loci.retrieve.pipeline import RetrievalTrace, retrieve
+        from loci.retrieve.query_cnl import split_query
 
         conn = get_connection()
         try:
@@ -226,15 +218,20 @@ def build_mcp_server() -> FastMCP:
         except ProjectNotFound as e:
             return f"Error: {e}"
 
+        # Parse any ?key=value CNL clauses from the query; remainder is free text.
+        free_text, cnl_query = split_query(query)
+        effective_query = free_text if free_text else query
+
         try:
             retrieve_result = await retrieve(
-                query=query,
+                query=effective_query,
                 project_id=project_id,
                 conn=conn,
                 n=n,
                 filter_aspects=filter_aspects,
                 filter_folder=filter_folder,
                 return_trace=verbose,
+                cnl_query=cnl_query if not cnl_query.is_empty else None,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("loci_recall: retrieve failed")
@@ -250,14 +247,34 @@ def build_mcp_server() -> FastMCP:
             return f'## Recall: "{query}"\n\nNo results found.'
 
         # Log usage for each returned resource.
-        for r in results:
-            await _log_usage(r.resource_id, "loci_recall", conn)
+        session = session_hash_from_ctx(ctx)
+        for res in results:
+            await record_event(
+                conn=conn,
+                tool="loci_recall",
+                project_id=project_id,
+                resource_id=res.resource_id,
+                query=query,
+                session_hash=session,
+                enqueue_inference=True,
+            )
 
         lines: list[str] = [f'## Recall: "{query}"\n']
 
         # Trace block (verbose mode only)
         if trace:
             lines.append("### Retrieval trace\n")
+            if not cnl_query.is_empty:
+                parts = []
+                if cnl_query.topic:
+                    parts.append(f"topic={'~' if cnl_query.topic_fuzzy else ''}{cnl_query.topic}")
+                if cnl_query.kind:
+                    parts.append(f"kind={cnl_query.kind}")
+                if cnl_query.role:
+                    parts.append(f"role={cnl_query.role}")
+                if cnl_query.target:
+                    parts.append(f"target={cnl_query.target}")
+                lines.append(f"- **Parsed query**: {' '.join(parts)}")
             if trace.expanded_aspects:
                 lines.append(
                     f"- **Expanded aspects**: {', '.join(trace.expanded_aspects)}"
@@ -267,6 +284,7 @@ def build_mcp_server() -> FastMCP:
                 lines.append(f"- **HyDE hypothesis**: {hyp}")
             lines.append("")
 
+        from loci.graph.handles import short_id as _short_id
         for i, r in enumerate(results, start=1):
             folder_tag = f" `{r.folder}`" if r.folder else ""
             aspects_str = ", ".join(r.aspects) if r.aspects else "—"
@@ -276,9 +294,10 @@ def build_mcp_server() -> FastMCP:
                 top_text = raw_text.replace("\n", " ").strip()
                 if len(r.chunks[0].text) > 300:
                     top_text += "..."
+            sid = _short_id(r.resource_id)
 
             lines.append(
-                f"### {i}. [{r.title}](@loci:source://{r.resource_id}){folder_tag}"
+                f"### {i}. {sid} — [{r.title}](@loci:source://{r.resource_id}){folder_tag}"
             )
             lines.append(f"**Aspects**: {aspects_str}")
             lines.append(f"**Why surfaced**: {r.why_surfaced}")
@@ -340,18 +359,34 @@ def build_mcp_server() -> FastMCP:
                     )
                 return "\n".join(lines)
             else:
-                # Return aspects for the specific resource.
-                resource_aspects = aspect_repo.aspects_for(resource_id)
+                # Return aspects for the specific resource (project-scoped, falls back to global).
+                resource_aspects = aspect_repo.aspects_for(resource_id, project_id=project_id)
                 if not resource_aspects:
                     return f"No aspects for resource `{resource_id}`."
                 lines = [f"## Aspects for `{resource_id}`\n"]
                 for ra in resource_aspects:
-                    label_row = conn.execute(
-                        "SELECT label FROM aspect_vocab WHERE id = ?", (ra.aspect_id,)
+                    av_row = conn.execute(
+                        "SELECT label, kind, role, target_aspect_id FROM aspect_vocab WHERE id = ?",
+                        (ra.aspect_id,)
                     ).fetchone()
-                    label = label_row["label"] if label_row else ra.aspect_id
+                    if av_row is None:
+                        continue
+                    label = av_row["label"]
+                    struct_parts = []
+                    if av_row["kind"]:
+                        struct_parts.append(f"kind={av_row['kind']}")
+                    if av_row["role"]:
+                        struct_parts.append(f"role={av_row['role']}")
+                    if av_row["target_aspect_id"]:
+                        t_row = conn.execute(
+                            "SELECT topic FROM aspect_vocab WHERE id = ?",
+                            (av_row["target_aspect_id"],)
+                        ).fetchone()
+                        if t_row:
+                            struct_parts.append(f"target={t_row['topic']}")
+                    struct_str = f" [{', '.join(struct_parts)}]" if struct_parts else ""
                     lines.append(
-                        f"- **{label}** (confidence: {ra.confidence:.2f}, source: {ra.source})"
+                        f"- **{label}**{struct_str} (conf: {ra.confidence:.2f}, src: {ra.source})"
                     )
                 return "\n".join(lines)
 
@@ -360,8 +395,34 @@ def build_mcp_server() -> FastMCP:
                 return "Error: resource_id is required for action='add'."
             if not labels:
                 return "Error: labels is required for action='add'."
-            aspect_repo.tag_resource(resource_id, labels, source="user")
+            from loci.graph.aspect_dsl import parse as _parse, render as _render  # noqa: PLC0415
+            from loci.graph.models import AspectScore  # noqa: PLC0415
+
+            scores = [
+                AspectScore(label=_render(p := _parse(lbl)), confidence=1.0, proposition=p)
+                for lbl in labels
+            ]
+            aspect_repo.tag_resource_with_propositions(
+                project_id, resource_id, scores, source="user"
+            )
             conn.commit()
+            session = session_hash_from_ctx(ctx)
+            await record_event(
+                conn=conn,
+                tool="loci_aspects:add",
+                project_id=project_id,
+                resource_id=resource_id,
+                session_hash=session,
+                enqueue_inference=False,
+            )
+            from loci.jobs.queue import enqueue
+            enqueue(
+                conn,
+                kind="refresh_project_edges",
+                project_id=project_id,
+                payload={"resource_id": resource_id},
+                fingerprint=f"refresh_edges:{project_id}:{resource_id}",
+            )
             return f"Added aspects to `{resource_id}`: {', '.join(labels)}"
 
         elif action == "remove":
@@ -369,16 +430,33 @@ def build_mcp_server() -> FastMCP:
                 return "Error: resource_id is required for action='remove'."
             if not labels:
                 return "Error: labels is required for action='remove'."
-            aspect_repo.untag_resource(resource_id, labels)
+            aspect_repo.untag_resource(resource_id, labels, project_id=project_id)
             conn.commit()
+            session = session_hash_from_ctx(ctx)
+            await record_event(
+                conn=conn,
+                tool="loci_aspects:remove",
+                project_id=project_id,
+                resource_id=resource_id,
+                session_hash=session,
+                enqueue_inference=False,
+            )
+            from loci.jobs.queue import enqueue
+            enqueue(
+                conn,
+                kind="refresh_project_edges",
+                project_id=project_id,
+                payload={"resource_id": resource_id},
+                fingerprint=f"refresh_edges:{project_id}:{resource_id}",
+            )
             return f"Removed aspects from `{resource_id}`: {', '.join(labels)}"
 
         elif action == "edit":
             if resource_id is None:
                 return "Error: resource_id is required for action='edit'."
 
-            # Get current aspects.
-            current_aspects = aspect_repo.aspects_for(resource_id)
+            # Get current aspects (project-scoped, falls back to global).
+            current_aspects = aspect_repo.aspects_for(resource_id, project_id=project_id)
             current_labels: list[str] = []
             for ra in current_aspects:
                 label_row = conn.execute(
@@ -423,11 +501,42 @@ def build_mcp_server() -> FastMCP:
                 # Elicitation not supported — keep current labels.
                 pass
 
-            # Replace all aspects.
-            aspect_repo.clear_resource_aspects(resource_id)
+            # Delete role-derived edges for all existing aspects before clearing.
+            from loci.graph.aspect_dsl import parse as _parse, render as _render  # noqa: PLC0415
+            from loci.graph.aspect_graph import AspectGraphRepository  # noqa: PLC0415
+            from loci.graph.models import AspectScore  # noqa: PLC0415
+
+            ag_repo = AspectGraphRepository(conn)
+            for ra in aspect_repo.aspects_for(resource_id, project_id=project_id):
+                ag_repo.delete_role_edges_for(project_id, resource_id, ra.aspect_id)
+
+            aspect_repo.clear_resource_aspects(resource_id, project_id=project_id)
             if chosen_labels:
-                aspect_repo.tag_resource(resource_id, chosen_labels, source="user")
+                scores = [
+                    AspectScore(label=_render(p := _parse(lbl)), confidence=1.0, proposition=p)
+                    for lbl in chosen_labels
+                ]
+                aspect_repo.tag_resource_with_propositions(
+                    project_id, resource_id, scores, source="user"
+                )
             conn.commit()
+            session = session_hash_from_ctx(ctx)
+            await record_event(
+                conn=conn,
+                tool="loci_aspects:edit",
+                project_id=project_id,
+                resource_id=resource_id,
+                session_hash=session,
+                enqueue_inference=False,
+            )
+            from loci.jobs.queue import enqueue
+            enqueue(
+                conn,
+                kind="refresh_project_edges",
+                project_id=project_id,
+                payload={"resource_id": resource_id},
+                fingerprint=f"refresh_edges:{project_id}:{resource_id}",
+            )
             return (
                 f"Updated aspects for `{resource_id}`:\n"
                 + (", ".join(chosen_labels) if chosen_labels else "(none)")
@@ -452,6 +561,7 @@ def build_mcp_server() -> FastMCP:
         ),
     )
     async def loci_browse(
+        ctx: Context,
         folder: str | None = None,
         aspect: str | None = None,
         query: str | None = None,
@@ -525,12 +635,23 @@ def build_mcp_server() -> FastMCP:
             filter_str = ", ".join(filters) or "no filters"
             return f"No resources found ({filter_str})."
 
+        session = session_hash_from_ctx(ctx)
+        resource_ids = [row["id"] for row in rows if row["id"]]
+        await record_browse_events(
+            conn=conn,
+            project_id=project_id,
+            resource_ids=resource_ids,
+            session_hash=session,
+        )
+
+        from loci.graph.handles import short_id as _short_id
         lines = ["## Resources\n"]
-        lines.append("| Title | Folder | Aspects | Saved |")
-        lines.append("|-------|--------|---------|-------|")
+        lines.append("| ID | Title | Folder | Aspects | Saved |")
+        lines.append("|----|-------|--------|---------|-------|")
         for row in rows:
             title = (row["title"] or "Untitled")[:50]
             rid = row["id"]
+            sid = _short_id(rid) if rid else "—"
             folder_cell = row["folder"] or "—"
             aspects_cell = row["aspects"] or "—"
             if len(aspects_cell) > 40:
@@ -538,7 +659,7 @@ def build_mcp_server() -> FastMCP:
             saved = (row["created_at"] or "")[:10]
             title_link = f"[{title}](@loci:source://{rid})"
             lines.append(
-                f"| {title_link} | {folder_cell} | {aspects_cell} | {saved} |"
+                f"| {sid} | {title_link} | {folder_cell} | {aspects_cell} | {saved} |"
             )
 
         return "\n".join(lines)
@@ -726,7 +847,14 @@ def build_mcp_server() -> FastMCP:
         if node is None:
             return f"Resource not found: {resource_id}"
 
-        await _log_usage(resource_id, "resource_get_source", conn)
+        await record_event(
+            conn=conn,
+            tool="resource_get_source",
+            project_id=None,  # resource reads don't have project context yet
+            resource_id=resource_id,
+            session_hash=None,
+            enqueue_inference=False,
+        )
 
         # Fetch provenance.
         prov_row = conn.execute(
@@ -812,6 +940,16 @@ def build_mcp_server() -> FastMCP:
                 f"- [{title}](@loci:source://{row['id']}) — {saved}"
             )
 
+        for row in rows:
+            await record_event(
+                conn=conn,
+                tool="resource_get_folder",
+                project_id=project_id,
+                resource_id=row["id"],
+                session_hash=None,
+                enqueue_inference=False,
+            )
+
         return "\n".join(lines)
 
     @mcp.resource("aspect://{label}")
@@ -846,6 +984,16 @@ def build_mcp_server() -> FastMCP:
             title = node.title or "Untitled"
             lines.append(
                 f"- [{title}](@loci:source://{node.id}){folder_tag}"
+            )
+
+        for node in nodes:
+            await record_event(
+                conn=conn,
+                tool="resource_get_aspect",
+                project_id=project_id,
+                resource_id=node.id,
+                session_hash=None,
+                enqueue_inference=False,
             )
 
         return "\n".join(lines)
@@ -1028,7 +1176,7 @@ def _register_recent_resources(
             n += 1
         slug_to_id[slug] = rid
 
-        def _make_reader(_id: str = rid) -> Any:
+        def _make_reader(_id: str = rid, _project_id: str = project_id) -> Any:
             async def _read() -> str:
                 _conn = get_connection()
                 src_repo = SourceRepository(_conn)
@@ -1048,6 +1196,14 @@ def _register_recent_resources(
                     header.append(f"**Source**: {source_url}")
                 header.append(f"**ID**: `{_id}`")
                 header.append("")
+                await record_event(
+                    conn=_conn,
+                    tool="resource_mention_pick",
+                    project_id=_project_id,
+                    resource_id=_id,
+                    session_hash=None,
+                    enqueue_inference=False,
+                )
                 return "\n".join(header) + (node.body or "(no content)")
             return _read
 

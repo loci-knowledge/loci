@@ -4,18 +4,18 @@ Replaces the old interpretation-routed / PPR pipeline. The new model queries
 raw chunks directly, uses the concept graph (aspect labels + co_aspect /
 cites edges) to expand and rerank, and returns resource-grouped results.
 
-Pipeline:
-
-    1. expand_query_aspects()  → expanded aspect label list from concept graph
-    2. HyDE                    → hypothetical document, embed it
-    3. search_lex(query, filter_aspects=expanded_aspects)
-    4. search_vec(hyde_vec, filter_aspects=expanded_aspects)
-    5. RRF fusion              → merged chunk ranking (k=60)
-    6. Graph rerank            → boost resources connected by co_aspect / cites
-                                  edges to the current top-5
-    7. Group by resource_id    → take top chunks per resource
-    8. Build RetrievalResult   → with why_surfaced strings
-    9. Return top n resources
+Pipeline (v2.1)
+---------------
+    1. expand_query_aspects()  → expanded aspect label list via graph
+    2. HyDE(q, profile_md, aspects) → hypothetical document, embed it
+    3. search_lex(query, filter_aspects=caller_filter_only)
+    4. search_vec(hyde_vec, filter_aspects=caller_filter_only)
+    5. aspect_overlap_rank()   → third soft channel ranked by aspect confidence
+    6. 3-way RRF fusion        → merged chunk ranking (k=60)
+    7. Graph rerank (signed-sum, edge-weight-aware)
+    8. Aspect-density resource score bonus (α=0.2)
+    9. Group by resource_id    → take top chunks per resource
+   10. Build RetrievalResult   → with why_surfaced strings, return top n
 
 Score conventions
 -----------------
@@ -23,6 +23,20 @@ Score conventions
   feeding into RRF so that rank 1 = best.
 - vec scores are L2 distances (smaller = better). We negate them too.
 - RRF formula: 1 / (k + rank), higher = better. k=60 is the canonical default.
+
+Aspect channel (v2.1 addition)
+-------------------------------
+expanded_aspects are NO LONGER passed as a hard JOIN filter to lex/vec.
+Instead they drive a third RRF channel via aspect_overlap_rank(), which
+scores resources by sum(confidence) for matching aspects. Zero-recall failure
+from an empty expansion is eliminated: lex/vec always scan the full project.
+Only explicit caller-supplied filter_aspects remain as hard constraints.
+
+Graph rerank (v2.1 change)
+--------------------------
+Replaced max-pool with a signed sum weighted by concept_edges.weight:
+  boost(r') = 1 + clamp(Σ_e signed_mult[e.type] * e.weight, -0.5, +0.6)
+contradicts edges now actively demote when no stronger positive edge exists.
 """
 
 from __future__ import annotations
@@ -37,7 +51,11 @@ from loci.embed.local import Embedder, get_embedder
 from loci.graph.aspects import AspectRepository
 from loci.graph.concept_edges import ConceptEdgeRepository
 from loci.retrieve import hyde as hyde_mod
-from loci.retrieve.concept_expand import build_why_surfaced, expand_query_aspects
+from loci.retrieve.concept_expand import (
+    aspect_overlap_rank,
+    build_why_surfaced,
+    expand_query_aspects,
+)
 from loci.retrieve.lex import search_lex
 from loci.retrieve.vec import search_vec
 
@@ -49,11 +67,27 @@ _RRF_K = 60
 # Graph rerank: consider edges from the top-N resources.
 _GRAPH_RERANK_TOP_N = 5
 
-# Graph rerank multiplicative score boost for a neighbor resource.
-_GRAPH_RERANK_BOOST = 1.2
-
 # Edge types used for graph reranking.
-_GRAPH_EDGE_TYPES = ["co_aspect", "cites"]
+_GRAPH_EDGE_TYPES = ["co_aspect", "cites", "co_recalled", "supports", "instantiates", "depends_on", "contradicts"]
+
+# Signed per-type delta for boost formula:
+#   boost(r') = 1 + clamp(Σ_e DELTA[e.type] * e.weight, -0.5, +0.6)
+# Positive = promote; negative = demote.  max-pool replaced by signed sum.
+_EDGE_TYPE_DELTA: dict[str, float] = {
+    "supports":     +0.30,
+    "instantiates": +0.25,
+    "cites":        +0.20,
+    "depends_on":   +0.20,
+    "co_aspect":    +0.15,
+    "co_recalled":  +0.10,
+    "contradicts":  -0.15,
+}
+
+# Aspect-density bonus coefficient (R7).
+_ASPECT_DENSITY_ALPHA = 0.2
+
+# Weight for the aspect-overlap RRF channel relative to lex/vec (each weight=1).
+_ASPECT_CHANNEL_WEIGHT = 0.5
 
 # Maximum chunks to keep per resource in the final result.
 _MAX_CHUNKS_PER_RESOURCE = 3
@@ -101,6 +135,7 @@ async def retrieve(
     filter_folder: str | None = None,
     embedder: Embedder | None = None,
     return_trace: bool = False,
+    cnl_query: "Query | None" = None,  # noqa: F821 — parsed ?clause filter
 ) -> "list[RetrievalResult] | tuple[list[RetrievalResult], RetrievalTrace]":
     """Run the concept-graph retrieval pipeline.
 
@@ -151,11 +186,21 @@ async def retrieve(
 
     # ------------------------------------------------------------------
     # Step 2: HyDE — generate a hypothetical doc and embed it
+    # Aspects are passed so HyDE is grounded in project vocabulary (R2).
     # ------------------------------------------------------------------
     hyde_vec: np.ndarray | None = None
     hypothetical: str | None = None
     try:
-        hypothetical = await hyde_mod.hypothesize(query)
+        profile_row = conn.execute(
+            "SELECT profile_md FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        project_memo = profile_row["profile_md"] if profile_row and profile_row["profile_md"] else None
+
+        hypothetical = await hyde_mod.hypothesize(
+            query,
+            project_memo=project_memo,
+            aspects=expanded_aspects or None,
+        )
         if hypothetical and hypothetical != query:
             hyde_vec = emb.encode(hypothetical)
         else:
@@ -170,13 +215,15 @@ async def retrieve(
 
     # ------------------------------------------------------------------
     # Step 3 & 4: BM25 + ANN search
+    # NOTE: only caller-supplied filter_aspects are passed as a hard filter.
+    # query-expanded aspects drive the soft third channel instead (Step 5b).
     # ------------------------------------------------------------------
     lex_results = search_lex(
         query=query,
         project_id=project_id,
         conn=conn,
         limit=20,
-        filter_aspects=merged_aspects,
+        filter_aspects=filter_aspects,
         filter_folder=filter_folder,
     )
 
@@ -187,19 +234,13 @@ async def retrieve(
             project_id=project_id,
             conn=conn,
             limit=20,
-            filter_aspects=merged_aspects,
+            filter_aspects=filter_aspects,
             filter_folder=filter_folder,
         )
 
     # ------------------------------------------------------------------
-    # Step 5: RRF fusion
+    # Step 5a: RRF fusion (lex + vec channels)
     # ------------------------------------------------------------------
-    # BM25 is already ordered smallest-first (most negative = best).
-    # vec is ordered smallest-first (lowest distance = best).
-    # RRF rank 1 = best, so we use them in their natural order.
-
-    # Build a combined index keyed by chunk_id.
-    # Store per-chunk: resource_id, text, section, raw lex/vec scores.
     chunk_index: dict[str, dict] = {}
 
     for rank, hit in enumerate(lex_results, start=1):
@@ -232,13 +273,66 @@ async def retrieve(
         chunk_index[cid]["vec_score"] = hit["score"]
         chunk_index[cid]["rrf"] += 1.0 / (_RRF_K + rank)
 
+    # ------------------------------------------------------------------
+    # Step 5b: Aspect-overlap soft channel (R1)
+    # Ranks resources by sum(confidence) for expanded aspects, then
+    # broadcasts resource rank to all its chunks via a weighted RRF term.
+    # ------------------------------------------------------------------
+    if expanded_aspects or (cnl_query is not None and not cnl_query.is_empty):
+        asp_ranked = aspect_overlap_rank(
+            conn=conn,
+            project_id=project_id,
+            expanded_aspects=expanded_aspects,
+            limit=20,
+            query=cnl_query,
+        )
+        # Build resource→rank mapping
+        asp_resource_rank = {rid: rank for rank, (rid, _) in enumerate(asp_ranked, start=1)}
+
+        for cid, chunk in chunk_index.items():
+            rid = chunk["resource_id"]
+            asp_rank = asp_resource_rank.get(rid)
+            if asp_rank is not None:
+                chunk["rrf"] += _ASPECT_CHANNEL_WEIGHT / (_RRF_K + asp_rank)
+
+        # Also inject any resources from asp_ranked that aren't yet in chunk_index.
+        # We need a chunk to attach them to; look them up from raw_chunks.
+        existing_resources = {c["resource_id"] for c in chunk_index.values()}
+        missing = [(rid, s) for rid, s in asp_ranked if rid not in existing_resources]
+        if missing:
+            for rid, _asp_score in missing[:10]:
+                row = conn.execute(
+                    """
+                    SELECT rc.id AS chunk_id, rc.text, rc.section
+                    FROM raw_chunks rc
+                    JOIN nodes n ON n.id = rc.raw_id
+                    WHERE rc.raw_id = ? AND n.status IN ('live', 'dirty')
+                    ORDER BY rc.seq LIMIT 1
+                    """,
+                    (rid,),
+                ).fetchone()
+                if row:
+                    asp_rank = asp_resource_rank[rid]
+                    cid = row["chunk_id"]
+                    if cid not in chunk_index:
+                        chunk_index[cid] = {
+                            "chunk_id": cid,
+                            "resource_id": rid,
+                            "text": row["text"] or "",
+                            "section": row["section"],
+                            "lex_score": 0.0,
+                            "vec_score": 0.0,
+                            "rrf": _ASPECT_CHANNEL_WEIGHT / (_RRF_K + asp_rank),
+                        }
+
     # Sort chunks by RRF score descending.
     sorted_chunks = sorted(chunk_index.values(), key=lambda c: -c["rrf"])
 
     # ------------------------------------------------------------------
-    # Step 6: Graph rerank
+    # Step 6: Graph rerank (signed-sum, edge-weight-aware) (R3)
+    # boost(r') = 1 + clamp(Σ_e DELTA[e.type]*e.weight, -0.5, +0.6)
+    # Replaces max-pool; contradicts now actively demotes.
     # ------------------------------------------------------------------
-    # Collect the top-N unique resources from the RRF ranking.
     top_resource_ids: list[str] = []
     seen_for_top: set[str] = set()
     for c in sorted_chunks:
@@ -249,25 +343,36 @@ async def retrieve(
         if len(top_resource_ids) >= _GRAPH_RERANK_TOP_N:
             break
 
-    # Find neighbor resources connected via co_aspect / cites edges.
     edge_repo = ConceptEdgeRepository(conn)
-    boosted_resources: set[str] = set()
+    neighbor_delta: dict[str, float] = {}  # resource_id → cumulative signed delta
     for rid in top_resource_ids:
-        neighbors = edge_repo.neighbors(rid, edge_types=_GRAPH_EDGE_TYPES, depth=1)
-        boosted_resources.update(neighbors)
-    # Don't boost the top resources themselves — only their neighbors.
-    boosted_resources -= set(top_resource_ids)
+        for edge in edge_repo.edges_from(rid, edge_types=_GRAPH_EDGE_TYPES, project_id=project_id):
+            delta = _EDGE_TYPE_DELTA.get(edge.edge_type, 0.0) * edge.weight
+            neighbor_delta[edge.dst_id] = neighbor_delta.get(edge.dst_id, 0.0) + delta
+        for edge in edge_repo.edges_to(rid, edge_types=_GRAPH_EDGE_TYPES, project_id=project_id):
+            delta = _EDGE_TYPE_DELTA.get(edge.edge_type, 0.0) * edge.weight
+            neighbor_delta[edge.src_id] = neighbor_delta.get(edge.src_id, 0.0) + delta
+    # Top resources don't boost themselves.
+    for rid in top_resource_ids:
+        neighbor_delta.pop(rid, None)
 
-    # Apply boost: multiply the RRF score of chunks from boosted resources.
+    # Convert delta to multiplicative boost: 1 + clamp(delta, -0.5, +0.6)
+    neighbor_boost: dict[str, float] = {
+        rid: 1.0 + max(-0.5, min(0.6, delta))
+        for rid, delta in neighbor_delta.items()
+    }
+    boosted_resources: set[str] = set(neighbor_boost.keys())
+
     for chunk in chunk_index.values():
-        if chunk["resource_id"] in boosted_resources:
-            chunk["rrf"] *= _GRAPH_RERANK_BOOST
+        boost = neighbor_boost.get(chunk["resource_id"])
+        if boost is not None:
+            chunk["rrf"] *= boost
 
-    # Re-sort after boost.
     sorted_chunks = sorted(chunk_index.values(), key=lambda c: -c["rrf"])
 
     # ------------------------------------------------------------------
-    # Step 7: Group by resource, take top chunks per resource
+    # Step 7: Group by resource, take top chunks; aspect-density bonus (R7)
+    # score(r) += α * |aspects(r) ∩ ε(q)| / max(|ε(q)|, 1)
     # ------------------------------------------------------------------
     resource_chunks: dict[str, list[dict]] = {}
     resource_score: dict[str, float] = {}
@@ -277,8 +382,37 @@ async def retrieve(
         bucket = resource_chunks.setdefault(rid, [])
         if len(bucket) < _MAX_CHUNKS_PER_RESOURCE:
             bucket.append(chunk)
-        # Resource score = sum of RRF scores of its top chunks.
         resource_score[rid] = resource_score.get(rid, 0.0) + chunk["rrf"]
+
+    # Aspect-density bonus: reward resources covering more expanded aspects.
+    # v2.2: field-weighted when cnl_query provides typed constraints.
+    if expanded_aspects or (cnl_query is not None and not cnl_query.is_empty):
+        aspect_repo_inner = AspectRepository(conn)
+        n_expanded = max(len(expanded_aspects), 1)
+        expanded_set = set(expanded_aspects)
+        q_kind = cnl_query.kind if cnl_query else None
+        q_role = cnl_query.role if cnl_query else None
+        for rid in resource_score:
+            r_aspect_rows = aspect_repo_inner.aspects_for(rid, project_id=project_id)
+            overlap_score = 0.0
+            for ra in r_aspect_rows:
+                r_label = _lookup_label(ra.aspect_id, conn)
+                if r_label is None:
+                    continue
+                if r_label in expanded_set or (cnl_query and not cnl_query.is_empty):
+                    # Base match
+                    overlap_score += 1.0
+                    # Extra credit for typed-field matches
+                    aspect_row = conn.execute(
+                        "SELECT kind, role FROM aspect_vocab WHERE id = ?", (ra.aspect_id,)
+                    ).fetchone()
+                    if aspect_row:
+                        if q_kind and aspect_row["kind"] == q_kind:
+                            overlap_score += 0.5
+                        if q_role and aspect_row["role"] == q_role:
+                            overlap_score += 0.5
+            if overlap_score:
+                resource_score[rid] += _ASPECT_DENSITY_ALPHA * overlap_score / n_expanded
 
     # Sort resources by their aggregate score descending.
     ranked_resources = sorted(
@@ -297,8 +431,8 @@ async def retrieve(
         if meta is None:
             continue
 
-        # Fetch aspects for this resource.
-        resource_aspect_rows = aspect_repo.aspects_for(resource_id)
+        # Fetch aspects for this resource (project-scoped when available).
+        resource_aspect_rows = aspect_repo.aspects_for(resource_id, project_id=project_id)
         resource_aspect_labels = [
             _lookup_label(ra.aspect_id, conn)
             for ra in resource_aspect_rows
@@ -321,8 +455,9 @@ async def retrieve(
         winning_chunk = resource_chunks.get(resource_id, [{}])[0]
         why = build_why_surfaced(
             chunk={"resource_id": resource_id, **winning_chunk},
-            matched_aspects=expanded_aspects,
+            matched_aspects=merged_aspects or expanded_aspects,
             conn=conn,
+            project_id=project_id,
         )
         # Note if this resource was boosted by the graph.
         if resource_id in boosted_resources:

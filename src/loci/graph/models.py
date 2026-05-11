@@ -175,6 +175,10 @@ class Aspect:
     `conceptnet_relation_hint` is an optional ConceptNet 5.5 relation label
     (IsA, UsedFor, PartOf, …) that describes how resources tagged with this
     aspect relate to the concept. See `conceptnet_types.py`.
+
+    v2.2 DSL fields (`topic`, `kind`, `role`, `target_aspect_id`, `modifiers`):
+    For flat legacy labels: topic == label, all others None.
+    For typed propositions: label is the rendered CNL string (canonical form).
     """
     id: str = field(default_factory=new_id)
     label: str = ""
@@ -184,6 +188,12 @@ class Aspect:
     auto_inferred: bool = False
     last_used: str | None = None
     created_at: str = field(default_factory=now_iso)
+    # DSL proposition fields (v2.2)
+    topic: str | None = None
+    kind: str | None = None
+    role: str | None = None
+    target_aspect_id: str | None = None
+    modifiers: dict | None = None
 
 
 @dataclass
@@ -199,6 +209,69 @@ class ResourceAspect:
     confidence: float = 1.0
     source: str = "user"    # user | folder | inferred | usage
     created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class ProjectResourceAspect:
+    """Per-project aspect application: same resource, project-specific meaning.
+
+    `source` extends ResourceAspect's values with:
+      llm          — produced by the infer_interpretation background job
+      conversation — inferred from Claude Code conversation hook events
+      seed         — backfilled from legacy resource_aspects during migration
+    """
+    project_id: str
+    resource_id: str
+    aspect_id: str
+    confidence: float = 1.0
+    source: str = "inferred"
+    weight_signals: dict | None = None
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class ProjectInterpretation:
+    """LLM-generated narrative reading of a resource within a project's lens."""
+    project_id: str
+    resource_id: str
+    summary_md: str = ""
+    stance: str | None = None   # methodological|supporting|contradictory|reference|tangential
+    inputs_hash: str = ""
+    model_id: str | None = None
+    generated_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class AspectScore:
+    """One aspect label + confidence returned by the interpretation LLM.
+
+    v2.2: `proposition` carries the parsed CNL frame when the LLM emits a
+    structured string. `label` is always populated (= proposition.topic for
+    backward compat with writers that only look at the label).
+    """
+    label: str
+    confidence: float = 0.8
+    rationale: str | None = None
+    proposition: "Proposition | None" = None  # noqa: F821 — forward ref
+
+
+@dataclass
+class Relation:
+    """A typed edge proposed by the interpretation LLM between two resources."""
+    target_resource_id: str
+    edge_type: str   # supports|contradicts|instantiates|depends_on|co_recalled|addresses_query
+    weight: float = 1.0
+    evidence: str | None = None
+
+
+@dataclass
+class InterpretationOutput:
+    """Structured output produced by classify_project_interpretation_llm."""
+    aspects: list[AspectScore] = field(default_factory=list)
+    summary_md: str = ""
+    stance: str = "reference"
+    relations: list[Relation] = field(default_factory=list)
 
 
 @dataclass
@@ -221,6 +294,7 @@ class ConceptEdge:
     weight: float = 1.0
     metadata: dict | None = None
     created_at: str = field(default_factory=now_iso)
+    project_id: str | None = None
 
 
 @dataclass
