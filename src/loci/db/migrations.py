@@ -586,6 +586,21 @@ def _m006_aspect_dsl(conn: sqlite3.Connection) -> None:
     log.info("migrations: v2.2 DSL columns, aspect_kinds, effective_confidence view created")
 
 
+def _m007_project_cwd(conn: sqlite3.Connection) -> None:
+    """Add cwd column to projects for workspace-first MCP binding."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "projects" not in tables:
+        return  # fresh install — schema.sql will create it with the column
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+    if "cwd" not in cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN cwd TEXT UNIQUE")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_projects_cwd ON projects(cwd) WHERE cwd IS NOT NULL"
+    )
+
+
 _MIGRATIONS: list[tuple[int, object]] = [
     (1, _m001_aspects_v2),
     (2, _m002_carryover),
@@ -593,4 +608,5 @@ _MIGRATIONS: list[tuple[int, object]] = [
     (4, _m004_short_id),
     (5, _m005_aspect_provenance),
     (6, _m006_aspect_dsl),
+    (7, _m007_project_cwd),
 ]

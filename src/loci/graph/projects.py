@@ -45,16 +45,22 @@ class ProjectRepository:
         self.conn.execute(
             """
             INSERT INTO projects(id, slug, name, profile_md, created_at,
-                                  last_active_at, config)
-            VALUES (?,?,?,?,?,?,?)
+                                  last_active_at, config, cwd)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
             (
                 project.id, project.slug, project.name, project.profile_md,
                 project.created_at, project.last_active_at,
-                json.dumps(project.config),
+                json.dumps(project.config), project.cwd,
             ),
         )
         return project
+
+    def get_by_cwd(self, cwd: str) -> Project | None:
+        row = self.conn.execute(
+            "SELECT * FROM projects WHERE cwd = ?", (cwd,)
+        ).fetchone()
+        return self._row_to_project(row) if row else None
 
     def update(
         self, project_id: str, slug: str, name: str, profile_md: str,
@@ -178,4 +184,5 @@ class ProjectRepository:
             profile_md=row["profile_md"], created_at=row["created_at"],
             last_active_at=row["last_active_at"],
             config=json.loads(row["config"]) if row["config"] else {},
+            cwd=row["cwd"] if "cwd" in row.keys() else None,
         )

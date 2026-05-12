@@ -12,14 +12,13 @@ from pathlib import Path
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_project_toml(directory: Path, slug: str) -> None:
-    """Write a .loci/project.toml binding file in the given directory."""
-    loci_dir = directory / ".loci"
-    loci_dir.mkdir(parents=True, exist_ok=True)
-    (loci_dir / "project.toml").write_text(
-        f'slug = "{slug}"\ncreated_at = "2026-01-01"\n',
-        encoding="utf-8",
-    )
+def _bind_project_cwd(project: object, cwd: str) -> None:
+    """Bind a project to a cwd in the DB (mirrors what loci_use does)."""
+    from loci.db.connection import connect
+    conn = connect()
+    conn.execute("UPDATE projects SET cwd = ? WHERE id = ?", (str(Path(cwd).resolve()), project.id))
+    conn.commit()
+    conn.close()
 
 
 def _run_event_conversation(
@@ -40,8 +39,10 @@ def _run_event_conversation(
     monkeypatch.setenv("LOCI_CAPTURE_CONVERSATION", "true" if capture_conversation else "false")
     get_settings.cache_clear()
 
-    # Write the project.toml binding
-    _write_project_toml(tmp_path, project.slug)
+    effective_cwd = cwd if cwd is not None else str(tmp_path)
+
+    # Bind the project to this cwd so resolve_project_id can find it.
+    _bind_project_cwd(project, effective_cwd)
 
     # Monkey-patch stdin
     monkeypatch.setattr(sys, "stdin", StringIO(json.dumps(payload)))
@@ -49,7 +50,6 @@ def _run_event_conversation(
     # Call the CLI function directly
     from loci.ui.cli import event_conversation
 
-    effective_cwd = cwd if cwd is not None else str(tmp_path)
     event_conversation(role=role, project=None, cwd=effective_cwd)
 
 

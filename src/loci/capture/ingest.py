@@ -97,7 +97,7 @@ async def ingest_file(
 ) -> CaptureResult:
     """Ingest a local file and return CaptureResult."""
     return await _ingest_path(
-        path=Path(path),
+        path=Path(path).expanduser().resolve(),
         context_text=context_text,
         project_id=project_id,
         conn=conn,

@@ -119,8 +119,11 @@ CREATE TABLE IF NOT EXISTS projects (
     profile_md      TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_active_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    config          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(config))
+    config          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(config)),
+    cwd             TEXT UNIQUE
 );
+
+CREATE INDEX IF NOT EXISTS idx_projects_cwd ON projects(cwd) WHERE cwd IS NOT NULL;
 
 
 -- ---------------------------------------------------------------------------

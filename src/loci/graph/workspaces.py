@@ -250,6 +250,27 @@ class WorkspaceRepository:
             result.append((workspace, link))
         return result
 
+    def list_with_link_flag(
+        self, project_id: str | None = None,
+    ) -> list[tuple[Workspace, bool]]:
+        """Return all workspaces with a boolean indicating if each is linked to project_id.
+
+        Linked workspaces come first, then unlinked, both sorted by slug.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT w.*, (pw.project_id IS NOT NULL) AS is_linked
+            FROM information_workspaces w
+            LEFT JOIN project_workspaces pw
+                ON pw.workspace_id = w.id
+                AND pw.project_id = ?
+                AND pw.role != 'excluded'
+            ORDER BY is_linked DESC, w.slug
+            """,
+            (project_id,),
+        ).fetchall()
+        return [(self._row_to_workspace(dict(r)), bool(r["is_linked"])) for r in rows]
+
     def linked_project_ids(self, workspace_id: str) -> list[str]:
         """Return project_ids for all projects that have linked this workspace."""
         rows = self.conn.execute(

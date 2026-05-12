@@ -1,11 +1,10 @@
-"""MCP completion handler for loci URI template variables.
+"""MCP completion handler for loci URI template variables and prompt arguments.
 
 Wired via @mcp.completion() in build_mcp_server(). Provides live autocomplete
-suggestions when the user types @loci:folder://pa → ["papers"], etc.
-
-Supported templates:
+suggestions for:
     loci:folder://{folder_path}  → distinct folder labels matching the prefix
     loci:aspect://{label}        → aspect vocab labels matching the prefix
+    /loci prompt workspace_slug  → workspace slugs (linked-first) matching prefix
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from __future__ import annotations
 import random
 import sqlite3
 
-from mcp.types import Completion, CompletionArgument, ResourceTemplateReference
+from mcp.types import Completion, CompletionArgument, PromptReference, ResourceTemplateReference
 
 from loci.config import get_settings
 
@@ -22,7 +21,31 @@ async def handle_completion(
     ref: object,
     argument: CompletionArgument,
     conn: sqlite3.Connection,
+    *,
+    invocation_cwd: str | None = None,
 ) -> Completion | None:
+    partial = (argument.value or "").lower()
+
+    # Prompt-argument completions (e.g. /loci <workspace_slug>)
+    if isinstance(ref, PromptReference):
+        if getattr(ref, "name", None) == "loci" and argument.name == "workspace_slug":
+            from loci.graph.workspaces import WorkspaceRepository
+            from loci.graph.projects import ProjectRepository
+
+            project_id: str | None = None
+            if invocation_cwd:
+                proj = ProjectRepository(conn).get_by_cwd(invocation_cwd)
+                if proj:
+                    project_id = proj.id
+
+            pairs = WorkspaceRepository(conn).list_with_link_flag(project_id)
+            values = [
+                ws.slug for ws, _ in pairs
+                if not partial or ws.slug.startswith(partial)
+            ]
+            return Completion(values=values, hasMore=False, total=len(values))
+        return None
+
     if not isinstance(ref, ResourceTemplateReference):
         return None
 

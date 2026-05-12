@@ -22,9 +22,14 @@ Project auto-resolution is unchanged — see loci.mcp.resolve.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+
+# Captured at MCP startup — used as the persistent key for project binding.
+_INVOCATION_CWD = str(Path(os.getcwd()).resolve())
 
 from loci.config import get_settings
 from loci.db import init_schema
@@ -93,23 +98,23 @@ def build_mcp_server() -> FastMCP:
 
         conn = get_connection()
         try:
-            project_id = resolve_project_id(conn, project)
+            project_id = resolve_project_id(conn, project, cwd=_INVOCATION_CWD)
         except ProjectNotFound as e:
             return f"Error: {e}"
 
         # --- Detect input type and ingest ---
         import re
-        from pathlib import Path
 
         input_str = url_or_path.strip()
         is_url = bool(re.match(r"^https?://", input_str))
-        is_path = not is_url and Path(input_str).exists()
+        expanded_path = Path(input_str).expanduser()
+        is_path = not is_url and expanded_path.exists()
 
         try:
             if is_url:
                 result = await ingest_url(input_str, context_text, project_id, conn)
             elif is_path:
-                result = await ingest_file(Path(input_str), context_text, project_id, conn)
+                result = await ingest_file(expanded_path, context_text, project_id, conn)
             else:
                 # Treat as raw text snippet; use first ~60 chars as title.
                 title = input_str[:60].split("\n")[0].strip() or "Untitled snippet"
@@ -214,7 +219,7 @@ def build_mcp_server() -> FastMCP:
 
         conn = get_connection()
         try:
-            project_id = resolve_project_id(conn, project)
+            project_id = resolve_project_id(conn, project, cwd=_INVOCATION_CWD)
         except ProjectNotFound as e:
             return f"Error: {e}"
 
@@ -340,7 +345,7 @@ def build_mcp_server() -> FastMCP:
     ) -> str:
         conn = get_connection()
         try:
-            project_id = resolve_project_id(conn, project)
+            project_id = resolve_project_id(conn, project, cwd=_INVOCATION_CWD)
         except ProjectNotFound as e:
             return f"Error: {e}"
 
@@ -570,7 +575,7 @@ def build_mcp_server() -> FastMCP:
     ) -> str:
         conn = get_connection()
         try:
-            project_id = resolve_project_id(conn, project)
+            project_id = resolve_project_id(conn, project, cwd=_INVOCATION_CWD)
         except ProjectNotFound as e:
             return f"Error: {e}"
 
@@ -679,7 +684,7 @@ def build_mcp_server() -> FastMCP:
     async def loci_context(project: str | None = None) -> str:
         conn = get_connection()
         try:
-            project_id = resolve_project_id(conn, project)
+            project_id = resolve_project_id(conn, project, cwd=_INVOCATION_CWD)
         except ProjectNotFound as e:
             return f"Error: {e}"
 
@@ -800,7 +805,7 @@ def build_mcp_server() -> FastMCP:
         conn = get_connection()
         ws_repo = WorkspaceRepository(conn)
         try:
-            project_id = resolve_project_id(conn, project)
+            project_id = resolve_project_id(conn, project, cwd=_INVOCATION_CWD)
             ws_links = ws_repo.linked_workspaces(project_id)
             linked = [(ws, link) for ws, link in ws_links if link.role != "excluded"]
         except Exception:
@@ -1005,7 +1010,7 @@ def build_mcp_server() -> FastMCP:
     @mcp.completion()
     async def handle_completion(ref, argument, context):  # noqa: ANN001
         from loci.mcp.completions import handle_completion as _handle
-        return await _handle(ref, argument, get_connection())
+        return await _handle(ref, argument, get_connection(), invocation_cwd=_INVOCATION_CWD)
 
     # -----------------------------------------------------------------------
     # MCP Prompts — slash-command entry points
@@ -1024,18 +1029,112 @@ def build_mcp_server() -> FastMCP:
         """Save a URL, file, or text snippet into loci."""
         return f"Use loci_save to capture {target!r} into the current loci project."
 
+    @mcp.prompt("loci")
+    async def loci_prompt(workspace_slug: str = "") -> str:
+        """Pick an information workspace to bind to this project.
+
+        Call with no argument to list available workspaces.
+        Call with a workspace slug to bind it: /loci my-workspace
+        """
+        conn = get_connection()
+        ws_repo = WorkspaceRepository(conn)
+
+        if not workspace_slug.strip():
+            # List workspaces, linked-first for the cwd's project.
+            try:
+                project_id = resolve_project_id(conn, None, cwd=_INVOCATION_CWD)
+            except ProjectNotFound:
+                project_id = None
+
+            pairs = ws_repo.list_with_link_flag(project_id)
+            if not pairs:
+                return (
+                    "No information workspaces found. "
+                    "Create one first: `loci workspace create <slug> && loci workspace scan <slug>`"
+                )
+            lines = ["## Available workspaces\n"]
+            for ws, linked in pairs:
+                tag = " ✓ linked" if linked else ""
+                lines.append(f"- **{ws.slug}**{tag} — {ws.name} ({ws.kind})")
+            lines.append(
+                "\nTo bind a workspace, call: `/loci <workspace-slug>` "
+                "or say: use workspace <slug>"
+            )
+            return "\n".join(lines)
+
+        return (
+            f"Call loci_use with workspace_slug={workspace_slug.strip()!r} to bind "
+            f"that workspace to this project directory."
+        )
+
     # -----------------------------------------------------------------------
-    # Concrete resource enumeration — top-30 by recency for @-mention picker
+    # loci_use — bind a workspace to the current cwd (creates project if needed)
     # -----------------------------------------------------------------------
 
-    _startup_conn = get_connection()
-    try:
-        _startup_project_id: str | None = resolve_project_id(_startup_conn)
-    except ProjectNotFound:
-        _startup_project_id = None
+    @mcp.tool(
+        description=(
+            "Bind an information workspace to the current project directory. "
+            "Creates a project for this directory if none exists. "
+            "The first call sets the workspace as primary; subsequent calls add as reference. "
+            "After binding, loci_recall and loci_save will use that project."
+        ),
+    )
+    async def loci_use(workspace_slug: str) -> str:
+        import re as _re
 
-    if _startup_project_id:
-        _register_recent_resources(mcp, _startup_conn, _startup_project_id, _slug_to_id)
+        conn = get_connection()
+        ws_repo = WorkspaceRepository(conn)
+        proj_repo = ProjectRepository(conn)
+
+        ws = ws_repo.get_by_slug(workspace_slug)
+        if ws is None:
+            slugs = [w.slug for w, _ in ws_repo.list_with_link_flag()]
+            available = ", ".join(slugs) if slugs else "(none)"
+            return f"Workspace not found: {workspace_slug!r}. Available: {available}"
+
+        # Find or create project for cwd.
+        proj = proj_repo.get_by_cwd(_INVOCATION_CWD)
+        if proj is None:
+            from loci.graph.models import Project
+
+            base_slug = _re.sub(r"[^\w-]", "-", Path(_INVOCATION_CWD).name.lower()).strip("-") or "project"
+            slug = base_slug
+            n = 2
+            while proj_repo.get_by_slug(slug) is not None:
+                slug = f"{base_slug}-{n}"
+                n += 1
+
+            proj = proj_repo.create(
+                Project(slug=slug, name=slug, cwd=_INVOCATION_CWD)
+            )
+            conn.commit()
+
+        # Determine role: primary if no workspaces yet, else reference.
+        existing_links = ws_repo.linked_workspaces(proj.id)
+        role: str = "primary" if not existing_links else "reference"
+
+        ws_repo.link_project(proj.id, ws.id, role=role)  # type: ignore[arg-type]
+        conn.commit()
+
+        # Kick off a co-aspect edge build for the new project.
+        try:
+            from loci.jobs.queue import enqueue
+
+            enqueue(
+                conn,
+                kind="refresh_project_edges",
+                payload={"project_id": proj.id},
+                fingerprint=f"refresh_edges:{proj.id}:on_use",
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+        return (
+            f"Bound project `{proj.slug}` to workspace `{ws.slug}` "
+            f"(role={role}, cwd={_INVOCATION_CWD}). "
+            f"Try loci_recall to search your resources."
+        )
 
     return mcp
 

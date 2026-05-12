@@ -102,6 +102,7 @@ class Project:
     created_at: str = field(default_factory=now_iso)
     last_active_at: str = field(default_factory=now_iso)
     config: dict = field(default_factory=dict)
+    cwd: str | None = None
 
 
 @dataclass
